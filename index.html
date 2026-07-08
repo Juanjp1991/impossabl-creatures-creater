@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My Google AI Studio App</title>
+    <script>
+      (function() {
+        try {
+          let customFetch = window.fetch || globalThis.fetch;
+
+          // Define a fallback property descriptor for fetch
+          const fetchDescriptor = {
+            get() { return customFetch; },
+            set(val) { customFetch = val; },
+            configurable: true,
+            enumerable: true
+          };
+
+          // Try standard redefinition first
+          try {
+            Object.defineProperty(window, 'fetch', fetchDescriptor);
+          } catch (e) {
+            console.warn("window.fetch redefine failed, using proxy fallback:", e);
+          }
+
+          try {
+            Object.defineProperty(globalThis, 'fetch', fetchDescriptor);
+          } catch (e) {
+            console.warn("globalThis.fetch redefine failed, using proxy fallback:", e);
+          }
+
+          // Set up globalProxy to trap and allow setting 'fetch' on global objects
+          const globalProxy = new Proxy(window, {
+            get(target, prop) {
+              if (prop === 'fetch') {
+                return customFetch;
+              }
+              if (prop === 'global' || prop === 'globalThis' || prop === 'window' || prop === 'self') {
+                return globalProxy;
+              }
+              const value = target[prop];
+              if (typeof value === 'function') {
+                return value.bind(target);
+              }
+              return value;
+            },
+            set(target, prop, value) {
+              if (prop === 'fetch') {
+                customFetch = value;
+                return true;
+              }
+              target[prop] = value;
+              return true;
+            },
+            has(target, prop) {
+              return prop === 'fetch' || prop === 'global' || prop === 'globalThis' || Reflect.has(target, prop);
+            }
+          });
+
+          // Define global, globalThis, and self on window to point to our Proxy
+          try {
+            Object.defineProperty(window, 'global', {
+              value: globalProxy,
+              writable: true,
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e) {}
+
+          try {
+            Object.defineProperty(window, 'globalThis', {
+              value: globalProxy,
+              writable: true,
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e) {}
+
+          try {
+            Object.defineProperty(window, 'self', {
+              value: globalProxy,
+              writable: true,
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e) {}
+        } catch (err) {
+          console.warn("Failed to set up global proxy:", err);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
