@@ -11,7 +11,8 @@ export const ANIMALS: Animal[] = [
     bodyConnections: {
       neck: { x: 75, y: 95 },
       tail: { x: 265, y: 110 },
-      legs: { x: 170, y: 165 },
+      frontLegs: { x: 115, y: 165 },
+      backLegs: { x: 235, y: 165 },
     },
     parts: {
       head: {
@@ -186,23 +187,23 @@ export const ANIMALS: Animal[] = [
   <path d="M 75,110 C 90,125 95,145 90,160 Z" fill="#8B5A2B" opacity="0.4" />
 </g>`
       },
-      legs: {
-        id: "bear-legs",
+      frontLegs: {
+        id: "bear-frontLegs",
         animalId: "bear",
-        type: "legs",
-        name: "Bear Legs",
+        type: "frontLegs",
+        name: "Bear Front Legs",
         viewBox: "0 0 260 180",
         connections: {
-          body: { x: 130, y: 15 },
+          body: { x: 75, y: 15 },
         },
         render: ({ color = "#5C4033" }) => (
-          <g id="svg-bear-legs">
+          <g id="svg-bear-frontLegs">
             <defs>
-              <linearGradient id="bear-leg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+              <linearGradient id="bear-fleg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
                 <stop offset="0%" stopColor={color} />
                 <stop offset="100%" stopColor="#302018" />
               </linearGradient>
-              <linearGradient id="bear-leg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+              <linearGradient id="bear-fleg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
                 <stop offset="0%" stopColor="#3D2B1F" />
                 <stop offset="100%" stopColor="#1A110B" />
               </linearGradient>
@@ -217,26 +218,11 @@ export const ANIMALS: Animal[] = [
                  L 35,152 Q 35,160 48,160 
                  L 70,160 Q 75,145 73,125
                  C 70,100 72,70 75,35 Z"
-              fill="url(#bear-leg-back-grad)"
+              fill="url(#bear-fleg-back-grad)"
               opacity="0.85"
             />
             {/* Back Claws (Front Leg) */}
             <path d="M 32,156 L 27,160 L 33,160 M 36,156 L 31,160 L 37,160 M 40,156 L 35,160 L 41,160" stroke="#111" strokeWidth="1.5" fill="#EAEAEA" opacity="0.8" />
-
-            {/* Back Hind Leg */}
-            <path
-              d="M 180,20 
-                 C 165,45 160,75 165,105 
-                 C 168,125 164,140 160,152 
-                 L 150,154 Q 150,162 165,162 
-                 L 185,162 C 190,145 195,115 190,85
-                 C 188,60 198,35 200,20 Z"
-              fill="url(#bear-leg-back-grad)"
-              opacity="0.85"
-            />
-            {/* Back Claws (Hind Leg) */}
-            <path d="M 148,158 L 143,162 L 149,162 M 152,158 L 147,162 L 153,162 M 156,158 L 151,162 L 157,162" stroke="#111" strokeWidth="1.5" fill="#EAEAEA" opacity="0.8" />
-
 
             {/* FRONT LAYER LEGS (Main color) */}
             {/* Front Front Leg */}
@@ -249,13 +235,61 @@ export const ANIMALS: Animal[] = [
                  L 85,159 
                  Q 90,140 88,115
                  C 86,90 92,55 95,15 Z"
-              fill="url(#bear-leg-front-grad)"
+              fill="url(#bear-fleg-front-grad)"
               stroke="#3D2B1F"
               strokeWidth="2"
             />
             {/* Front Claws (Front Leg) */}
             <path d="M 45,155 L 39,159 L 46,159 M 49,155 L 43,159 L 50,159 M 53,155 L 47,159 L 54,159" stroke="#3D2B1F" strokeWidth="1.5" fill="#EAEAEA" />
+            
+            {/* Fur detail lines on joints */}
+            <path d="M 80,45 Q 73,55 82,65" fill="none" stroke="#3D2B1F" strokeWidth="1.5" opacity="0.4" />
+          </g>
+        ),
+        rawContent: `<g>
+  <!-- Bear Front Legs (Back & Front Layer) -->
+  <path d="M 55,20 C 50,45 52,70 56,100 C 59,120 54,135 48,150 L 35,152 Q 35,160 48,160 L 70,160 Q 75,145 73,125 C 70,100 72,70 75,35 Z" fill="#3D2B1F" />
+  <path d="M 75,10 C 68,35 66,60 72,90 C 75,110 70,130 62,148 L 48,150 Q 48,159 62,159 L 85,159 Q 90,140 88,115 C 86,90 92,55 95,15 Z" fill="#5C4033" stroke="#3D2B1F" stroke-width="2" />
+</g>`
+      },
+      backLegs: {
+        id: "bear-backLegs",
+        animalId: "bear",
+        type: "backLegs",
+        name: "Bear Back Legs",
+        viewBox: "0 0 260 180",
+        connections: {
+          body: { x: 195, y: 15 },
+        },
+        render: ({ color = "#5C4033" }) => (
+          <g id="svg-bear-backLegs">
+            <defs>
+              <linearGradient id="bear-bleg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor={color} />
+                <stop offset="100%" stopColor="#302018" />
+              </linearGradient>
+              <linearGradient id="bear-bleg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#3D2B1F" />
+                <stop offset="100%" stopColor="#1A110B" />
+              </linearGradient>
+            </defs>
 
+            {/* BACK LAYER LEGS (Darker for depth) */}
+            {/* Back Hind Leg */}
+            <path
+              d="M 180,20 
+                 C 165,45 160,75 165,105 
+                 C 168,125 164,140 160,152 
+                 L 150,154 Q 150,162 165,162 
+                 L 185,162 C 190,145 195,115 190,85
+                 C 188,60 198,35 200,20 Z"
+              fill="url(#bear-bleg-back-grad)"
+              opacity="0.85"
+            />
+            {/* Back Claws (Hind Leg) */}
+            <path d="M 148,158 L 143,162 L 149,162 M 152,158 L 147,162 L 153,162 M 156,158 L 151,162 L 157,162" stroke="#111" strokeWidth="1.5" fill="#EAEAEA" opacity="0.8" />
+
+            {/* FRONT LAYER LEGS (Main color) */}
             {/* Front Hind Leg (Thicker, powerful thigh) */}
             <path
               d="M 210,10 
@@ -266,7 +300,7 @@ export const ANIMALS: Animal[] = [
                  L 210,161 
                  C 215,145 224,115 220,85
                  C 216,55 230,30 232,10 Z"
-              fill="url(#bear-leg-front-grad)"
+              fill="url(#bear-bleg-front-grad)"
               stroke="#3D2B1F"
               strokeWidth="2"
             />
@@ -274,16 +308,13 @@ export const ANIMALS: Animal[] = [
             <path d="M 166,157 L 160,161 L 167,161 M 170,157 L 164,161 L 171,161 M 174,157 L 168,161 L 175,161" stroke="#3D2B1F" strokeWidth="1.5" fill="#EAEAEA" />
             
             {/* Fur detail lines on joints */}
-            <path d="M 80,45 Q 73,55 82,65" fill="none" stroke="#3D2B1F" strokeWidth="1.5" opacity="0.4" />
             <path d="M 205,40 Q 192,55 208,70" fill="none" stroke="#3D2B1F" strokeWidth="1.5" opacity="0.4" />
           </g>
         ),
         rawContent: `<g>
-  <!-- Bear Legs (Front & Hind Layers) -->
-  <path d="M 55,20 C 50,45 52,70 56,100 C 59,120 54,135 48,150 L 35,152 Q 35,160 48,160 L 70,160 Q 75,145 73,125 C 70,100 72,70 75,35 Z" fill="#3D2B1F" />
+  <!-- Bear Back Legs (Back & Front Layer) -->
   <path d="M 180,20 C 165,45 160,75 165,105 C 168,125 164,140 160,152 L 150,154 Q 150,162 165,162 L 185,162 C 190,145 195,115 190,85 C 188,60 198,35 200,20 Z" fill="#3D2B1F" />
-  <path d="M 75,10 C 68,35 66,60 72,90 C 75,110 70,130 62,148 L 48,150 Q 48,159 62,159 L 85,159 Q 90,140 88,115 C 86,90 92,55 95,15 Z" fill="#5C4033" stroke="#3D2B1F" strokeWidth="2" />
-  <path d="M 210,10 C 195,35 185,65 190,95 C 193,115 188,135 180,150 L 170,152 Q 170,161 185,161 L 210,161 C 215,145 224,115 220,85 C 216,55 230,30 232,10 Z" fill="#5C4033" stroke="#3D2B1F" strokeWidth="2" />
+  <path d="M 210,10 C 195,35 185,65 190,95 C 193,115 188,135 180,150 L 170,152 Q 170,161 185,161 L 210,161 C 215,145 224,115 220,85 C 216,55 230,30 232,10 Z" fill="#5C4033" stroke="#3D2B1F" stroke-width="2" />
 </g>`
       },
       tail: {
@@ -329,7 +360,8 @@ export const ANIMALS: Animal[] = [
     bodyConnections: {
       neck: { x: 50, y: 55 },
       tail: { x: 260, y: 75 },
-      legs: { x: 150, y: 110 },
+      frontLegs: { x: 95, y: 110 },
+      backLegs: { x: 215, y: 110 },
     },
     parts: {
       head: {
@@ -576,23 +608,23 @@ export const ANIMALS: Animal[] = [
   <circle cx="230" cy="92" r="4.5" fill="#111111" />
 </g>`
       },
-      legs: {
-        id: "cheetah-legs",
+      frontLegs: {
+        id: "cheetah-frontLegs",
         animalId: "cheetah",
-        type: "legs",
-        name: "Cheetah Legs",
+        type: "frontLegs",
+        name: "Cheetah Front Legs",
         viewBox: "0 0 240 220",
         connections: {
-          body: { x: 120, y: 15 },
+          body: { x: 75, y: 15 },
         },
         render: ({ color = "#F4C430", accentColor = "#111111" }) => (
-          <g id="svg-cheetah-legs">
+          <g id="svg-cheetah-frontLegs">
             <defs>
-              <linearGradient id="cheetah-leg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+              <linearGradient id="cheetah-fleg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
                 <stop offset="0%" stopColor={color} />
                 <stop offset="100%" stopColor="#D4A017" />
               </linearGradient>
-              <linearGradient id="cheetah-leg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+              <linearGradient id="cheetah-fleg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
                 <stop offset="0%" stopColor="#C29010" />
                 <stop offset="100%" stopColor="#8C6500" />
               </linearGradient>
@@ -607,20 +639,7 @@ export const ANIMALS: Animal[] = [
                  L 26,187 L 26,195 L 48,195 
                  C 53,175 58,145 56,115 
                  C 54,95 62,55 64,25 Z"
-              fill="url(#cheetah-leg-back-grad)"
-              opacity="0.85"
-            />
-            {/* Back Hind Leg (Athletic spring joint) */}
-            <path
-              d="M 160,20 
-                 C 142,45 138,75 145,100 
-                 C 152,120 148,145 140,170 
-                 C 134,185 125,190 120,195 
-                 L 142,195 
-                 C 152,185 162,170 168,145 
-                 C 174,120 178,85 174,50
-                 C 172,35 174,25 175,20 Z"
-              fill="url(#cheetah-leg-back-grad)"
+              fill="url(#cheetah-fleg-back-grad)"
               opacity="0.85"
             />
             {/* Spots on back legs */}
@@ -628,11 +647,6 @@ export const ANIMALS: Animal[] = [
             <circle cx="52" cy="75" r="2.5" fill={accentColor} opacity="0.6" />
             <circle cx="50" cy="110" r="2" fill={accentColor} opacity="0.6" />
             <circle cx="44" cy="145" r="2" fill={accentColor} opacity="0.6" />
-            <circle cx="162" cy="55" r="3" fill={accentColor} opacity="0.6" />
-            <circle cx="155" cy="85" r="3" fill={accentColor} opacity="0.6" />
-            <circle cx="156" cy="115" r="2.5" fill={accentColor} opacity="0.6" />
-            <circle cx="148" cy="145" r="2" fill={accentColor} opacity="0.6" />
-
 
             {/* FRONT LAYER LEGS (Main color) */}
             {/* Front Front Leg */}
@@ -646,7 +660,7 @@ export const ANIMALS: Animal[] = [
                  Q 78,185 78,155
                  C 78,125 82,90 84,40
                  C 85,25 88,15 88,12 Z"
-              fill="url(#cheetah-leg-front-grad)"
+              fill="url(#cheetah-fleg-front-grad)"
               stroke="#684A00"
               strokeWidth="2"
             />
@@ -658,7 +672,60 @@ export const ANIMALS: Animal[] = [
             <circle cx="70" cy="120" r="2" fill={accentColor} />
             <circle cx="64" cy="145" r="2" fill={accentColor} />
             <circle cx="58" cy="170" r="1.5" fill={accentColor} />
+            
+            {/* Paws visual splits */}
+            <path d="M 44,202 L 44,197 M 49,202 L 49,197" stroke="#684A00" strokeWidth="1.5" />
+          </g>
+        ),
+        rawContent: `<g>
+  <!-- Cheetah Front Legs (Back & Front Layer) -->
+  <path d="M 50,20 C 45,45 42,75 48,105 C 52,125 45,155 38,185 L 26,187 L 26,195 L 48,195 C 53,175 58,145 56,115 C 54,95 62,55 64,25 Z" fill="#C29010" />
+  <path d="M 68,12 C 62,35 58,68 64,102 C 68,125 60,155 52,192 L 38,194 Q 38,202 54,202 L 72,202 Q 78,185 78,155 C 78,125 82,90 84,40 Z" fill="#F4C430" stroke="#684A00" strokeWidth="2" />
+</g>`
+      },
+      backLegs: {
+        id: "cheetah-backLegs",
+        animalId: "cheetah",
+        type: "backLegs",
+        name: "Cheetah Back Legs",
+        viewBox: "0 0 240 220",
+        connections: {
+          body: { x: 195, y: 15 },
+        },
+        render: ({ color = "#F4C430", accentColor = "#111111" }) => (
+          <g id="svg-cheetah-backLegs">
+            <defs>
+              <linearGradient id="cheetah-bleg-front-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor={color} />
+                <stop offset="100%" stopColor="#D4A017" />
+              </linearGradient>
+              <linearGradient id="cheetah-bleg-back-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#C29010" />
+                <stop offset="100%" stopColor="#8C6500" />
+              </linearGradient>
+            </defs>
 
+            {/* BACK LAYER LEGS (Darker shade) */}
+            {/* Back Hind Leg (Athletic spring joint) */}
+            <path
+              d="M 160,20 
+                 C 142,45 138,75 145,100 
+                 C 152,120 148,145 140,170 
+                 C 134,185 125,190 120,195 
+                 L 142,195 
+                 C 152,185 162,170 168,145 
+                 C 174,120 178,85 174,50
+                 C 172,35 174,25 175,20 Z"
+              fill="url(#cheetah-bleg-back-grad)"
+              opacity="0.85"
+            />
+            {/* Spots on back legs */}
+            <circle cx="162" cy="55" r="3" fill={accentColor} opacity="0.6" />
+            <circle cx="155" cy="85" r="3" fill={accentColor} opacity="0.6" />
+            <circle cx="156" cy="115" r="2.5" fill={accentColor} opacity="0.6" />
+            <circle cx="148" cy="145" r="2" fill={accentColor} opacity="0.6" />
+
+            {/* FRONT LAYER LEGS (Main color) */}
             {/* Front Hind Leg (S-shaped speed-running leg) */}
             <path
               d="M 188,12 
@@ -670,7 +737,7 @@ export const ANIMALS: Animal[] = [
                  C 184,192 192,175 198,148 
                  C 204,118 208,82 202,48
                  C 198,32 202,20 204,12 Z"
-              fill="url(#cheetah-leg-front-grad)"
+              fill="url(#cheetah-bleg-front-grad)"
               stroke="#684A00"
               strokeWidth="2"
             />
@@ -685,15 +752,12 @@ export const ANIMALS: Animal[] = [
             <circle cx="166" cy="175" r="2" fill={accentColor} />
             
             {/* Paws visual splits */}
-            <path d="M 44,202 L 44,197 M 49,202 L 49,197" stroke="#684A00" strokeWidth="1.5" />
             <path d="M 148,202 L 148,197 M 153,202 L 153,197" stroke="#684A00" strokeWidth="1.5" />
           </g>
         ),
         rawContent: `<g>
-  <!-- Cheetah Legs (Front & Hind Layers) -->
-  <path d="M 50,20 C 45,45 42,75 48,105 C 52,125 45,155 38,185 L 26,187 L 26,195 L 48,195 C 53,175 58,145 56,115 C 54,95 62,55 64,25 Z" fill="#C29010" />
+  <!-- Cheetah Back Legs (Back & Front Layer) -->
   <path d="M 160,20 C 142,45 138,75 145,100 C 152,120 148,145 140,170 C 134,185 125,190 120,195 L 142,195 C 152,185 162,170 168,145 C 174,120 178,85 174,50 Z" fill="#C29010" />
-  <path d="M 68,12 C 62,35 58,68 64,102 C 68,125 60,155 52,192 L 38,194 Q 38,202 54,202 L 72,202 Q 78,185 78,155 C 78,125 82,90 84,40 Z" fill="#F4C430" stroke="#684A00" strokeWidth="2" />
   <path d="M 188,12 C 170,35 160,65 172,95 C 182,118 178,142 165,168 C 158,185 148,192 142,199 Q 142,202 155,202 L 172,202 C 184,192 192,175 198,148 C 204,118 208,82 202,48 Z" fill="#F4C430" stroke="#684A00" strokeWidth="2" />
 </g>`
       },

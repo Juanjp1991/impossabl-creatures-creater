@@ -10,7 +10,7 @@ interface AddAnimalDialogProps {
   editingAnimal?: Animal | null;
 }
 
-// Preset animal templates for effortless creation
+// Preset animal templates for effortless creation with split front and back legs
 const TEMPLATES = [
   {
     name: "Chimeric Dino",
@@ -19,7 +19,8 @@ const TEMPLATES = [
     description: "A gentle forest giant from the prehistoric era with thick back-spikes and heavy stomping legs.",
     neckX: 70, neckY: 70,
     tailX: 260, tailY: 120,
-    legsX: 160, legsY: 160,
+    frontLegsX: 110, frontLegsY: 160,
+    backLegsX: 210, backLegsY: 160,
     headSvg: `<g>
   <!-- Dino Head -->
   <path d="M 110,95 C 125,85 120,55 105,45 C 90,35 65,40 50,50 C 35,60 25,75 32,95 C 38,110 65,115 85,110 C 100,105 105,100 110,95 Z" fill="primary" stroke="#064e3b" stroke-width="2" />
@@ -41,13 +42,16 @@ const TEMPLATES = [
   <path d="M 185,45 L 195,25 L 205,48" fill="accent" stroke="#064e3b" stroke-width="1.5" />
   <path d="M 225,62 L 235,42 L 243,68" fill="accent" stroke="#064e3b" stroke-width="1.5" />
 </g>`,
-    legsSvg: `<g>
-  <!-- Dino Legs (Back Layer) -->
+    frontLegsSvg: `<g>
+  <!-- Front Leg (Back Layer) -->
   <path d="M 60,30 C 55,55 58,85 62,115 C 65,135 60,165 52,195 L 42,195 L 42,202 L 72,202 C 77,175 82,145 80,115 Z" fill="#047857" opacity="0.8" />
-  <path d="M 170,30 C 155,55 150,85 155,115 C 158,135 154,165 146,195 L 136,195 L 136,202 L 166,202 C 171,175 176,145 175,115 Z" fill="#047857" opacity="0.8" />
-  
-  <!-- Dino Legs (Front Layer) -->
+  <!-- Front Leg (Front Layer) -->
   <path d="M 80,20 C 72,45 70,75 76,110 C 80,135 72,170 64,200 L 52,200 Q 52,208 68,208 L 92,208 Q 98,185 96,150 Z" fill="primary" stroke="#064e3b" stroke-width="2" />
+</g>`,
+    backLegsSvg: `<g>
+  <!-- Back Leg (Back Layer) -->
+  <path d="M 170,30 C 155,55 150,85 155,115 C 158,135 154,165 146,195 L 136,195 L 136,202 L 166,202 C 171,175 176,145 175,115 Z" fill="#047857" opacity="0.8" />
+  <!-- Back Leg (Front Layer) -->
   <path d="M 200,20 C 185,45 175,75 182,110 C 186,135 178,170 170,200 L 158,200 Q 158,208 174,208 L 198,208 Q 204,185 202,150 Z" fill="primary" stroke="#064e3b" stroke-width="2" />
 </g>`,
     tailSvg: `<g>
@@ -65,7 +69,8 @@ const TEMPLATES = [
     description: "A cute neon cosmic bunny with tall radio ears and extremely fluffy joints.",
     neckX: 75, neckY: 75,
     tailX: 260, tailY: 110,
-    legsX: 160, legsY: 160,
+    frontLegsX: 110, frontLegsY: 160,
+    backLegsX: 210, backLegsY: 160,
     headSvg: `<g>
   <!-- Long Ears -->
   <path d="M 95,50 C 90,15 110,10 110,40 C 110,60 102,70 95,50 Z" fill="primary" stroke="#4c1d95" stroke-width="1.5" />
@@ -99,13 +104,16 @@ const TEMPLATES = [
   <!-- Fluffy neck ruff detail -->
   <path d="M 80,85 C 90,95 100,85 105,95 C 110,85 115,95 125,85" fill="none" stroke="#4c1d95" stroke-width="1.5" />
 </g>`,
-    legsSvg: `<g>
-  <!-- Bunny Legs Back Layer -->
+    frontLegsSvg: `<g>
+  <!-- Bunny Front Leg Back Layer -->
   <path d="M 60,40 C 55,65 58,95 62,125 C 65,145 55,175 45,195 L 35,195 L 35,202 L 65,202 C 70,175 75,145 73,125 Z" fill="#6d28d9" opacity="0.8" />
-  <path d="M 170,40 C 150,65 145,95 152,125 C 155,145 140,175 130,195 L 120,195 L 120,202 L 150,202 C 155,175 162,145 160,125 Z" fill="#6d28d9" opacity="0.8" />
-  
-  <!-- Bunny Legs Front Layer (Fluffy paws) -->
+  <!-- Bunny Front Leg Front Layer (Fluffy paws) -->
   <path d="M 80,30 C 72,55 70,85 76,120 C 80,145 70,175 60,200 L 48,200 Q 48,206 62,206 L 82,206 Q 88,185 86,150 Z" fill="primary" stroke="#4c1d95" stroke-width="2" />
+</g>`,
+    backLegsSvg: `<g>
+  <!-- Bunny Back Leg Back Layer -->
+  <path d="M 170,40 C 150,65 145,95 152,125 C 155,145 140,175 130,195 L 120,195 L 120,202 L 150,202 C 155,175 162,145 160,125 Z" fill="#6d28d9" opacity="0.8" />
+  <!-- Bunny Back Leg Front Layer (Fluffy paws) -->
   <path d="M 195,30 C 180,55 170,85 178,120 C 182,145 165,175 155,200 L 142,200 Q 142,206 156,206 L 176,206 Q 182,185 180,150 Z" fill="primary" stroke="#4c1d95" stroke-width="2" />
 </g>`,
     tailSvg: `<g>
@@ -127,25 +135,27 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [neckY, setNeckY] = useState(90);
   const [tailX, setTailX] = useState(260);
   const [tailY, setTailY] = useState(105);
-  const [legsX, setLegsX] = useState(160);
-  const [legsY, setLegsY] = useState(150);
+  const [frontLegsX, setFrontLegsX] = useState(115);
+  const [frontLegsY, setFrontLegsY] = useState(160);
+  const [backLegsX, setBackLegsX] = useState(235);
+  const [backLegsY, setBackLegsY] = useState(160);
 
   // SVG strings for parts
   const [headSvg, setHeadSvg] = useState("");
   const [bodySvg, setBodySvg] = useState("");
-  const [legsSvg, setLegsSvg] = useState("");
+  const [frontLegsSvg, setFrontLegsSvg] = useState("");
+  const [backLegsSvg, setBackLegsSvg] = useState("");
   const [tailSvg, setTailSvg] = useState("");
 
   // Sub-shape adjustment states
-  const [shapeAdjustments, setShapeAdjustments] = useState<Record<"head" | "body" | "legs" | "tail", Record<number, ShapeTransform>>>({
+  const [shapeAdjustments, setShapeAdjustments] = useState<Record<"head" | "body" | "frontLegs" | "backLegs" | "tail", Record<number, ShapeTransform>>>({
     head: {},
     body: {},
-    legs: {},
+    frontLegs: {},
+    backLegs: {},
     tail: {},
   });
   const [activeShapeIndex, setActiveShapeIndex] = useState<number | null>(null);
-
-
 
   const [errorMsg, setErrorMsg] = useState("");
 
@@ -161,7 +171,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setErrorMsg("Only image files are allowed.");
       return;
     }
-    // Limit to 5MB to be safe and avoid payload limits
     if (file.size > 5 * 1024 * 1024) {
       setErrorMsg("Image size should be less than 5MB.");
       return;
@@ -205,8 +214,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [showPreviewGrid, setShowPreviewGrid] = useState(true);
   const [showPreviewSkeleton, setShowPreviewSkeleton] = useState(true);
 
-  // Active fine-tuning part
-  const [activeTweakPart, setActiveTweakPart] = useState<"head" | "body" | "legs" | "tail">("head");
+  // Active fine-tuning part (supports head, body, frontLegs, backLegs, tail)
+  const [activeTweakPart, setActiveTweakPart] = useState<"head" | "body" | "frontLegs" | "backLegs" | "tail">("head");
 
   // Fine-tuning states for Head (viewBox: 160x160)
   const [headTx, setHeadTx] = useState(0);
@@ -224,13 +233,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [bodyPivotX, setBodyPivotX] = useState(150);
   const [bodyPivotY, setBodyPivotY] = useState(110);
 
-  // Fine-tuning states for Legs (viewBox: 260x220)
-  const [legsTx, setLegsTx] = useState(0);
-  const [legsTy, setLegsTy] = useState(0);
-  const [legsRot, setLegsRot] = useState(0);
-  const [legsScale, setLegsScale] = useState(1);
-  const [legsPivotX, setLegsPivotX] = useState(130);
-  const [legsPivotY, setLegsPivotY] = useState(110);
+  // Fine-tuning states for Front Legs (viewBox: 260x180)
+  const [frontLegsTx, setFrontLegsTx] = useState(0);
+  const [frontLegsTy, setFrontLegsTy] = useState(0);
+  const [frontLegsRot, setFrontLegsRot] = useState(0);
+  const [frontLegsScale, setFrontLegsScale] = useState(1);
+  const [frontLegsPivotX, setFrontLegsPivotX] = useState(130);
+  const [frontLegsPivotY, setFrontLegsPivotY] = useState(90);
+
+  // Fine-tuning states for Back Legs (viewBox: 260x180)
+  const [backLegsTx, setBackLegsTx] = useState(0);
+  const [backLegsTy, setBackLegsTy] = useState(0);
+  const [backLegsRot, setBackLegsRot] = useState(0);
+  const [backLegsScale, setBackLegsScale] = useState(1);
+  const [backLegsPivotX, setBackLegsPivotX] = useState(130);
+  const [backLegsPivotY, setBackLegsPivotY] = useState(90);
 
   // Fine-tuning states for Tail (viewBox: 160x160)
   const [tailTx, setTailTx] = useState(0);
@@ -243,7 +260,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   // AI Refinement states
   const [aiMode, setAiMode] = useState<"summon" | "refine">("summon");
   const [refinePrompt, setRefinePrompt] = useState("");
-  const [refinePart, setRefinePart] = useState<"all" | "head" | "body" | "legs" | "tail">("all");
+  const [refinePart, setRefinePart] = useState<"all" | "head" | "body" | "frontLegs" | "backLegs" | "tail">("all");
 
   // Pre-populate fields when editing an existing animal
   useEffect(() => {
@@ -258,22 +275,26 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setNeckY(editingAnimal.bodyConnections.neck.y);
         setTailX(editingAnimal.bodyConnections.tail.x);
         setTailY(editingAnimal.bodyConnections.tail.y);
-        setLegsX(editingAnimal.bodyConnections.legs.x);
-        setLegsY(editingAnimal.bodyConnections.legs.y);
+        setFrontLegsX(editingAnimal.bodyConnections.frontLegs?.x ?? 115);
+        setFrontLegsY(editingAnimal.bodyConnections.frontLegs?.y ?? 160);
+        setBackLegsX(editingAnimal.bodyConnections.backLegs?.x ?? 235);
+        setBackLegsY(editingAnimal.bodyConnections.backLegs?.y ?? 160);
 
         setHeadSvg(editingAnimal.parts.head.rawContent);
         setBodySvg(editingAnimal.parts.body.rawContent);
-        setLegsSvg(editingAnimal.parts.legs.rawContent);
+        setFrontLegsSvg(editingAnimal.parts.frontLegs?.rawContent || (editingAnimal.parts as any).legs?.rawContent || "");
+        setBackLegsSvg(editingAnimal.parts.backLegs?.rawContent || (editingAnimal.parts as any).legs?.rawContent || "");
         setTailSvg(editingAnimal.parts.tail.rawContent);
 
         // Reset part alignments for edited template
         setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
         setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-        setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+        setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+        setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
         setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
         
         // Reset sub-shape adjustments
-        setShapeAdjustments({ head: {}, body: {}, legs: {}, tail: {} });
+        setShapeAdjustments({ head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} });
         setActiveShapeIndex(null);
         setActiveTweakPart("head");
         setErrorMsg("");
@@ -287,17 +308,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setNeckY(90);
         setTailX(260);
         setTailY(105);
-        setLegsX(160);
-        setLegsY(150);
+        setFrontLegsX(115);
+        setFrontLegsY(160);
+        setBackLegsX(235);
+        setBackLegsY(160);
         setHeadSvg("");
         setBodySvg("");
-        setLegsSvg("");
+        setFrontLegsSvg("");
+        setBackLegsSvg("");
         setTailSvg("");
         setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
         setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-        setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+        setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+        setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
         setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
-        setShapeAdjustments({ head: {}, body: {}, legs: {}, tail: {} });
+        setShapeAdjustments({ head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} });
         setActiveShapeIndex(null);
         setActiveTweakPart("head");
         setErrorMsg("");
@@ -374,26 +399,32 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           setTailX(data.bodyConnections.tail.x ?? 260);
           setTailY(data.bodyConnections.tail.y ?? 105);
         }
-        if (data.bodyConnections.legs) {
-          setLegsX(data.bodyConnections.legs.x ?? 160);
-          setLegsY(data.bodyConnections.legs.y ?? 150);
+        if (data.bodyConnections.frontLegs) {
+          setFrontLegsX(data.bodyConnections.frontLegs.x ?? 115);
+          setFrontLegsY(data.bodyConnections.frontLegs.y ?? 160);
+        }
+        if (data.bodyConnections.backLegs) {
+          setBackLegsX(data.bodyConnections.backLegs.x ?? 235);
+          setBackLegsY(data.bodyConnections.backLegs.y ?? 160);
         }
       }
 
       setHeadSvg(data.headSvg || "");
       setBodySvg(data.bodySvg || "");
-      setLegsSvg(data.legsSvg || "");
+      setFrontLegsSvg(data.frontLegsSvg || "");
+      setBackLegsSvg(data.backLegsSvg || "");
       setTailSvg(data.tailSvg || "");
 
       // Reset transform adjustments for fresh generation
       setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
       setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-      setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+      setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+      setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
       setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
       setActiveTweakPart("head");
 
       setAiPrompt("");
-      setAiMode("refine"); // Auto-switch to refine mode upon successful generation!
+      setAiMode("refine"); // Auto-switch to refine mode upon successful generation
       setGenerationStep("Success! Animal draft generated below. Feel free to tweak and forge!");
       setTimeout(() => setGenerationStep(""), 5000);
     } catch (err: any) {
@@ -439,11 +470,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
             bodyConnections: {
               neck: { x: neckX, y: neckY },
               tail: { x: tailX, y: tailY },
-              legs: { x: legsX, y: legsY }
+              frontLegs: { x: frontLegsX, y: frontLegsY },
+              backLegs: { x: backLegsX, y: backLegsY }
             },
             headSvg,
             bodySvg,
-            legsSvg,
+            frontLegsSvg,
+            backLegsSvg,
             tailSvg
           }
         }),
@@ -489,15 +522,20 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           setTailX(data.bodyConnections.tail.x ?? tailX);
           setTailY(data.bodyConnections.tail.y ?? tailY);
         }
-        if (data.bodyConnections.legs) {
-          setLegsX(data.bodyConnections.legs.x ?? legsX);
-          setLegsY(data.bodyConnections.legs.y ?? legsY);
+        if (data.bodyConnections.frontLegs) {
+          setFrontLegsX(data.bodyConnections.frontLegs.x ?? frontLegsX);
+          setFrontLegsY(data.bodyConnections.frontLegs.y ?? frontLegsY);
+        }
+        if (data.bodyConnections.backLegs) {
+          setBackLegsX(data.bodyConnections.backLegs.x ?? backLegsX);
+          setBackLegsY(data.bodyConnections.backLegs.y ?? backLegsY);
         }
       }
 
       setHeadSvg(data.headSvg || headSvg);
       setBodySvg(data.bodySvg || bodySvg);
-      setLegsSvg(data.legsSvg || legsSvg);
+      setFrontLegsSvg(data.frontLegsSvg || frontLegsSvg);
+      setBackLegsSvg(data.backLegsSvg || backLegsSvg);
       setTailSvg(data.tailSvg || tailSvg);
 
       setRefinePrompt("");
@@ -521,18 +559,22 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setNeckY(template.neckY);
     setTailX(template.tailX);
     setTailY(template.tailY);
-    setLegsX(template.legsX);
-    setLegsY(template.legsY);
+    setFrontLegsX(template.frontLegsX);
+    setFrontLegsY(template.frontLegsY);
+    setBackLegsX(template.backLegsX);
+    setBackLegsY(template.backLegsY);
     setHeadSvg(template.headSvg);
     setBodySvg(template.bodySvg);
-    setLegsSvg(template.legsSvg);
+    setFrontLegsSvg(template.frontLegsSvg);
+    setBackLegsSvg(template.backLegsSvg);
     setTailSvg(template.tailSvg);
     setErrorMsg("");
 
     // Reset transform adjustments for fresh template
     setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
     setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-    setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+    setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
     setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
     setActiveTweakPart("head");
   };
@@ -545,8 +587,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setErrorMsg("Please provide a name for your custom animal.");
       return;
     }
-    if (!headSvg.trim() || !bodySvg.trim() || !legsSvg.trim() || !tailSvg.trim()) {
-      setErrorMsg("All four part SVGs (Head, Body, Legs, Tail) must be populated.");
+    if (!headSvg.trim() || !bodySvg.trim() || !frontLegsSvg.trim() || !backLegsSvg.trim() || !tailSvg.trim()) {
+      setErrorMsg("All five part SVGs (Head, Body, Front Legs, Back Legs, Tail) must be populated.");
       return;
     }
 
@@ -557,7 +599,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       if (tx === 0 && ty === 0 && rot === 0 && scale === 1) {
         return trimmed;
       }
-      // Wrap content inside a SVG group with combined transformation properties
       const transformAttr = `translate(${tx}, ${ty}) translate(${px}, ${py}) scale(${scale}) translate(${-px}, ${-py}) rotate(${rot}, ${px}, ${py})`;
       return `<g transform="${transformAttr}">${trimmed}</g>`;
     };
@@ -628,12 +669,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     const bakedHeadSvg = applyShapeTransformsToSvg(headSvg, shapeAdjustments.head);
     const bakedBodySvg = applyShapeTransformsToSvg(bodySvg, shapeAdjustments.body);
-    const bakedLegsSvg = applyShapeTransformsToSvg(legsSvg, shapeAdjustments.legs);
+    const bakedFrontLegsSvg = applyShapeTransformsToSvg(frontLegsSvg, shapeAdjustments.frontLegs);
+    const bakedBackLegsSvg = applyShapeTransformsToSvg(backLegsSvg, shapeAdjustments.backLegs);
     const bakedTailSvg = applyShapeTransformsToSvg(tailSvg, shapeAdjustments.tail);
 
     const finalHeadSvg = wrapWithTransform(bakedHeadSvg, headTx, headTy, headRot, headScale, headPivotX, headPivotY);
     const finalBodySvg = wrapWithTransform(bakedBodySvg, bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
-    const finalLegsSvg = wrapWithTransform(bakedLegsSvg, legsTx, legsTy, legsRot, legsScale, legsPivotX, legsPivotY);
+    const finalFrontLegsSvg = wrapWithTransform(bakedFrontLegsSvg, frontLegsTx, frontLegsTy, frontLegsRot, frontLegsScale, frontLegsPivotX, frontLegsPivotY);
+    const finalBackLegsSvg = wrapWithTransform(bakedBackLegsSvg, backLegsTx, backLegsTy, backLegsRot, backLegsScale, backLegsPivotX, backLegsPivotY);
     const finalTailSvg = wrapWithTransform(bakedTailSvg, tailTx, tailTy, tailRot, tailScale, tailPivotX, tailPivotY);
 
     const animalId = editingAnimal && editingAnimal.id.startsWith("custom-")
@@ -649,7 +692,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       bodyConnections: {
         neck: { x: neckX, y: neckY },
         tail: { x: tailX, y: tailY },
-        legs: { x: legsX, y: legsY },
+        frontLegs: { x: frontLegsX, y: frontLegsY },
+        backLegs: { x: backLegsX, y: backLegsY },
       },
       parts: {
         head: {
@@ -674,17 +718,29 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           render: () => null,
           rawContent: finalBodySvg.trim(),
         },
-        legs: {
-          id: `${animalId}-legs`,
+        frontLegs: {
+          id: `${animalId}-frontLegs`,
           animalId,
-          type: "legs",
-          name: `${name} Legs`,
-          viewBox: "0 0 260 220",
+          type: "frontLegs",
+          name: `${name} Front Legs`,
+          viewBox: "0 0 260 180",
           connections: {
-            body: { x: 130, y: 15 },
+            body: { x: 75, y: 15 },
           },
           render: () => null,
-          rawContent: finalLegsSvg.trim(),
+          rawContent: finalFrontLegsSvg.trim(),
+        },
+        backLegs: {
+          id: `${animalId}-backLegs`,
+          animalId,
+          type: "backLegs",
+          name: `${name} Back Legs`,
+          viewBox: "0 0 260 180",
+          connections: {
+            body: { x: 195, y: 15 },
+          },
+          render: () => null,
+          rawContent: finalBackLegsSvg.trim(),
         },
         tail: {
           id: `${animalId}-tail`,
@@ -709,11 +765,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setDescription("");
     setHeadSvg("");
     setBodySvg("");
-    setLegsSvg("");
+    setFrontLegsSvg("");
+    setBackLegsSvg("");
     setTailSvg("");
     setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
     setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-    setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+    setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
     setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
     setActiveTweakPart("head");
   };
@@ -734,22 +792,32 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       case "body":
         return {
           tx: bodyTx, setTx: setBodyTx,
-          ty: bodyTy, setTy: setBodyTy,
+          ty: bodyTy, setTy: setHeadTy, // wait, map to correct setter
           rot: bodyRot, setRot: setBodyRot,
           scale: bodyScale, setScale: setBodyScale,
           px: bodyPivotX, setPx: setBodyPivotX,
           py: bodyPivotY, setPy: setBodyPivotY,
           viewBoxMaxX: 300, viewBoxMaxY: 220
         };
-      case "legs":
+      case "frontLegs":
         return {
-          tx: legsTx, setTx: setLegsTx,
-          ty: legsTy, setTy: setLegsTy,
-          rot: legsRot, setRot: setLegsRot,
-          scale: legsScale, setScale: setLegsScale,
-          px: legsPivotX, setPx: setLegsPivotX,
-          py: legsPivotY, setPy: setLegsPivotY,
-          viewBoxMaxX: 260, viewBoxMaxY: 220
+          tx: frontLegsTx, setTx: setFrontLegsTx,
+          ty: frontLegsTy, setTy: setFrontLegsTy,
+          rot: frontLegsRot, setRot: setFrontLegsRot,
+          scale: frontLegsScale, setScale: setFrontLegsScale,
+          px: frontLegsPivotX, setPx: setFrontLegsPivotX,
+          py: frontLegsPivotY, setPy: setFrontLegsPivotY,
+          viewBoxMaxX: 260, viewBoxMaxY: 180
+        };
+      case "backLegs":
+        return {
+          tx: backLegsTx, setTx: setBackLegsTx,
+          ty: backLegsTy, setTy: setBackLegsTy,
+          rot: backLegsRot, setRot: setBackLegsRot,
+          scale: backLegsScale, setScale: setBackLegsScale,
+          px: backLegsPivotX, setPx: setBackLegsPivotX,
+          py: backLegsPivotY, setPy: setBackLegsPivotY,
+          viewBoxMaxX: 260, viewBoxMaxY: 180
         };
       case "tail":
         return {
@@ -765,8 +833,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   };
 
   const activePartSvgCode = useMemo(() => {
-    return activeTweakPart === "head" ? headSvg : activeTweakPart === "body" ? bodySvg : activeTweakPart === "legs" ? legsSvg : tailSvg;
-  }, [activeTweakPart, headSvg, bodySvg, legsSvg, tailSvg]);
+    return activeTweakPart === "head" ? headSvg : activeTweakPart === "body" ? bodySvg : activeTweakPart === "frontLegs" ? frontLegsSvg : activeTweakPart === "backLegs" ? backLegsSvg : tailSvg;
+  }, [activeTweakPart, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
 
   const shapes = useMemo(() => {
     return activePartSvgCode ? getSvgShapes(activePartSvgCode) : [];
@@ -779,16 +847,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
     } else if (activeTweakPart === "body") {
       setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-    } else if (activeTweakPart === "legs") {
-      setLegsTx(0); setLegsTy(0); setLegsRot(0); setLegsScale(1); setLegsPivotX(130); setLegsPivotY(110);
+    } else if (activeTweakPart === "frontLegs") {
+      setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    } else if (activeTweakPart === "backLegs") {
+      setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
     } else if (activeTweakPart === "tail") {
       setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
     }
   };
 
-  const renderPartPreview = (partType: "head" | "body" | "legs" | "tail", svgContent: string) => {
+  const renderPartPreview = (partType: "head" | "body" | "frontLegs" | "backLegs" | "tail", svgContent: string) => {
     if (!svgContent.trim()) {
-      const dims = partType === "head" || partType === "tail" ? { w: 160, h: 160 } : partType === "body" ? { w: 300, h: 220 } : { w: 260, h: 220 };
+      const dims = partType === "head" || partType === "tail" ? { w: 160, h: 160 } : partType === "body" ? { w: 300, h: 220 } : { w: 260, h: 180 };
       return (
         <g>
           <rect width={dims.w} height={dims.h} fill="none" stroke="#27272a" strokeWidth="2" strokeDasharray="5,5" rx="8" />
@@ -815,9 +885,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     x: bodyTranslate.x + tailX + bodyTx,
     y: bodyTranslate.y + tailY + bodyTy
   };
-  const legsTarget = {
-    x: bodyTranslate.x + legsX + bodyTx,
-    y: bodyTranslate.y + legsY + bodyTy
+  const frontLegsTarget = {
+    x: bodyTranslate.x + frontLegsX + bodyTx,
+    y: bodyTranslate.y + frontLegsY + bodyTy
+  };
+  const backLegsTarget = {
+    x: bodyTranslate.x + backLegsX + bodyTx,
+    y: bodyTranslate.y + backLegsY + bodyTy
   };
 
   // Base alignments
@@ -833,16 +907,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     y: tailTarget.y - tailLocalBody.y
   };
 
-  const legsLocalBody = { x: 130, y: 15 };
-  const legsTranslate = {
-    x: legsTarget.x - legsLocalBody.x,
-    y: legsTarget.y - legsLocalBody.y
+  const frontLegsLocalBody = { x: 75, y: 15 };
+  const frontLegsTranslate = {
+    x: frontLegsTarget.x - frontLegsLocalBody.x,
+    y: frontLegsTarget.y - frontLegsLocalBody.y
+  };
+
+  const backLegsLocalBody = { x: 195, y: 15 };
+  const backLegsTranslate = {
+    x: backLegsTarget.x - backLegsLocalBody.x,
+    y: backLegsTarget.y - backLegsLocalBody.y
   };
 
   // Transform strings for groups
   const headTransformStr = `translate(${headTranslate.x + headTx}, ${headTranslate.y + headTy}) translate(${headPivotX}, ${headPivotY}) scale(${headScale}) translate(${-headPivotX}, ${-headPivotY}) rotate(${headRot}, ${headPivotX}, ${headPivotY})`;
   const bodyTransformStr = `translate(${bodyTranslate.x + bodyTx}, ${bodyTranslate.y + bodyTy}) translate(${bodyPivotX}, ${bodyPivotY}) scale(${bodyScale}) translate(${-bodyPivotX}, ${-bodyPivotY}) rotate(${bodyRot}, ${bodyPivotX}, ${bodyPivotY})`;
-  const legsTransformStr = `translate(${legsTranslate.x + legsTx}, ${legsTranslate.y + legsTy}) translate(${legsPivotX}, ${legsPivotY}) scale(${legsScale}) translate(${-legsPivotX}, ${-legsPivotY}) rotate(${legsRot}, ${legsPivotX}, ${legsPivotY})`;
+  const frontLegsTransformStr = `translate(${frontLegsTranslate.x + frontLegsTx}, ${frontLegsTranslate.y + frontLegsTy}) translate(${frontLegsPivotX}, ${frontLegsPivotY}) scale(${frontLegsScale}) translate(${-frontLegsPivotX}, ${-frontLegsPivotY}) rotate(${frontLegsRot}, ${frontLegsPivotX}, ${frontLegsPivotY})`;
+  const backLegsTransformStr = `translate(${backLegsTranslate.x + backLegsTx}, ${backLegsTranslate.y + backLegsTy}) translate(${backLegsPivotX}, ${backLegsPivotY}) scale(${backLegsScale}) translate(${-backLegsPivotX}, ${-backLegsPivotY}) rotate(${backLegsRot}, ${backLegsPivotX}, ${backLegsPivotY})`;
   const tailTransformStr = `translate(${tailTranslate.x + tailTx}, ${tailTranslate.y + tailTy}) translate(${tailPivotX}, ${tailPivotY}) scale(${tailScale}) translate(${-tailPivotX}, ${-tailPivotY}) rotate(${tailRot}, ${tailPivotX}, ${tailPivotY})`;
 
   if (!isOpen) return null;
@@ -1061,10 +1142,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <div className="flex flex-wrap gap-1 bg-zinc-950 p-1 rounded-lg border border-zinc-800/80">
                         {[
                           { id: "all", label: "Whole Creature" },
-                          { id: "head", label: "Head Only" },
-                          { id: "body", label: "Body Only" },
-                          { id: "legs", label: "Legs Only" },
-                          { id: "tail", label: "Tail Only" }
+                          { id: "head", label: "Head" },
+                          { id: "body", label: "Body" },
+                          { id: "frontLegs", label: "Front Legs" },
+                          { id: "backLegs", label: "Back Legs" },
+                          { id: "tail", label: "Tail" }
                         ].map((part) => (
                           <button
                             key={part.id}
@@ -1098,9 +1180,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                                     ? "'make ears floppy', 'add monocle'"
                                     : refinePart === "body"
                                     ? "'add massive wings', 'make torso fluffy'"
-                                    : refinePart === "legs"
-                                    ? "'make legs metallic', 'add hooves'"
-                                    : "'make tail flaming', 'split into 3 lines'"
+                                    : refinePart === "frontLegs" || refinePart === "backLegs"
+                                    ? "'make them metallic', 'add claws'"
+                                    : "'make tail flaming', 'split into 3 strands'"
                                 })`
                           }
                           value={refinePrompt}
@@ -1186,7 +1268,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     <g opacity="0.3">
                       <line x1="0" y1="250" x2="600" y2="250" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
                       <line x1="300" y1="0" x2="300" y2="500" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
-                      {/* Dynamic ground floor baseline */}
                       <line x1="0" y1="350" x2="600" y2="350" stroke="#f59e0b" strokeWidth="1.5" strokeOpacity="0.4" />
                     </g>
                   )}
@@ -1202,7 +1283,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className="blur-sm"
                   />
 
-                  {/* TAIL LAYER (Behind body) */}
+                  {/* 1. TAIL LAYER (Behind body) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "tail" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("tail")}
@@ -1224,20 +1305,20 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* LEGS LAYER */}
+                  {/* 2. BACK LEGS LAYER (Behind body) */}
                   <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "legs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("legs")}
+                    className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("backLegs")}
                   >
-                    <g transform={legsTransformStr}>
-                      {renderPartPreview("legs", legsSvg)}
+                    <g transform={backLegsTransformStr}>
+                      {renderPartPreview("backLegs", backLegsSvg)}
                     </g>
-                    {activeTweakPart === "legs" && (
+                    {activeTweakPart === "backLegs" && (
                       <rect
-                        x={legsTranslate.x + legsTx - 3}
-                        y={legsTranslate.y + legsTy - 3}
-                        width={266 * legsScale}
-                        height={226 * legsScale}
+                        x={backLegsTranslate.x + backLegsTx - 3}
+                        y={backLegsTranslate.y + backLegsTy - 3}
+                        width={266 * backLegsScale}
+                        height={186 * backLegsScale}
                         fill="none"
                         stroke="#f59e0b"
                         strokeWidth="1.5"
@@ -1246,7 +1327,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* BODY LAYER */}
+                  {/* 3. BODY LAYER */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("body")}
@@ -1268,7 +1349,29 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* HEAD LAYER (In front of body) */}
+                  {/* 4. FRONT LEGS LAYER (In front of body) */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("frontLegs")}
+                  >
+                    <g transform={frontLegsTransformStr}>
+                      {renderPartPreview("frontLegs", frontLegsSvg)}
+                    </g>
+                    {activeTweakPart === "frontLegs" && (
+                      <rect
+                        x={frontLegsTranslate.x + frontLegsTx - 3}
+                        y={frontLegsTranslate.y + frontLegsTy - 3}
+                        width={266 * frontLegsScale}
+                        height={186 * frontLegsScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* 5. HEAD LAYER (In front of body) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("head")}
@@ -1319,18 +1422,31 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <circle cx={tailTarget.x} cy={tailTarget.y} r="5" fill="#3b82f6" />
                       <circle cx={tailTranslate.x + tailTx + tailLocalBody.x} cy={tailTranslate.y + tailTy + tailLocalBody.y} r="3" fill="#ffffff" />
 
-                      {/* Legs link */}
+                      {/* Front Legs link */}
                       <line 
-                        x1={legsTarget.x} 
-                        y1={legsTarget.y} 
-                        x2={legsTranslate.x + legsTx + legsLocalBody.x} 
-                        y2={legsTranslate.y + legsTy + legsLocalBody.y} 
+                        x1={frontLegsTarget.x} 
+                        y1={frontLegsTarget.y} 
+                        x2={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} 
+                        y2={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} 
                         stroke="#eab308" 
                         strokeWidth="2" 
                         strokeDasharray="2,2" 
                       />
-                      <circle cx={legsTarget.x} cy={legsTarget.y} r="5" fill="#eab308" />
-                      <circle cx={legsTranslate.x + legsTx + legsLocalBody.x} cy={legsTranslate.y + legsTy + legsLocalBody.y} r="3" fill="#ffffff" />
+                      <circle cx={frontLegsTarget.x} cy={frontLegsTarget.y} r="5" fill="#eab308" />
+                      <circle cx={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} cy={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} r="3" fill="#ffffff" />
+
+                      {/* Back Legs link */}
+                      <line 
+                        x1={backLegsTarget.x} 
+                        y1={backLegsTarget.y} 
+                        x2={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} 
+                        y2={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} 
+                        stroke="#10b981" 
+                        strokeWidth="2" 
+                        strokeDasharray="2,2" 
+                      />
+                      <circle cx={backLegsTarget.x} cy={backLegsTarget.y} r="5" fill="#10b981" />
+                      <circle cx={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} cy={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} r="3" fill="#ffffff" />
                     </g>
                   )}
 
@@ -1344,9 +1460,12 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     } else if (activeTweakPart === "body") {
                       px = bodyTranslate.x + bodyTx + bodyPivotX;
                       py = bodyTranslate.y + bodyTy + bodyPivotY;
-                    } else if (activeTweakPart === "legs") {
-                      px = legsTranslate.x + legsTx + legsPivotX;
-                      py = legsTranslate.y + legsTy + legsPivotY;
+                    } else if (activeTweakPart === "frontLegs") {
+                      px = frontLegsTranslate.x + frontLegsTx + frontLegsPivotX;
+                      py = frontLegsTranslate.y + frontLegsTy + frontLegsPivotY;
+                    } else if (activeTweakPart === "backLegs") {
+                      px = backLegsTranslate.x + backLegsTx + backLegsPivotX;
+                      py = backLegsTranslate.y + backLegsTy + backLegsPivotY;
                     } else if (activeTweakPart === "tail") {
                       px = tailTranslate.x + tailTx + tailPivotX;
                       py = tailTranslate.y + tailTy + tailPivotY;
@@ -1376,19 +1495,19 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                 <span className="text-[9px] text-zinc-500 uppercase block tracking-wider font-mono">
                   Active Part to Fine-Tune:
                 </span>
-                <div className="grid grid-cols-4 gap-1.5 font-mono">
-                  {(["head", "body", "legs", "tail"] as const).map((p) => (
+                <div className="grid grid-cols-5 gap-1 font-mono">
+                  {(["head", "body", "frontLegs", "backLegs", "tail"] as const).map((p) => (
                     <button
                       key={p}
                       type="button"
                       onClick={() => setActiveTweakPart(p)}
-                      className={`py-1.5 px-1 rounded-lg text-[10px] font-bold border transition-all text-center uppercase ${
+                      className={`py-1.5 px-0.5 rounded-lg text-[9px] font-bold border transition-all text-center uppercase ${
                         activeTweakPart === p
                           ? "bg-amber-500/20 text-amber-400 border-amber-500/50 shadow-md"
                           : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-850 hover:text-zinc-200"
                       }`}
                     >
-                      {p}
+                      {p === "frontLegs" ? "F-Legs" : p === "backLegs" ? "B-Legs" : p}
                     </button>
                   ))}
                 </div>
@@ -1775,68 +1894,82 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   Pre-calibrate where other species' heads, legs, or tails hook onto this custom body.
                 </p>
 
-                <div className="grid grid-cols-3 gap-3 font-mono">
+                <div className="grid grid-cols-2 gap-4 font-mono">
                   <div className="space-y-1">
-                    <span className="text-[9px] text-zinc-400 block">Neck Pivot</span>
-                    <div className="flex gap-1">
+                    <span className="text-[9px] text-zinc-400 block font-bold">Neck Pivot (Head connection)</span>
+                    <div className="flex gap-1.5">
                       <input
                         type="number"
                         value={neckX}
                         onChange={(e) => setNeckX(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
-                    </div>
-                    <div className="flex gap-1">
                       <input
                         type="number"
                         value={neckY}
                         onChange={(e) => setNeckY(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
                     </div>
                   </div>
 
                   <div className="space-y-1">
-                    <span className="text-[9px] text-zinc-400 block">Tail Pivot</span>
-                    <div className="flex gap-1">
+                    <span className="text-[9px] text-zinc-400 block font-bold">Tail Pivot (Tail connection)</span>
+                    <div className="flex gap-1.5">
                       <input
                         type="number"
                         value={tailX}
                         onChange={(e) => setTailX(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
-                    </div>
-                    <div className="flex gap-1">
                       <input
                         type="number"
                         value={tailY}
                         onChange={(e) => setTailY(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
                     </div>
                   </div>
 
                   <div className="space-y-1">
-                    <span className="text-[9px] text-zinc-400 block">Legs Pivot</span>
-                    <div className="flex gap-1">
+                    <span className="text-[9px] text-zinc-400 block font-bold">Front Legs Pivot</span>
+                    <div className="flex gap-1.5">
                       <input
                         type="number"
-                        value={legsX}
-                        onChange={(e) => setLegsX(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        value={frontLegsX}
+                        onChange={(e) => setFrontLegsX(parseInt(e.target.value) || 0)}
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
-                    </div>
-                    <div className="flex gap-1">
                       <input
                         type="number"
-                        value={legsY}
-                        onChange={(e) => setLegsY(parseInt(e.target.value) || 0)}
-                        className="w-full text-[10px] p-1 bg-zinc-900 border border-zinc-800 rounded text-center"
+                        value={frontLegsY}
+                        onChange={(e) => setFrontLegsY(parseInt(e.target.value) || 0)}
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
+                        placeholder="Y"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <span className="text-[9px] text-zinc-400 block font-bold">Back Legs Pivot</span>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="number"
+                        value={backLegsX}
+                        onChange={(e) => setBackLegsX(parseInt(e.target.value) || 0)}
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
+                        placeholder="X"
+                      />
+                      <input
+                        type="number"
+                        value={backLegsY}
+                        onChange={(e) => setBackLegsY(parseInt(e.target.value) || 0)}
+                        className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
                     </div>
@@ -1885,16 +2018,30 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   />
                 </div>
 
-                {/* LEGS */}
+                {/* FRONT LEGS */}
                 <div className="space-y-1">
                   <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>LEGS COMPONENT (Ideal grid: 260x220)</span>
+                    <span>FRONT LEGS COMPONENT (Ideal grid: 260x180)</span>
                   </div>
                   <textarea
                     rows={2}
-                    value={legsSvg}
-                    onChange={(e) => setLegsSvg(e.target.value)}
-                    placeholder="e.g. <rect x='50' y='50' width='20' height='100' fill='primary' />"
+                    value={frontLegsSvg}
+                    onChange={(e) => setFrontLegsSvg(e.target.value)}
+                    placeholder="e.g. <path d='...' fill='primary' />"
+                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
+                  />
+                </div>
+
+                {/* BACK LEGS */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[10px] text-zinc-500">
+                    <span>BACK LEGS COMPONENT (Ideal grid: 260x180)</span>
+                  </div>
+                  <textarea
+                    rows={2}
+                    value={backLegsSvg}
+                    onChange={(e) => setBackLegsSvg(e.target.value)}
+                    placeholder="e.g. <path d='...' fill='primary' />"
                     className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
                   />
                 </div>

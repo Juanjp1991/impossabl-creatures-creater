@@ -43,7 +43,8 @@ export const AnimalLibrary: React.FC<AnimalLibraryProps> = ({
           const isPurebred =
             creatureState.head === animal.id &&
             creatureState.body === animal.id &&
-            creatureState.legs === animal.id &&
+            creatureState.frontLegs === animal.id &&
+            creatureState.backLegs === animal.id &&
             creatureState.tail === animal.id;
 
           return (
@@ -138,13 +139,16 @@ export const AnimalLibrary: React.FC<AnimalLibraryProps> = ({
 // Elegant Mini Preview Component to draw Grizzly or Cheetah in-place
 const MiniAnimalPreview: React.FC<{ animal: Animal }> = ({ animal }) => {
   // Compute default skeletal translation positions for pure template rendering
-  const neckTarget = animal.bodyConnections.neck;
-  const tailTarget = animal.bodyConnections.tail;
-  const legsTarget = animal.bodyConnections.legs;
+  // Compute default skeletal translation positions for pure template rendering safely
+  const neckTarget = animal.bodyConnections?.neck || { x: 75, y: 95 };
+  const tailTarget = animal.bodyConnections?.tail || { x: 265, y: 110 };
+  const frontLegsTarget = animal.bodyConnections?.frontLegs || { x: 115, y: 165 };
+  const backLegsTarget = animal.bodyConnections?.backLegs || { x: 235, y: 165 };
 
   const headPart = animal.parts.head;
   const bodyPart = animal.parts.body;
-  const legsPart = animal.parts.legs;
+  const frontLegsPart = animal.parts.frontLegs;
+  const backLegsPart = animal.parts.backLegs;
   const tailPart = animal.parts.tail;
 
   // We place the body local (0,0) at translation (15, 10) inside a 330x220 canvas
@@ -152,7 +156,8 @@ const MiniAnimalPreview: React.FC<{ animal: Animal }> = ({ animal }) => {
 
   const neckT = { x: bodyTranslate.x + neckTarget.x, y: bodyTranslate.y + neckTarget.y };
   const tailT = { x: bodyTranslate.x + tailTarget.x, y: bodyTranslate.y + tailTarget.y };
-  const legsT = { x: bodyTranslate.x + legsTarget.x, y: bodyTranslate.y + legsTarget.y };
+  const frontLegsT = { x: bodyTranslate.x + frontLegsTarget.x, y: bodyTranslate.y + frontLegsTarget.y };
+  const backLegsT = { x: bodyTranslate.x + backLegsTarget.x, y: bodyTranslate.y + backLegsTarget.y };
 
   const headLocalNeck = headPart.connections.neck || { x: 0, y: 0 };
   const headT = { x: neckT.x - headLocalNeck.x, y: neckT.y - headLocalNeck.y };
@@ -160,8 +165,11 @@ const MiniAnimalPreview: React.FC<{ animal: Animal }> = ({ animal }) => {
   const tailLocalBody = tailPart.connections.body || { x: 0, y: 0 };
   const tailT_final = { x: tailT.x - tailLocalBody.x, y: tailT.y - tailLocalBody.y };
 
-  const legsLocalBody = legsPart.connections.body || { x: 0, y: 0 };
-  const legsT_final = { x: legsT.x - legsLocalBody.x, y: legsT.y - legsLocalBody.y };
+  const frontLegsLocalBody = frontLegsPart.connections.body || { x: 0, y: 0 };
+  const frontLegsT_final = { x: frontLegsT.x - frontLegsLocalBody.x, y: frontLegsT.y - frontLegsLocalBody.y };
+
+  const backLegsLocalBody = backLegsPart.connections.body || { x: 0, y: 0 };
+  const backLegsT_final = { x: backLegsT.x - backLegsLocalBody.x, y: backLegsT.y - backLegsLocalBody.y };
 
   return (
     <svg viewBox="0 0 330 220" className="w-full h-full p-2">
@@ -169,15 +177,19 @@ const MiniAnimalPreview: React.FC<{ animal: Animal }> = ({ animal }) => {
       <g transform={`translate(${tailT_final.x}, ${tailT_final.y})`}>
         {tailPart.render({ color: animal.color, accentColor: animal.accentColor })}
       </g>
-      {/* 2. Legs */}
-      <g transform={`translate(${legsT_final.x}, ${legsT_final.y})`}>
-        {legsPart.render({ color: animal.color, accentColor: animal.accentColor })}
+      {/* 2. Back Legs */}
+      <g transform={`translate(${backLegsT_final.x}, ${backLegsT_final.y})`}>
+        {backLegsPart.render({ color: animal.color, accentColor: animal.accentColor })}
       </g>
       {/* 3. Body */}
       <g transform={`translate(${bodyTranslate.x}, ${bodyTranslate.y})`}>
         {bodyPart.render({ color: animal.color, accentColor: animal.accentColor })}
       </g>
-      {/* 4. Head */}
+      {/* 4. Front Legs */}
+      <g transform={`translate(${frontLegsT_final.x}, ${frontLegsT_final.y})`}>
+        {frontLegsPart.render({ color: animal.color, accentColor: animal.accentColor })}
+      </g>
+      {/* 5. Head */}
       <g transform={`translate(${headT.x}, ${headT.y})`}>
         {headPart.render({ color: animal.color, accentColor: animal.accentColor })}
       </g>

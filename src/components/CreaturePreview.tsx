@@ -12,7 +12,8 @@ interface CreaturePreviewProps {
   colorOverrides: {
     head?: string;
     body?: string;
-    legs?: string;
+    frontLegs?: string;
+    backLegs?: string;
     tail?: string;
   };
   showGrid: boolean;
@@ -42,12 +43,14 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
   // Find the source animal for each part
   const headAnimal = useMemo(() => animals.find(a => a.id === creatureState.head) || animals[0], [animals, creatureState.head]);
   const bodyAnimal = useMemo(() => animals.find(a => a.id === creatureState.body) || animals[0], [animals, creatureState.body]);
-  const legsAnimal = useMemo(() => animals.find(a => a.id === creatureState.legs) || animals[0], [animals, creatureState.legs]);
+  const frontLegsAnimal = useMemo(() => animals.find(a => a.id === creatureState.frontLegs) || animals[0], [animals, creatureState.frontLegs]);
+  const backLegsAnimal = useMemo(() => animals.find(a => a.id === creatureState.backLegs) || animals[0], [animals, creatureState.backLegs]);
   const tailAnimal = useMemo(() => animals.find(a => a.id === creatureState.tail) || animals[0], [animals, creatureState.tail]);
 
   const headPart = headAnimal.parts.head;
   const bodyPart = bodyAnimal.parts.body;
-  const legsPart = legsAnimal.parts.legs;
+  const frontLegsPart = frontLegsAnimal.parts.frontLegs;
+  const backLegsPart = backLegsAnimal.parts.backLegs;
   const tailPart = tailAnimal.parts.tail;
 
   // Base translation of the body in our 600x500 combined viewport
@@ -56,7 +59,8 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
   // Adjustments
   const headAdjust = adjustments.head;
   const bodyAdjust = adjustments.body;
-  const legsAdjust = adjustments.legs;
+  const frontLegsAdjust = adjustments.frontLegs;
+  const backLegsAdjust = adjustments.backLegs;
   const tailAdjust = adjustments.tail;
 
   // Body connection targets in combined coordinate space
@@ -68,7 +72,8 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
   // Center of the body is approximately (150, 110) in its 300x220 space.
   const bodyCenter = { x: 150, y: 110 };
 
-  const getScaledBodyPoint = (point: { x: number; y: number }) => {
+  const getScaledBodyPoint = (point?: { x: number; y: number }) => {
+    if (!point) return { x: 150, y: 110 };
     // 1. Scale relative to body center
     const rx = bodyCenter.x + (point.x - bodyCenter.x) * bScale;
     const ry = bodyCenter.y + (point.y - bodyCenter.y) * bScale;
@@ -79,14 +84,16 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
     };
   };
 
-  const neckTarget = getScaledBodyPoint(bodyAnimal.bodyConnections.neck);
-  const tailTarget = getScaledBodyPoint(bodyAnimal.bodyConnections.tail);
-  const legsTarget = getScaledBodyPoint(bodyAnimal.bodyConnections.legs);
+  const neckTarget = getScaledBodyPoint(bodyAnimal?.bodyConnections?.neck);
+  const tailTarget = getScaledBodyPoint(bodyAnimal?.bodyConnections?.tail);
+  const frontLegsTarget = getScaledBodyPoint(bodyAnimal?.bodyConnections?.frontLegs);
+  const backLegsTarget = getScaledBodyPoint(bodyAnimal?.bodyConnections?.backLegs);
 
   // Helper to compute rendering colors
   const headColor = colorOverrides.head || headAnimal.color;
   const bodyColor = colorOverrides.body || bodyAnimal.color;
-  const legsColor = colorOverrides.legs || legsAnimal.color;
+  const frontLegsColor = colorOverrides.frontLegs || frontLegsAnimal.color;
+  const backLegsColor = colorOverrides.backLegs || backLegsAnimal.color;
   const tailColor = colorOverrides.tail || tailAnimal.color;
 
   // Compute final translations for the parts based on skeletal alignment
@@ -104,23 +111,32 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
     y: tailTarget.y - tailLocalBody.y + tailAdjust.offsetY
   };
 
-  // 3. Legs: align legs' body connection point with the body's legs target
-  const legsLocalBody = legsPart.connections.body || { x: 0, y: 0 };
-  const legsTranslate = {
-    x: legsTarget.x - legsLocalBody.x + legsAdjust.offsetX,
-    y: legsTarget.y - legsLocalBody.y + legsAdjust.offsetY
+  // 3. Front Legs: align front legs' body connection point with the body's frontLegs target
+  const frontLegsLocalBody = frontLegsPart.connections.body || { x: 0, y: 0 };
+  const frontLegsTranslate = {
+    x: frontLegsTarget.x - frontLegsLocalBody.x + frontLegsAdjust.offsetX,
+    y: frontLegsTarget.y - frontLegsLocalBody.y + frontLegsAdjust.offsetY
+  };
+
+  // 4. Back Legs: align back legs' body connection point with the body's backLegs target
+  const backLegsLocalBody = backLegsPart.connections.body || { x: 0, y: 0 };
+  const backLegsTranslate = {
+    x: backLegsTarget.x - backLegsLocalBody.x + backLegsAdjust.offsetX,
+    y: backLegsTarget.y - backLegsLocalBody.y + backLegsAdjust.offsetY
   };
 
   // Sub-shape specific adjustments
   const shapeAdjustments = adjustments.shapeAdjustments;
   const headShapeTransforms = shapeAdjustments?.head;
   const bodyShapeTransforms = shapeAdjustments?.body;
-  const legsShapeTransforms = shapeAdjustments?.legs;
+  const frontLegsShapeTransforms = shapeAdjustments?.frontLegs;
+  const backLegsShapeTransforms = shapeAdjustments?.backLegs;
   const tailShapeTransforms = shapeAdjustments?.tail;
 
   const headHighlight = activePart === "head" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
   const bodyHighlight = activePart === "body" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
-  const legsHighlight = activePart === "legs" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
+  const frontLegsHighlight = activePart === "frontLegs" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
+  const backLegsHighlight = activePart === "backLegs" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
   const tailHighlight = activePart === "tail" ? (activeShapeIndex !== null ? activeShapeIndex : undefined) : undefined;
 
   const currentPreset = useMemo(() => {
@@ -142,10 +158,15 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
           rotate: [-3, 3, -3],
           transition: { duration: 3.2 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
         },
-        legs: {
+        frontLegs: {
           scaleY: [1, 0.99, 1],
           y: [0, 0.5, 0],
           transition: { duration: 4 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.1 }
+        },
+        backLegs: {
+          scaleY: [1, 0.985, 1],
+          y: [0, 0.4, 0],
+          transition: { duration: 4 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.25 }
         }
       },
       playful: {
@@ -164,10 +185,15 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
           rotate: [-14, 15, -14],
           transition: { duration: 1.1 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
         },
-        legs: {
+        frontLegs: {
           scaleY: [1, 0.98, 1],
           y: [0, 1.2, 0],
-          transition: { duration: 2.2 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
+          transition: { duration: 2.2 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0 }
+        },
+        backLegs: {
+          scaleY: [1, 0.975, 1],
+          y: [0, 1.0, 0],
+          transition: { duration: 2.2 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.15 }
         }
       },
       vigilant: {
@@ -185,9 +211,13 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
           rotate: [-1.5, 1.5, -1.5],
           transition: { duration: 7 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
         },
-        legs: {
+        frontLegs: {
           y: [0, 0.1, 0],
-          transition: { duration: 6 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
+          transition: { duration: 6 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0 }
+        },
+        backLegs: {
+          y: [0, 0.08, 0],
+          transition: { duration: 6 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.3 }
         }
       },
       fluid: {
@@ -206,9 +236,13 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
           y: [1.5, -1.5, 1.5],
           transition: { duration: 2.8 * speedMultiplier, ease: "easeInOut", repeat: Infinity }
         },
-        legs: {
+        frontLegs: {
           y: [-0.4, 0.4, -0.4],
           transition: { duration: 3.5 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.2 }
+        },
+        backLegs: {
+          y: [-0.3, 0.3, -0.3],
+          transition: { duration: 3.5 * speedMultiplier, ease: "easeInOut", repeat: Infinity, delay: 0.4 }
         }
       }
     };
@@ -242,7 +276,8 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
         <div className="absolute top-3 right-4 text-[10px] font-mono text-zinc-500 pointer-events-none flex gap-3">
           <span>H: {headAnimal.name}</span>
           <span>B: {bodyAnimal.name}</span>
-          <span>L: {legsAnimal.name}</span>
+          <span>FL: {frontLegsAnimal.name}</span>
+          <span>BL: {backLegsAnimal.name}</span>
           <span>T: {tailAnimal.name}</span>
         </div>
 
@@ -319,39 +354,39 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             )}
           </g>
 
-          {/* LEGS LAYER */}
+          {/* BACK LEGS LAYER (Renders behind body for 3D depth) */}
           <g 
             className="cursor-pointer transition-all duration-200"
             onClick={(e) => {
               e.stopPropagation();
-              onSelectPart("legs");
+              onSelectPart("backLegs");
             }}
           >
-            {/* Legs placement */}
-            <g transform={`translate(${legsTarget.x + legsAdjust.offsetX}, ${legsTarget.y + legsAdjust.offsetY})`}>
+            {/* Back Legs placement */}
+            <g transform={`translate(${backLegsTarget.x + backLegsAdjust.offsetX}, ${backLegsTarget.y + backLegsAdjust.offsetY})`}>
               <motion.g
-                animate={isAnimating ? currentPreset.legs : { scaleY: 1, y: 0 }}
+                animate={isAnimating ? currentPreset.backLegs : { scaleY: 1, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${legsAdjust.scale}) translate(${-legsLocalBody.x}, ${-legsLocalBody.y})`}>
+                <g transform={`scale(${backLegsAdjust.scale}) translate(${-backLegsLocalBody.x}, ${-backLegsLocalBody.y})`}>
                   {parseSvgToReact(
-                    legsPart.rawContent,
-                    { color: legsColor, accentColor: legsAnimal.accentColor },
-                    legsAnimal.color,
-                    legsAnimal.accentColor,
-                    legsShapeTransforms,
-                    legsHighlight
+                    backLegsPart.rawContent,
+                    { color: backLegsColor, accentColor: backLegsAnimal.accentColor },
+                    backLegsAnimal.color,
+                    backLegsAnimal.accentColor,
+                    backLegsShapeTransforms,
+                    backLegsHighlight
                   )}
                 </g>
               </motion.g>
             </g>
             {/* Selected Outline */}
-            {activePart === "legs" && (
+            {activePart === "backLegs" && (
               <rect
-                x={legsTranslate.x - 5}
-                y={legsTranslate.y - 5}
-                width={200 * legsAdjust.scale}
-                height={160 * legsAdjust.scale}
+                x={backLegsTranslate.x - 5}
+                y={backLegsTranslate.y - 5}
+                width={120 * backLegsAdjust.scale}
+                height={160 * backLegsAdjust.scale}
                 fill="none"
                 stroke="#f59e0b"
                 strokeWidth="1.5"
@@ -401,7 +436,48 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             )}
           </g>
 
-          {/* HEAD LAYER (In front of body) */}
+          {/* FRONT LEGS LAYER (Renders in front of body) */}
+          <g 
+            className="cursor-pointer transition-all duration-200"
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelectPart("frontLegs");
+            }}
+          >
+            {/* Front Legs placement */}
+            <g transform={`translate(${frontLegsTarget.x + frontLegsAdjust.offsetX}, ${frontLegsTarget.y + frontLegsAdjust.offsetY})`}>
+              <motion.g
+                animate={isAnimating ? currentPreset.frontLegs : { scaleY: 1, y: 0 }}
+                style={{ transformOrigin: "0px 0px" }}
+              >
+                <g transform={`scale(${frontLegsAdjust.scale}) translate(${-frontLegsLocalBody.x}, ${-frontLegsLocalBody.y})`}>
+                  {parseSvgToReact(
+                    frontLegsPart.rawContent,
+                    { color: frontLegsColor, accentColor: frontLegsAnimal.accentColor },
+                    frontLegsAnimal.color,
+                    frontLegsAnimal.accentColor,
+                    frontLegsShapeTransforms,
+                    frontLegsHighlight
+                  )}
+                </g>
+              </motion.g>
+            </g>
+            {/* Selected Outline */}
+            {activePart === "frontLegs" && (
+              <rect
+                x={frontLegsTranslate.x - 5}
+                y={frontLegsTranslate.y - 5}
+                width={120 * frontLegsAdjust.scale}
+                height={160 * frontLegsAdjust.scale}
+                fill="none"
+                stroke="#f59e0b"
+                strokeWidth="1.5"
+                strokeDasharray="4,4"
+              />
+            )}
+          </g>
+
+          {/* HEAD LAYER (In front of body and legs) */}
           <g 
             className="cursor-pointer transition-all duration-200"
             onClick={(e) => {
@@ -466,7 +542,7 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
                 y1={tailTarget.y} 
                 x2={tailTranslate.x + tailLocalBody.x} 
                 y2={tailTranslate.y + tailLocalBody.y} 
-                stroke="#ec4899" 
+                stroke="#3b82f6" 
                 strokeWidth="2" 
                 strokeDasharray="2,2" 
               />
@@ -474,19 +550,33 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
               <circle cx={tailTranslate.x + tailLocalBody.x} cy={tailTranslate.y + tailLocalBody.y} r="3" fill="#ffffff" />
               <text x={tailTarget.x + 8} y={tailTarget.y - 4} fill="#3b82f6" className="text-[9px] font-mono font-bold select-none">tail joint</text>
 
-              {/* 3. Legs Connection */}
+              {/* 3. Front Legs Connection */}
               <line 
-                x1={legsTarget.x} 
-                y1={legsTarget.y} 
-                x2={legsTranslate.x + legsLocalBody.x} 
-                y2={legsTranslate.y + legsLocalBody.y} 
-                stroke="#ec4899" 
+                x1={frontLegsTarget.x} 
+                y1={frontLegsTarget.y} 
+                x2={frontLegsTranslate.x + frontLegsLocalBody.x} 
+                y2={frontLegsTranslate.y + frontLegsLocalBody.y} 
+                stroke="#f59e0b" 
                 strokeWidth="2" 
                 strokeDasharray="2,2" 
               />
-              <circle cx={legsTarget.x} cy={legsTarget.y} r="5" fill="#f59e0b" />
-              <circle cx={legsTranslate.x + legsLocalBody.x} cy={legsTranslate.y + legsLocalBody.y} r="3" fill="#ffffff" />
-              <text x={legsTarget.x + 8} y={legsTarget.y - 4} fill="#f59e0b" className="text-[9px] font-mono font-bold select-none">leg hip</text>
+              <circle cx={frontLegsTarget.x} cy={frontLegsTarget.y} r="5" fill="#f59e0b" />
+              <circle cx={frontLegsTranslate.x + frontLegsLocalBody.x} cy={frontLegsTranslate.y + frontLegsLocalBody.y} r="3" fill="#ffffff" />
+              <text x={frontLegsTarget.x + 8} y={frontLegsTarget.y - 4} fill="#f59e0b" className="text-[9px] font-mono font-bold select-none">front shoulder</text>
+
+              {/* 4. Back Legs Connection */}
+              <line 
+                x1={backLegsTarget.x} 
+                y1={backLegsTarget.y} 
+                x2={backLegsTranslate.x + backLegsLocalBody.x} 
+                y2={backLegsTranslate.y + backLegsLocalBody.y} 
+                stroke="#10b981" 
+                strokeWidth="2" 
+                strokeDasharray="2,2" 
+              />
+              <circle cx={backLegsTarget.x} cy={backLegsTarget.y} r="5" fill="#10b981" />
+              <circle cx={backLegsTranslate.x + backLegsLocalBody.x} cy={backLegsTranslate.y + backLegsLocalBody.y} r="3" fill="#ffffff" />
+              <text x={backLegsTarget.x + 8} y={backLegsTarget.y - 4} fill="#10b981" className="text-[9px] font-mono font-bold select-none">rear hip</text>
 
               {/* Spine connection bone (neck to hip to tail) */}
               <path 
@@ -497,7 +587,14 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
                 opacity="0.6" 
               />
               <path 
-                d={`M ${(neckTarget.x + tailTarget.x)/2} ${(neckTarget.y + tailTarget.y)/2 - 15} ${legsTarget.x} ${legsTarget.y}`} 
+                d={`M ${(neckTarget.x + frontLegsTarget.x)/2} ${(neckTarget.y + frontLegsTarget.y)/2} L ${frontLegsTarget.x} ${frontLegsTarget.y}`} 
+                fill="none" 
+                stroke="#a855f7" 
+                strokeWidth="1.5" 
+                opacity="0.6" 
+              />
+              <path 
+                d={`M ${(tailTarget.x + backLegsTarget.x)/2} ${(tailTarget.y + backLegsTarget.y)/2} L ${backLegsTarget.x} ${backLegsTarget.y}`} 
                 fill="none" 
                 stroke="#a855f7" 
                 strokeWidth="1.5" 

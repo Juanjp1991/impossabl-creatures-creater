@@ -24,7 +24,8 @@ export const PartSelector: React.FC<PartSelectorProps> = ({
   const partTypes: { type: AnimalPartType; label: string; desc: string }[] = [
     { type: "head", label: "Head Source", desc: "Senses, face markings, and ears" },
     { type: "body", label: "Body Torso", desc: "Mass, core proportions, and back shape" },
-    { type: "legs", label: "Legs & Paws", desc: "Stature, athletic frame, and claws" },
+    { type: "frontLegs", label: "Front Legs", desc: "Front posture, forepaws, and shoulders" },
+    { type: "backLegs", label: "Back Legs", desc: "Rear posture, hindpaws, and hip structure" },
     { type: "tail", label: "Tail Component", desc: "Balance, length, and detail markings" },
   ];
 

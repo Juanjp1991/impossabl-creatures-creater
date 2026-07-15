@@ -14,7 +14,8 @@ import { Eye, HelpCircle, Layers, Settings, Sparkles, Wand2, Info, Heart, Activi
 const INITIAL_CREATURE: CreatureState = {
   head: "bear",
   body: "bear",
-  legs: "bear",
+  frontLegs: "bear",
+  backLegs: "bear",
   tail: "bear",
 };
 
@@ -23,24 +24,100 @@ const INITIAL_ADJUSTMENT = { scale: 1.0, offsetX: 0, offsetY: 0 };
 const INITIAL_ADJUSTMENTS: AdjustmentsState = {
   head: { ...INITIAL_ADJUSTMENT },
   body: { ...INITIAL_ADJUSTMENT },
-  legs: { ...INITIAL_ADJUSTMENT },
+  frontLegs: { ...INITIAL_ADJUSTMENT },
+  backLegs: { ...INITIAL_ADJUSTMENT },
   tail: { ...INITIAL_ADJUSTMENT },
   shapeAdjustments: {
     head: {},
     body: {},
-    legs: {},
+    frontLegs: {},
+    backLegs: {},
     tail: {},
   },
 };
 
-// Initializer helper to read custom templates from localStorage safely
+// Initializer helper to read custom templates from localStorage safely and migrate legacy schemas
 const getInitialAnimals = (): Animal[] => {
   try {
     const saved = localStorage.getItem("creature_builder_custom_animals");
     if (saved) {
       const parsed = JSON.parse(saved);
       if (Array.isArray(parsed)) {
-        return [...ANIMALS, ...parsed];
+        const sanitized = parsed.map((animal: any) => {
+          const bodyConnections = { ...animal.bodyConnections };
+          const legacyLegsConn = (bodyConnections as any).legs;
+
+          if (legacyLegsConn && !bodyConnections.frontLegs) {
+            bodyConnections.frontLegs = { x: Math.max(20, legacyLegsConn.x - 40), y: legacyLegsConn.y };
+          }
+          if (legacyLegsConn && !bodyConnections.backLegs) {
+            bodyConnections.backLegs = { x: Math.min(280, legacyLegsConn.x + 40), y: legacyLegsConn.y };
+          }
+          if (!bodyConnections.frontLegs) {
+            bodyConnections.frontLegs = { x: 115, y: 160 };
+          }
+          if (!bodyConnections.backLegs) {
+            bodyConnections.backLegs = { x: 235, y: 160 };
+          }
+          if (!bodyConnections.neck) {
+            bodyConnections.neck = { x: 75, y: 90 };
+          }
+          if (!bodyConnections.tail) {
+            bodyConnections.tail = { x: 260, y: 105 };
+          }
+
+          const parts = { ...animal.parts };
+          const legacyLegsPart = (parts as any).legs;
+          if (legacyLegsPart) {
+            if (!parts.frontLegs) {
+              parts.frontLegs = {
+                ...legacyLegsPart,
+                id: `${animal.id}-frontLegs`,
+                type: "frontLegs",
+                name: legacyLegsPart.name.replace("Legs", "Front Legs"),
+              };
+            }
+            if (!parts.backLegs) {
+              parts.backLegs = {
+                ...legacyLegsPart,
+                id: `${animal.id}-backLegs`,
+                type: "backLegs",
+                name: legacyLegsPart.name.replace("Legs", "Back Legs"),
+              };
+            }
+          }
+          if (!parts.frontLegs) {
+            parts.frontLegs = {
+              id: `${animal.id}-frontLegs`,
+              animalId: animal.id,
+              type: "frontLegs",
+              name: `${animal.name} Front Legs`,
+              viewBox: "0 0 260 180",
+              connections: { body: { x: 75, y: 15 } },
+              rawContent: "",
+              render: () => null,
+            };
+          }
+          if (!parts.backLegs) {
+            parts.backLegs = {
+              id: `${animal.id}-backLegs`,
+              animalId: animal.id,
+              type: "backLegs",
+              name: `${animal.name} Back Legs`,
+              viewBox: "0 0 260 180",
+              connections: { body: { x: 195, y: 15 } },
+              rawContent: "",
+              render: () => null,
+            };
+          }
+
+          return {
+            ...animal,
+            bodyConnections,
+            parts,
+          };
+        });
+        return [...ANIMALS, ...sanitized];
       }
     }
   } catch (err) {
@@ -78,11 +155,21 @@ const reconstructAnimalRenders = (animals: Animal[]): Animal[] => {
               animal.accentColor
             ),
         },
-        legs: {
-          ...animal.parts.legs,
+        frontLegs: {
+          ...animal.parts.frontLegs,
           render: (props) =>
             parseSvgToReact(
-              animal.parts.legs.rawContent,
+              animal.parts.frontLegs.rawContent,
+              props,
+              animal.color,
+              animal.accentColor
+            ),
+        },
+        backLegs: {
+          ...animal.parts.backLegs,
+          render: (props) =>
+            parseSvgToReact(
+              animal.parts.backLegs.rawContent,
               props,
               animal.color,
               animal.accentColor
@@ -139,7 +226,8 @@ export default function App() {
       const currentShapeAdjustments = prev.shapeAdjustments || {
         head: {},
         body: {},
-        legs: {},
+        frontLegs: {},
+        backLegs: {},
         tail: {},
       };
       const partShapes = { ...currentShapeAdjustments[activePart] };
@@ -172,7 +260,8 @@ export default function App() {
       const currentShapeAdjustments = prev.shapeAdjustments || {
         head: {},
         body: {},
-        legs: {},
+        frontLegs: {},
+        backLegs: {},
         tail: {},
       };
       const partShapes = { ...currentShapeAdjustments[activePart] };
@@ -192,7 +281,8 @@ export default function App() {
   const [colorOverrides, setColorOverrides] = useState<{
     head?: string;
     body?: string;
-    legs?: string;
+    frontLegs?: string;
+    backLegs?: string;
     tail?: string;
   }>({});
 
@@ -254,7 +344,8 @@ export default function App() {
     setCreature({
       head: animalId,
       body: animalId,
-      legs: animalId,
+      frontLegs: animalId,
+      backLegs: animalId,
       tail: animalId,
     });
     // Reset individual offsets to defaults
@@ -276,7 +367,8 @@ export default function App() {
     setCreature({
       head: randomSource(),
       body: randomSource(),
-      legs: randomSource(),
+      frontLegs: randomSource(),
+      backLegs: randomSource(),
       tail: randomSource(),
     });
 
@@ -287,8 +379,16 @@ export default function App() {
     setAdjustments({
       head: { scale: randScale(), offsetX: randOffset(), offsetY: randOffset() },
       body: { scale: parseFloat((0.9 + Math.random() * 0.2).toFixed(2)), offsetX: 0, offsetY: 0 },
-      legs: { scale: randScale(), offsetX: randOffset(), offsetY: randOffset() },
+      frontLegs: { scale: randScale(), offsetX: randOffset(), offsetY: randOffset() },
+      backLegs: { scale: randScale(), offsetX: randOffset(), offsetY: randOffset() },
       tail: { scale: randScale(), offsetX: randOffset(), offsetY: randOffset() },
+      shapeAdjustments: {
+        head: {},
+        body: {},
+        frontLegs: {},
+        backLegs: {},
+        tail: {},
+      },
     });
 
     // Clear color overrides to maintain animal base styles
@@ -339,7 +439,8 @@ export default function App() {
       parts: {
         head: { ...newAnimal.parts.head, render: null as any },
         body: { ...newAnimal.parts.body, render: null as any },
-        legs: { ...newAnimal.parts.legs, render: null as any },
+        frontLegs: { ...newAnimal.parts.frontLegs, render: null as any },
+        backLegs: { ...newAnimal.parts.backLegs, render: null as any },
         tail: { ...newAnimal.parts.tail, render: null as any },
       },
     };
@@ -369,7 +470,8 @@ export default function App() {
       let changed = false;
       if (copy.head === animalId) { copy.head = "bear"; changed = true; }
       if (copy.body === animalId) { copy.body = "bear"; changed = true; }
-      if (copy.legs === animalId) { copy.legs = "bear"; changed = true; }
+      if (copy.frontLegs === animalId) { copy.frontLegs = "bear"; changed = true; }
+      if (copy.backLegs === animalId) { copy.backLegs = "bear"; changed = true; }
       if (copy.tail === animalId) { copy.tail = "bear"; changed = true; }
       return changed ? copy : prev;
     });
@@ -655,7 +757,7 @@ export default function App() {
             activePartName={activePartObj ? activePartObj.name : null}
             onDownloadFull={() =>
               handleDownloadFile(
-                `creature-hybrid-${creature.head}-${creature.body}-${creature.legs}-${creature.tail}.svg`,
+                `creature-hybrid-${creature.head}-${creature.body}-${creature.frontLegs}-${creature.backLegs}-${creature.tail}.svg`,
                 fullSvgCode
               )
             }
@@ -686,7 +788,8 @@ export default function App() {
                 parts: {
                   head: { ...newAnimal.parts.head, render: null as any },
                   body: { ...newAnimal.parts.body, render: null as any },
-                  legs: { ...newAnimal.parts.legs, render: null as any },
+                  frontLegs: { ...newAnimal.parts.frontLegs, render: null as any },
+                  backLegs: { ...newAnimal.parts.backLegs, render: null as any },
                   tail: { ...newAnimal.parts.tail, render: null as any },
                 },
               };

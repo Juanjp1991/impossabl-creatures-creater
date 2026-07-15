@@ -1,6 +1,6 @@
 import React from "react";
 
-export type AnimalPartType = "head" | "body" | "legs" | "tail";
+export type AnimalPartType = "head" | "body" | "frontLegs" | "backLegs" | "tail";
 
 export interface ConnectionPoint {
   x: number;
@@ -17,7 +17,8 @@ export interface BodyConnectionPoints {
   // Body-specific points where other parts attach (in local space of the body)
   neck: ConnectionPoint;
   tail: ConnectionPoint;
-  legs: ConnectionPoint;
+  frontLegs: ConnectionPoint;
+  backLegs: ConnectionPoint;
 }
 
 export interface AnimalPart {
@@ -43,7 +44,8 @@ export interface Animal {
   parts: {
     head: AnimalPart;
     body: AnimalPart;
-    legs: AnimalPart;
+    frontLegs: AnimalPart;
+    backLegs: AnimalPart;
     tail: AnimalPart;
   };
 }
@@ -67,19 +69,22 @@ export type PartShapeAdjustments = Record<number, ShapeAdjustment>;
 export interface CreatureState {
   head: string; // animalId supplying the head
   body: string; // animalId supplying the body
-  legs: string; // animalId supplying the legs
+  frontLegs: string; // animalId supplying the front legs
+  backLegs: string; // animalId supplying the back legs
   tail: string; // animalId supplying the tail
 }
 
 export interface AdjustmentsState {
   head: PartAdjustment;
   body: PartAdjustment;
-  legs: PartAdjustment;
+  frontLegs: PartAdjustment;
+  backLegs: PartAdjustment;
   tail: PartAdjustment;
   shapeAdjustments?: {
     head: PartShapeAdjustments;
     body: PartShapeAdjustments;
-    legs: PartShapeAdjustments;
+    frontLegs: PartShapeAdjustments;
+    backLegs: PartShapeAdjustments;
     tail: PartShapeAdjustments;
   };
 }
