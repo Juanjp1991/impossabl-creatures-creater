@@ -7,9 +7,11 @@ import { AdjustmentControls } from "./components/AdjustmentControls";
 import { SvgCodeViewer } from "./components/SvgCodeViewer";
 import { AnimalLibrary } from "./components/AnimalLibrary";
 import { PartSelector } from "./components/PartSelector";
-import { AddAnimalDialog } from "./components/AddAnimalDialog";
 import { parseSvgToReact } from "./utils/svgParser";
 import { Eye, HelpCircle, Layers, Settings, Sparkles, Wand2, Info, Heart, Activity } from "lucide-react";
+
+const AnimalPackagePanel = React.lazy(() => import("./components/AnimalPackagePanel").then((module) => ({ default: module.AnimalPackagePanel })));
+const AddAnimalDialog = React.lazy(() => import("./components/AddAnimalDialog").then((module) => ({ default: module.AddAnimalDialog })));
 
 const INITIAL_CREATURE: CreatureState = {
   head: "bear",
@@ -447,7 +449,7 @@ export default function App() {
 
     setAnimalsListRaw((prev) => {
       const customOnly = prev.filter((a) => a.id.startsWith("custom-"));
-      const updatedCustomOnly = [...customOnly, serializable];
+      const updatedCustomOnly = [...customOnly.filter((animal) => animal.id !== serializable.id), serializable];
       
       try {
         localStorage.setItem("creature_builder_custom_animals", JSON.stringify(updatedCustomOnly));
@@ -581,6 +583,14 @@ export default function App() {
             onDeleteAnimal={handleDeleteAnimal}
             onEditAnimal={handleEditAnimal}
           />
+
+          <React.Suspense fallback={<div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 text-[10px] font-mono text-zinc-500">Loading package compiler…</div>}>
+            <AnimalPackagePanel
+              animals={animalsList}
+              selectedAnimalId={creature.body}
+              onImport={handleAddAnimal}
+            />
+          </React.Suspense>
           
           <PartSelector
             animals={animalsList}
@@ -773,7 +783,7 @@ export default function App() {
       </main>
 
       {/* Dynamic Creation Dialog Modal Overlay */}
-      <AddAnimalDialog
+      {isAddModalOpen && <React.Suspense fallback={null}><AddAnimalDialog
         isOpen={isAddModalOpen}
         onClose={() => {
           setIsAddModalOpen(false);
@@ -808,7 +818,7 @@ export default function App() {
           setEditingAnimal(null);
         }}
         editingAnimal={editingAnimal}
-      />
+      /></React.Suspense>}
 
       {/* Footer info brand */}
       <footer className="mt-auto py-5 border-t border-zinc-800 text-center text-[11px] font-mono text-zinc-500 bg-[#18181b] select-none flex items-center justify-between px-6">

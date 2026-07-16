@@ -48,6 +48,10 @@ export interface Animal {
     backLegs: AnimalPart;
     tail: AnimalPart;
   };
+  /** Optional, backward-compatible provenance for AI-generated animals. */
+  generationMetadata?: import("./generation/contracts").GenerationMetadata;
+  /** Optional Phase 4 forward-kinematic rig and named poses. */
+  rig?: import("./rig/contracts").RigDefinition;
 }
 
 export interface PartAdjustment {

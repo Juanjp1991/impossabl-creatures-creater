@@ -47,6 +47,7 @@ const ATTRIBUTE_MAP: Record<string, string> = {
 
 function camelCaseAttribute(attr: string): string {
   const lower = attr.toLowerCase();
+  if (lower.startsWith("data-") || lower.startsWith("aria-")) return lower;
   if (ATTRIBUTE_MAP[lower]) return ATTRIBUTE_MAP[lower];
   return attr.replace(/-([a-z])/g, (g) => g[1].toUpperCase());
 }
@@ -59,7 +60,11 @@ export interface ShapeTransform {
   translateY: number;
   rotate: number;
   scale: number;
+  scaleX?: number;
+  scaleY?: number;
   fill?: string;
+  pivotX?: number;
+  pivotY?: number;
 }
 
 export interface SvgShapeInfo {
@@ -147,8 +152,9 @@ export function parseSvgToReact(
   colors?: { color?: string; accentColor?: string },
   originalColor?: string,
   originalAccentColor?: string,
-  shapeTransforms?: Record<number, ShapeTransform>,
-  highlightedShapeIndex?: number
+  shapeTransforms?: Record<string | number, ShapeTransform>,
+  highlightedShapeIndex?: string | number,
+  rigTransforms?: Record<string, string>
 ): React.ReactNode {
   if (!svgString) return null;
 
@@ -219,16 +225,21 @@ export function parseSvgToReact(
 
     // Apply shape-specific adjustment transforms if configured
     if (currentShapeIndex !== -1 && shapeTransforms && shapeTransforms[currentShapeIndex]) {
-      const transform = shapeTransforms[currentShapeIndex];
+      const stableId = node.getAttribute("id") || "";
+      const transform = shapeTransforms[stableId] || shapeTransforms[currentShapeIndex];
       let tString = "";
       if (transform.translateX !== 0 || transform.translateY !== 0) {
         tString += `translate(${transform.translateX}, ${transform.translateY}) `;
       }
       if (transform.rotate !== 0) {
-        tString += `rotate(${transform.rotate}) `;
+        tString += `rotate(${transform.rotate}, ${transform.pivotX || 0}, ${transform.pivotY || 0}) `;
       }
-      if (transform.scale !== 1) {
-        tString += `scale(${transform.scale}) `;
+      const scaleX = transform.scaleX ?? transform.scale;
+      const scaleY = transform.scaleY ?? transform.scale;
+      if (scaleX !== 1 || scaleY !== 1) {
+        const px = transform.pivotX || 0;
+        const py = transform.pivotY || 0;
+        tString += `translate(${px}, ${py}) scale(${scaleX}, ${scaleY}) translate(${-px}, ${-py}) `;
       }
 
       if (tString) {
@@ -241,8 +252,14 @@ export function parseSvgToReact(
       }
     }
 
+    const layerId = node.getAttribute("id") || "";
+    if (layerId && rigTransforms?.[layerId]) {
+      const existingTransform = props.transform || "";
+      props.transform = [existingTransform, rigTransforms[layerId]].filter(Boolean).join(" ");
+    }
+
     // Apply selective highlight styles if this shape is active
-    if (currentShapeIndex !== -1 && currentShapeIndex === highlightedShapeIndex) {
+    if (currentShapeIndex !== -1 && (currentShapeIndex === highlightedShapeIndex || node.getAttribute("id") === highlightedShapeIndex)) {
       props.style = {
         ...(props.style || {}),
         filter: "drop-shadow(0 0 3px #f59e0b) drop-shadow(0 0 6px #f59e0b)",

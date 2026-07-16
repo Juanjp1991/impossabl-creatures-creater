@@ -1,7 +1,19 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2 } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2 } from "lucide-react";
 import { Animal } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
+import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
+import { runGenerationPipeline } from "../generation/clientPipeline";
+import type { AnimalDraft, GenerationMetadata, GuidedAnimalBrief } from "../generation/contracts";
+import { validateAnimalDraft } from "../generation/validation";
+import { SvgLayersPanel } from "./SvgLayersPanel";
+import { RigEditorPanel } from "./RigEditorPanel";
+import { ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
+import type { RigDefinition } from "../rig/contracts";
+import { computeForwardKinematics, computeLocalJointMatrices, rigMatrixToSvg } from "../rig/engine";
+
+type EditablePart = "head" | "body" | "frontLegs" | "backLegs" | "tail";
+const EMPTY_HISTORY = (): Record<EditablePart, string[]> => ({ head: [], body: [], frontLegs: [], backLegs: [], tail: [] });
 
 interface AddAnimalDialogProps {
   isOpen: boolean;
@@ -148,14 +160,22 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [tailSvg, setTailSvg] = useState("");
 
   // Sub-shape adjustment states
-  const [shapeAdjustments, setShapeAdjustments] = useState<Record<"head" | "body" | "frontLegs" | "backLegs" | "tail", Record<number, ShapeTransform>>>({
+  const [shapeAdjustments, setShapeAdjustments] = useState<Record<EditablePart, Record<string, ShapeTransform>>>({
     head: {},
     body: {},
     frontLegs: {},
     backLegs: {},
     tail: {},
   });
-  const [activeShapeIndex, setActiveShapeIndex] = useState<number | null>(null);
+  const [activeShapeIndex, setActiveShapeIndex] = useState<string | null>(null);
+  const [svgUndo, setSvgUndo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
+  const [svgRedo, setSvgRedo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
+  const [keepLayerAnchorFixed, setKeepLayerAnchorFixed] = useState(true);
+  const [proportionalLayerScaling, setProportionalLayerScaling] = useState(true);
+  const previewStageRef = useRef<SVGSVGElement>(null);
+  const [selectedLayerBounds, setSelectedLayerBounds] = useState<{ x: number; y: number; width: number; height: number; transform: string } | null>(null);
+  const [rigDefinition, setRigDefinition] = useState<RigDefinition | undefined>();
+  const [rigPoseRotations, setRigPoseRotations] = useState<Record<string, number>>({});
 
   const [errorMsg, setErrorMsg] = useState("");
 
@@ -165,6 +185,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [generationStep, setGenerationStep] = useState("");
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
+  const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
+  const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
 
   const handleImageUpload = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -208,6 +231,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     if (e.target.files && e.target.files[0]) {
       handleImageUpload(e.target.files[0]);
     }
+  };
+
+  const updateBriefField = <K extends keyof GuidedAnimalBrief>(key: K, value: GuidedAnimalBrief[K]) => {
+    setGuidedBrief((current) => {
+      const next = { ...current, [key]: value };
+      return key === "summary" ? next : { ...next, summary: summarizeBrief(next) };
+    });
   };
 
   // Preview settings states
@@ -265,11 +295,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   // Pre-populate fields when editing an existing animal
   useEffect(() => {
     if (isOpen) {
+      setSvgUndo(EMPTY_HISTORY());
+      setSvgRedo(EMPTY_HISTORY());
       if (editingAnimal) {
         setName(editingAnimal.name);
         setColor(editingAnimal.color);
         setAccentColor(editingAnimal.accentColor);
         setDescription(editingAnimal.description);
+        setGenerationMetadata(editingAnimal.generationMetadata);
+        setGuidedBrief(editingAnimal.generationMetadata?.brief ?? createDefaultBrief(editingAnimal.name));
+        setPipelinePreviews(null);
+        setRigDefinition(editingAnimal.rig);
+        setRigPoseRotations(editingAnimal.rig?.bindPose ?? {});
         
         setNeckX(editingAnimal.bodyConnections.neck.x);
         setNeckY(editingAnimal.bodyConnections.neck.y);
@@ -304,6 +341,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setColor("#3B82F6");
         setAccentColor("#F59E0B");
         setDescription("");
+        setGenerationMetadata(undefined);
+        setGuidedBrief(createDefaultBrief());
+        setPipelinePreviews(null);
+        setRigDefinition(undefined);
+        setRigPoseRotations({});
         setNeckX(75);
         setNeckY(90);
         setTailX(260);
@@ -330,6 +372,15 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   }, [isOpen, editingAnimal]);
 
+  const applyAnimalDraft = (data: AnimalDraft) => {
+    setName(data.name || ""); setColor(data.color || "#cccccc"); setAccentColor(data.accentColor || "#ffaa00"); setDescription(data.description || "");
+    setNeckX(data.bodyConnections?.neck?.x ?? 75); setNeckY(data.bodyConnections?.neck?.y ?? 90);
+    setTailX(data.bodyConnections?.tail?.x ?? 260); setTailY(data.bodyConnections?.tail?.y ?? 105);
+    setFrontLegsX(data.bodyConnections?.frontLegs?.x ?? 115); setFrontLegsY(data.bodyConnections?.frontLegs?.y ?? 160);
+    setBackLegsX(data.bodyConnections?.backLegs?.x ?? 235); setBackLegsY(data.bodyConnections?.backLegs?.y ?? 160);
+    setHeadSvg(data.headSvg || ""); setBodySvg(data.bodySvg || ""); setFrontLegsSvg(data.frontLegsSvg || ""); setBackLegsSvg(data.backLegsSvg || ""); setTailSvg(data.tailSvg || "");
+  };
+
   const handleGenerateWithAI = async () => {
     if (!aiPrompt.trim() && !uploadedImage) {
       setErrorMsg("Please enter an animal description or upload an inspiring image first.");
@@ -338,82 +389,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     setIsGenerating(true);
     setErrorMsg("");
-    setGenerationStep("Contacting Gemini 3.5 Flash...");
+    const brief = { ...guidedBrief, animalName: aiPrompt.trim() || guidedBrief.animalName, summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: aiPrompt.trim() || guidedBrief.animalName }) };
+    if (!brief.animalName.trim()) { setErrorMsg("Animal name is required."); setIsGenerating(false); return; }
+    setGuidedBrief(brief);
+    setGenerationStep("Starting controlled Gemini pipeline...");
 
     try {
-      const timers = [
-        setTimeout(() => setGenerationStep("Drafting unique creature biology..."), 1200),
-        setTimeout(() => setGenerationStep("Forging vector coordinates for custom parts..."), 3000),
-        setTimeout(() => setGenerationStep("Aligning joints for head, legs, and tail..."), 5000),
-        setTimeout(() => setGenerationStep("Polishing SVG paths..."), 7000),
-      ];
-
-      const response = await fetch("/api/generate-animal", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ 
-          prompt: aiPrompt.trim(),
-          image: uploadedImage,
-        }),
-      });
-
-      timers.forEach(t => clearTimeout(t));
-
-      if (!response.ok) {
-        let errMsg = `Server returned error status ${response.status}`;
-        try {
-          const text = await response.text();
-          try {
-            const errData = JSON.parse(text);
-            errMsg = errData.error || errMsg;
-          } catch {
-            if (text.includes("<!doctype html>") || text.includes("<html")) {
-              errMsg = `Server error (${response.status}): The server is temporarily busy or returned an HTML error page. Please try again.`;
-            } else {
-              errMsg = text.substring(0, 150) || errMsg;
-            }
-          }
-        } catch {
-          // ignore
-        }
-        throw new Error(errMsg);
-      }
-
-      const data = await response.json().catch(() => {
-        throw new Error("Failed to parse the generated creature JSON data from the server.");
-      });
-      
-      setName(data.name || "");
-      setColor(data.color || "#cccccc");
-      setAccentColor(data.accentColor || "#ffaa00");
-      setDescription(data.description || "");
-      
-      if (data.bodyConnections) {
-        if (data.bodyConnections.neck) {
-          setNeckX(data.bodyConnections.neck.x ?? 75);
-          setNeckY(data.bodyConnections.neck.y ?? 90);
-        }
-        if (data.bodyConnections.tail) {
-          setTailX(data.bodyConnections.tail.x ?? 260);
-          setTailY(data.bodyConnections.tail.y ?? 105);
-        }
-        if (data.bodyConnections.frontLegs) {
-          setFrontLegsX(data.bodyConnections.frontLegs.x ?? 115);
-          setFrontLegsY(data.bodyConnections.frontLegs.y ?? 160);
-        }
-        if (data.bodyConnections.backLegs) {
-          setBackLegsX(data.bodyConnections.backLegs.x ?? 235);
-          setBackLegsY(data.bodyConnections.backLegs.y ?? 160);
-        }
-      }
-
-      setHeadSvg(data.headSvg || "");
-      setBodySvg(data.bodySvg || "");
-      setFrontLegsSvg(data.frontLegsSvg || "");
-      setBackLegsSvg(data.backLegsSvg || "");
-      setTailSvg(data.tailSvg || "");
+      const result = await runGenerationPipeline({ prompt: brief.animalName, image: uploadedImage, brief, onStep: setGenerationStep, onDraft: applyAnimalDraft });
+      applyAnimalDraft(result.animal);
+      setGenerationMetadata(result.metadata);
+      setPipelinePreviews({ cleanSvg: result.cleanSvg, diagnosticSvg: result.diagnosticSvg });
 
       // Reset transform adjustments for fresh generation
       setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
@@ -423,10 +408,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
       setActiveTweakPart("head");
 
-      setAiPrompt("");
       setAiMode("refine"); // Auto-switch to refine mode upon successful generation
-      setGenerationStep("Success! Animal draft generated below. Feel free to tweak and forge!");
-      setTimeout(() => setGenerationStep(""), 5000);
+      const remaining = result.metadata.validationHistory.at(-1)?.issues.length ?? 0;
+      setGenerationStep(result.metadata.finalStatus === "approved" ? "Pipeline complete: visual review approved." : `Pipeline stopped safely with ${remaining} technical issue(s) or visual warnings. Manual editing remains available.`);
     } catch (err: any) {
       console.error(err);
       setErrorMsg(err?.message || "An unexpected error occurred during generation. Make sure GEMINI_API_KEY is configured.");
@@ -591,6 +575,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setErrorMsg("All five part SVGs (Head, Body, Front Legs, Back Legs, Tail) must be populated.");
       return;
     }
+    let finalGenerationMetadata = generationMetadata;
+    if (generationMetadata) {
+      const validation = validateAnimalDraft({ name, color, accentColor, description: description || name, bodyConnections: { neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY }, frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY } }, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg }, generationMetadata.plan);
+      finalGenerationMetadata = { ...generationMetadata, validationHistory: [...generationMetadata.validationHistory, validation], finalStatus: validation.valid ? generationMetadata.finalStatus : "technical-failure" };
+      setGenerationMetadata(finalGenerationMetadata);
+      if (!validation.valid) {
+        setErrorMsg(`Technical validation found ${validation.issues.filter((entry) => entry.severity === "error").length} blocking issue(s). Repair the listed SVG parts before forging.`);
+        return;
+      }
+    }
 
     // Helper to bake the custom transformations into the raw SVG strings via group wraps
     const wrapWithTransform = (svg: string, tx: number, ty: number, rot: number, scale: number, px: number, py: number) => {
@@ -605,7 +599,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     const applyShapeTransformsToSvg = (
       svgString: string,
-      transforms: Record<number, ShapeTransform>
+      transforms: Record<string, ShapeTransform>
     ): string => {
       if (!svgString.trim()) return "";
       if (!transforms || Object.keys(transforms).length === 0) return svgString;
@@ -623,17 +617,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           const tagName = node.tagName.toLowerCase();
           if (isAdjustableTag(tagName)) {
             const currentIdx = shapeCounter++;
-            const t = transforms[currentIdx];
+            const t = transforms[node.getAttribute("id") || String(currentIdx)];
             if (t) {
               let tString = "";
               if (t.translateX !== 0 || t.translateY !== 0) {
                 tString += `translate(${t.translateX}, ${t.translateY}) `;
               }
               if (t.rotate !== 0) {
-                tString += `rotate(${t.rotate}) `;
+                tString += `rotate(${t.rotate}, ${t.pivotX || 0}, ${t.pivotY || 0}) `;
               }
-              if (t.scale !== 1) {
-                tString += `scale(${t.scale}) `;
+              const scaleX = t.scaleX ?? t.scale;
+              const scaleY = t.scaleY ?? t.scale;
+              if (scaleX !== 1 || scaleY !== 1) {
+                const px = t.pivotX || 0;
+                const py = t.pivotY || 0;
+                tString += `translate(${px}, ${py}) scale(${scaleX}, ${scaleY}) translate(${-px}, ${-py}) `;
               }
               tString = tString.trim();
 
@@ -667,11 +665,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       }
     };
 
-    const bakedHeadSvg = applyShapeTransformsToSvg(headSvg, shapeAdjustments.head);
-    const bakedBodySvg = applyShapeTransformsToSvg(bodySvg, shapeAdjustments.body);
-    const bakedFrontLegsSvg = applyShapeTransformsToSvg(frontLegsSvg, shapeAdjustments.frontLegs);
-    const bakedBackLegsSvg = applyShapeTransformsToSvg(backLegsSvg, shapeAdjustments.backLegs);
-    const bakedTailSvg = applyShapeTransformsToSvg(tailSvg, shapeAdjustments.tail);
+    const bakedHeadSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(headSvg, "head"), shapeAdjustments.head);
+    const bakedBodySvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(bodySvg, "body"), shapeAdjustments.body);
+    const bakedFrontLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(frontLegsSvg, "frontLegs"), shapeAdjustments.frontLegs);
+    const bakedBackLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(backLegsSvg, "backLegs"), shapeAdjustments.backLegs);
+    const bakedTailSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(tailSvg, "tail"), shapeAdjustments.tail);
 
     const finalHeadSvg = wrapWithTransform(bakedHeadSvg, headTx, headTy, headRot, headScale, headPivotX, headPivotY);
     const finalBodySvg = wrapWithTransform(bakedBodySvg, bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
@@ -755,6 +753,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           rawContent: finalTailSvg.trim(),
         },
       },
+      generationMetadata: finalGenerationMetadata,
+      rig: rigDefinition,
     };
 
     onAddAnimal(newAnimal);
@@ -792,7 +792,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       case "body":
         return {
           tx: bodyTx, setTx: setBodyTx,
-          ty: bodyTy, setTy: setHeadTy, // wait, map to correct setter
+          ty: bodyTy, setTy: setBodyTy,
           rot: bodyRot, setRot: setBodyRot,
           scale: bodyScale, setScale: setBodyScale,
           px: bodyPivotX, setPx: setBodyPivotX,
@@ -836,9 +836,190 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     return activeTweakPart === "head" ? headSvg : activeTweakPart === "body" ? bodySvg : activeTweakPart === "frontLegs" ? frontLegsSvg : activeTweakPart === "backLegs" ? backLegsSvg : tailSvg;
   }, [activeTweakPart, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
 
+  const setPartSvg = (part: EditablePart, value: string) => {
+    if (part === "head") setHeadSvg(value);
+    else if (part === "body") setBodySvg(value);
+    else if (part === "frontLegs") setFrontLegsSvg(value);
+    else if (part === "backLegs") setBackLegsSvg(value);
+    else setTailSvg(value);
+  };
+
+  const commitActiveSvg = (next: string) => {
+    if (next === activePartSvgCode) return;
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart].slice(-49), activePartSvgCode] }));
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: [] }));
+    setPartSvg(activeTweakPart, next);
+  };
+
+  const undoSvg = () => {
+    const stack = svgUndo[activeTweakPart];
+    const previous = stack.at(-1);
+    if (previous === undefined) return;
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: history[activeTweakPart].slice(0, -1) }));
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart], activePartSvgCode] }));
+    setPartSvg(activeTweakPart, previous);
+  };
+
+  const redoSvg = () => {
+    const stack = svgRedo[activeTweakPart];
+    const next = stack.at(-1);
+    if (next === undefined) return;
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: history[activeTweakPart].slice(0, -1) }));
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart], activePartSvgCode] }));
+    setPartSvg(activeTweakPart, next);
+  };
+
+  useEffect(() => {
+    if (!activePartSvgCode.trim()) return;
+    const stabilized = ensureStableSvgLayerIds(activePartSvgCode, activeTweakPart);
+    if (stabilized !== activePartSvgCode) setPartSvg(activeTweakPart, stabilized);
+  }, [activePartSvgCode, activeTweakPart]);
+
   const shapes = useMemo(() => {
     return activePartSvgCode ? getSvgShapes(activePartSvgCode) : [];
   }, [activePartSvgCode]);
+
+  const layerTree = useMemo(() => activePartSvgCode ? getSvgLayerTree(activePartSvgCode) : [], [activePartSvgCode]);
+  const activeLayerIds = useMemo(() => {
+    const ids: string[] = [];
+    const visit = (nodes: typeof layerTree) => nodes.forEach((node) => { ids.push(node.id); visit(node.children); });
+    visit(layerTree);
+    return ids;
+  }, [layerTree]);
+
+  const rigTransformsByPart = useMemo(() => {
+    const transforms: Record<EditablePart, Record<string, string>> = { head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} };
+    if (!rigDefinition?.joints.length) return transforms;
+    try {
+      const result = computeForwardKinematics(rigDefinition, rigPoseRotations);
+      const localMatrices = computeLocalJointMatrices(rigDefinition, rigPoseRotations);
+      const svgByPart: Record<EditablePart, string> = { head: headSvg, body: bodySvg, frontLegs: frontLegsSvg, backLegs: backLegsSvg, tail: tailSvg };
+      for (const joint of rigDefinition.joints) if (joint.partId in transforms) {
+        let nestedUnderParent = false;
+        const parent = joint.parentJointId ? rigDefinition.joints.find((item) => item.id === joint.parentJointId) : undefined;
+        if (parent && parent.partId === joint.partId && typeof DOMParser !== "undefined") {
+          const document = new DOMParser().parseFromString(`<g>${svgByPart[joint.partId as EditablePart]}</g>`, "image/svg+xml");
+          const elements = [...document.querySelectorAll("[id]")];
+          const childElement = elements.find((element) => element.id === joint.targetGroupId);
+          const parentElement = elements.find((element) => element.id === parent.targetGroupId);
+          nestedUnderParent = Boolean(childElement && parentElement?.contains(childElement));
+        }
+        transforms[joint.partId as EditablePart][joint.targetGroupId] = rigMatrixToSvg(nestedUnderParent ? localMatrices.get(joint.id)! : result.matrices.get(joint.id)!);
+      }
+    } catch { /* Invalid in-progress parent edits are shown without applying a pose. */ }
+    return transforms;
+  }, [rigDefinition, rigPoseRotations, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
+
+  const updateLayer = (operation: (svg: string) => string) => commitActiveSvg(operation(activePartSvgCode));
+  const moveLayer = (id: string, direction: LayerMove) => updateLayer((svg) => moveSvgLayer(svg, id, direction));
+
+  useEffect(() => {
+    if (!activeShapeIndex || !previewStageRef.current) { setSelectedLayerBounds(null); return; }
+    const frame = requestAnimationFrame(() => {
+      const partGroup = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+      const element = partGroup ? [...partGroup.querySelectorAll("[id]")].find((candidate) => candidate.id === activeShapeIndex) as SVGGraphicsElement | undefined : undefined;
+      if (!element || typeof element.getBBox !== "function") { setSelectedLayerBounds(null); return; }
+      try {
+        const box = element.getBBox();
+        setSelectedLayerBounds({ x: box.x, y: box.y, width: Math.max(box.width, 1), height: Math.max(box.height, 1), transform: element.getAttribute("transform") || "" });
+      } catch { setSelectedLayerBounds(null); }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeShapeIndex, activePartSvgCode, activeTweakPart]);
+
+  type PointerAction = "move" | "rotate" | "scale-n" | "scale-ne" | "scale-e" | "scale-se" | "scale-s" | "scale-sw" | "scale-w" | "scale-nw";
+  const attachmentPivot = () => activeTweakPart === "head" ? { x: 120, y: 110 }
+    : activeTweakPart === "frontLegs" ? { x: 75, y: 15 }
+    : activeTweakPart === "backLegs" ? { x: 195, y: 15 }
+    : activeTweakPart === "tail" ? { x: 15, y: 15 }
+    : { x: neckX, y: neckY };
+
+  const startLayerPointerAction = (action: PointerAction, event: React.PointerEvent<SVGElement>) => {
+    if (!activeShapeIndex || !selectedLayerBounds || !previewStageRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const part = activeTweakPart;
+    const layerId = activeShapeIndex;
+    const originalSvg = activePartSvgCode;
+    const originalTransform = getSvgLayerTransform(originalSvg, layerId);
+    const partGroup = previewStageRef.current.querySelector(`[data-editor-part="${part}"]`) as SVGGElement | null;
+    const matrix = partGroup?.getScreenCTM();
+    if (!partGroup || !matrix) return;
+    const toLocal = (clientX: number, clientY: number) => {
+      const point = previewStageRef.current!.createSVGPoint();
+      point.x = clientX; point.y = clientY;
+      return point.matrixTransform(matrix.inverse());
+    };
+    const start = toLocal(event.clientX, event.clientY);
+    const bounds = selectedLayerBounds;
+    const startScaleX = originalTransform.scaleX ?? originalTransform.scale ?? 1;
+    const startScaleY = originalTransform.scaleY ?? originalTransform.scale ?? 1;
+    const fixed = attachmentPivot();
+    const oppositePivot = {
+      x: action.includes("w") ? bounds.x + bounds.width : action.includes("e") ? bounds.x : bounds.x + bounds.width / 2,
+      y: action.includes("n") ? bounds.y + bounds.height : action.includes("s") ? bounds.y : bounds.y + bounds.height / 2,
+    };
+    const pivot = keepLayerAnchorFixed && action.startsWith("scale") ? fixed : {
+      x: originalTransform.pivotX ?? oppositePivot.x,
+      y: originalTransform.pivotY ?? oppositePivot.y,
+    };
+    const startAngle = Math.atan2(start.y - pivot.y, start.x - pivot.x);
+    let latestSvg = originalSvg;
+
+    const move = (pointer: PointerEvent) => {
+      const current = toLocal(pointer.clientX, pointer.clientY);
+      const dx = current.x - start.x;
+      const dy = current.y - start.y;
+      let next: ShapeTransform = { ...originalTransform };
+      if (action === "move") {
+        next = { ...next, translateX: (originalTransform.translateX || 0) + dx, translateY: (originalTransform.translateY || 0) + dy };
+      } else if (action === "rotate") {
+        const angle = Math.atan2(current.y - pivot.y, current.x - pivot.x);
+        next = { ...next, rotate: (originalTransform.rotate || 0) + (angle - startAngle) * 180 / Math.PI, pivotX: pivot.x, pivotY: pivot.y };
+      } else {
+        let factorX = action.includes("e") ? 1 + dx / bounds.width : action.includes("w") ? 1 - dx / bounds.width : 1;
+        let factorY = action.includes("s") ? 1 + dy / bounds.height : action.includes("n") ? 1 - dy / bounds.height : 1;
+        factorX = Math.max(.1, factorX); factorY = Math.max(.1, factorY);
+        if (proportionalLayerScaling) {
+          const factors = [action.includes("e") || action.includes("w") ? factorX : undefined, action.includes("n") || action.includes("s") ? factorY : undefined].filter((value): value is number => value !== undefined);
+          const factor = factors.reduce((sum, value) => sum + value, 0) / factors.length;
+          factorX = factorY = factor;
+        }
+        next = { ...next, scale: 1, scaleX: startScaleX * factorX, scaleY: startScaleY * factorY, pivotX: pivot.x, pivotY: pivot.y };
+      }
+      latestSvg = setSvgLayerTransform(originalSvg, layerId, next);
+      setPartSvg(part, latestSvg);
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      if (latestSvg !== originalSvg) {
+        setSvgUndo((history) => ({ ...history, [part]: [...history[part].slice(-49), originalSvg] }));
+        setSvgRedo((history) => ({ ...history, [part]: [] }));
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish, { once: true });
+  };
+
+  const renderLayerSelection = (part: EditablePart) => {
+    if (part !== activeTweakPart || !activeShapeIndex || !selectedLayerBounds) return null;
+    const { x, y, width, height, transform } = selectedLayerBounds;
+    const middleX = x + width / 2;
+    const middleY = y + height / 2;
+    const handles: Array<{ action: PointerAction; x: number; y: number; cursor: string }> = [
+      { action: "scale-nw", x, y, cursor: "nwse-resize" }, { action: "scale-n", x: middleX, y, cursor: "ns-resize" },
+      { action: "scale-ne", x: x + width, y, cursor: "nesw-resize" }, { action: "scale-e", x: x + width, y: middleY, cursor: "ew-resize" },
+      { action: "scale-se", x: x + width, y: y + height, cursor: "nwse-resize" }, { action: "scale-s", x: middleX, y: y + height, cursor: "ns-resize" },
+      { action: "scale-sw", x, y: y + height, cursor: "nesw-resize" }, { action: "scale-w", x, y: middleY, cursor: "ew-resize" },
+    ];
+    return <g transform={transform} data-testid="layer-selection-overlay">
+      <rect x={x} y={y} width={width} height={height} fill="rgba(245,158,11,.04)" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4 3" style={{ cursor: "move" }} onPointerDown={(event) => startLayerPointerAction("move", event)} />
+      <line x1={middleX} y1={y} x2={middleX} y2={y - 24} stroke="#f59e0b" strokeWidth="1" />
+      <circle cx={middleX} cy={y - 28} r="5" fill="#18181b" stroke="#f59e0b" strokeWidth="2" style={{ cursor: "grab" }} onPointerDown={(event) => startLayerPointerAction("rotate", event)} />
+      {handles.map((handle) => <rect key={handle.action} x={handle.x - 4} y={handle.y - 4} width="8" height="8" rx="1" fill="#f59e0b" stroke="#18181b" strokeWidth="1" style={{ cursor: handle.cursor }} onPointerDown={(event) => startLayerPointerAction(handle.action, event)} />)}
+    </g>;
+  };
 
   const activeT = getActiveTransform();
 
@@ -870,7 +1051,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
     const partTransforms = shapeAdjustments[partType];
     const highlightIdx = activeTweakPart === partType && activeShapeIndex !== null ? activeShapeIndex : undefined;
-    return parseSvgToReact(svgContent, { color, accentColor }, undefined, undefined, partTransforms, highlightIdx);
+    return parseSvgToReact(svgContent, { color, accentColor }, undefined, undefined, partTransforms, highlightIdx, rigTransformsByPart[partType]);
   };
 
   // Base translation of body in preview
@@ -1091,21 +1272,27 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               {/* Right Column: Text Prompts & Action triggers */}
               <div className="md:col-span-8 flex flex-col justify-end">
                 {aiMode === "summon" ? (
-                  <div className="flex flex-col gap-1.5 w-full">
-                    <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">
-                      Summoning Prompt:
-                    </label>
+                  <div className="flex flex-col gap-2.5 w-full">
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="text-[9px] font-mono text-zinc-400 uppercase">Preset
+                        <select value={guidedBrief.preset} disabled={isGenerating} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                          {GENERATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                        </select>
+                      </label>
+                      <label className="text-[9px] font-mono text-zinc-400 uppercase">Quality
+                        <select value={guidedBrief.mode} disabled={isGenerating} onChange={(event) => updateBriefField("mode", event.target.value as GuidedAnimalBrief["mode"])} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                          <option value="draft">Draft</option><option value="high-quality">High quality</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">Animal name (required)</label>
                     <div className="flex gap-2">
                       <input
                         type="text"
                         disabled={isGenerating}
-                        placeholder={
-                          uploadedImage
-                            ? "Describe how to adapt the image (optional, e.g., 'Make it a metallic dragon')"
-                            : "Describe your animal (e.g., 'A mechanical steampunk wolf', 'A cute sapphire owl')"
-                        }
+                        placeholder="e.g. cow"
                         value={aiPrompt}
-                        onChange={(e) => setAiPrompt(e.target.value)}
+                        onChange={(e) => { setAiPrompt(e.target.value); updateBriefField("animalName", e.target.value); }}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
                             e.preventDefault();
@@ -1133,6 +1320,38 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         )}
                       </button>
                     </div>
+                    <details className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-2">
+                      <summary className="cursor-pointer text-[10px] font-mono font-bold text-amber-400">GUIDED BRIEF OPTIONS</summary>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+                        {([
+                          ["sexOrVariant", "Sex / variant", ["neutral", "female", "male", "cow", "bull"]],
+                          ["age", "Age", ["young", "adult", "mature"]],
+                          ["bodyBuild", "Body build", ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"]],
+                          ["style", "Style", ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"]],
+                          ["detailLevel", "Detail", ["low", "medium", "high"]],
+                          ["pose", "Pose", ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"]],
+                          ["expression", "Expression", ["friendly", "calm", "alert", "determined", "curious and cheerful"]],
+                        ] as Array<[keyof GuidedAnimalBrief, string, string[]]>).map(([key, label, values]) => (
+                          <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
+                            <select value={String(guidedBrief[key])} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300">
+                              {values.map((value) => <option key={value} value={value}>{value}</option>)}
+                            </select>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                        {([[
+                          "mainColour", "Main colour", "natural species colours"
+                        ], ["markings", "Markings", "recognizable species markings"], ["definingAnatomy", "Defining anatomy", "horns, tusks, mane, shell..."], ["advancedInstructions", "Advanced instructions", "Optional extra direction"]] as Array<[keyof GuidedAnimalBrief, string, string]>).map(([key, label, placeholder]) => (
+                          <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
+                            <input value={String(guidedBrief[key])} placeholder={placeholder} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300" />
+                          </label>
+                        ))}
+                      </div>
+                    </details>
+                    <label className="text-[9px] font-mono text-zinc-400 uppercase">Editable expanded brief
+                      <textarea rows={3} value={guidedBrief.summary} onChange={(event) => updateBriefField("summary", event.target.value)} className="mt-1 w-full text-[10px] leading-relaxed p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-300 resize-y" />
+                    </label>
                   </div>
                 ) : (
                   <div className="flex flex-col gap-2.5 w-full">
@@ -1226,6 +1445,30 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                 <span>{generationStep}</span>
               </div>
             )}
+            {generationMetadata && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="md:col-span-1 text-[9px] font-mono text-zinc-400 space-y-1">
+                  <p className="font-bold text-amber-400 uppercase">Pipeline record: {generationMetadata.finalStatus}</p>
+                  <p>Model: {generationMetadata.models.generator}</p>
+                  <p>Prompts: {Object.values(generationMetadata.promptVersions).join(" · ")}</p>
+                  <p>Automatic repairs: {generationMetadata.completedRepairRounds}/{generationMetadata.automaticRepairLimit}</p>
+                  <p>Validation runs: {generationMetadata.validationHistory.length} · Reviews: {generationMetadata.reviewHistory.length}</p>
+                  <div className="flex items-center gap-1 pt-1"><span>Final rating:</span>{[1, 2, 3, 4, 5].map((rating) => <button type="button" key={rating} onClick={() => setGenerationMetadata((current) => current ? { ...current, finalUserRating: rating } : current)} className={`h-5 w-5 rounded border text-[9px] ${generationMetadata.finalUserRating === rating ? "border-amber-400 bg-amber-500 text-zinc-950" : "border-zinc-700 bg-zinc-900"}`}>{rating}</button>)}</div>
+                  {(generationMetadata.validationHistory.at(-1)?.issues.length ?? 0) > 0 && (
+                    <ul className="mt-2 max-h-20 overflow-auto text-red-300">
+                      {generationMetadata.validationHistory.at(-1)!.issues.map((entry, index) => <li key={`${entry.code}-${index}`}>{entry.part}: {entry.message}</li>)}
+                    </ul>
+                  )}
+                  {generationMetadata.finalStatus !== "approved" && <p className="text-amber-300">Remaining warnings are visible; use part-only refinement or the SVG editors below.</p>}
+                </div>
+                {pipelinePreviews && (["cleanSvg", "diagnosticSvg"] as const).map((key) => (
+                  <figure key={key} className="rounded-lg border border-zinc-800 overflow-hidden bg-white">
+                    <img src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(pipelinePreviews[key])}`} alt={key === "cleanSvg" ? "Clean assembled preview" : "Diagnostic preview with part boundaries and anchors"} className="w-full aspect-[6/5] object-contain" />
+                    <figcaption className="bg-zinc-900 px-2 py-1 text-[8px] font-mono uppercase text-zinc-400">{key === "cleanSvg" ? "Clean preview" : "Diagnostic preview"}</figcaption>
+                  </figure>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -1259,6 +1502,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               {/* Interactive Vector Stage */}
               <div className="relative w-full aspect-square bg-zinc-950 border border-zinc-850 rounded-xl overflow-hidden shadow-inner group">
                 <svg
+                  ref={previewStageRef}
                   viewBox="0 0 600 500"
                   className="w-full h-full select-none"
                   xmlns="http://www.w3.org/2000/svg"
@@ -1288,8 +1532,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "tail" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("tail")}
                   >
-                    <g transform={tailTransformStr}>
+                    <g data-editor-part="tail" transform={tailTransformStr}>
                       {renderPartPreview("tail", tailSvg)}
+                      {renderLayerSelection("tail")}
                     </g>
                     {activeTweakPart === "tail" && (
                       <rect
@@ -1310,8 +1555,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("backLegs")}
                   >
-                    <g transform={backLegsTransformStr}>
+                    <g data-editor-part="backLegs" transform={backLegsTransformStr}>
                       {renderPartPreview("backLegs", backLegsSvg)}
+                      {renderLayerSelection("backLegs")}
                     </g>
                     {activeTweakPart === "backLegs" && (
                       <rect
@@ -1332,8 +1578,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("body")}
                   >
-                    <g transform={bodyTransformStr}>
+                    <g data-editor-part="body" transform={bodyTransformStr}>
                       {renderPartPreview("body", bodySvg)}
+                      {renderLayerSelection("body")}
                     </g>
                     {activeTweakPart === "body" && (
                       <rect
@@ -1354,8 +1601,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("frontLegs")}
                   >
-                    <g transform={frontLegsTransformStr}>
+                    <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
                       {renderPartPreview("frontLegs", frontLegsSvg)}
+                      {renderLayerSelection("frontLegs")}
                     </g>
                     {activeTweakPart === "frontLegs" && (
                       <rect
@@ -1376,8 +1624,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("head")}
                   >
-                    <g transform={headTransformStr}>
+                    <g data-editor-part="head" transform={headTransformStr}>
                       {renderPartPreview("head", headSvg)}
+                      {renderLayerSelection("head")}
                     </g>
                     {activeTweakPart === "head" && (
                       <rect
@@ -1640,15 +1889,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <SlidersHorizontal size={12} />
                       Sub-Shape Adjuster ({activeTweakPart})
                     </div>
+                    <div className="flex items-center gap-1">
+                      <button type="button" title="Undo layer edit" disabled={!svgUndo[activeTweakPart].length} onClick={undoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Undo2 size={10}/></button>
+                      <button type="button" title="Redo layer edit" disabled={!svgRedo[activeTweakPart].length} onClick={redoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Redo2 size={10}/></button>
                     {activeShapeIndex !== null && (
                       <button
                         type="button"
                         onClick={() => {
-                          setShapeAdjustments(prev => {
-                            const partAdjustments = { ...prev[activeTweakPart] };
-                            delete partAdjustments[activeShapeIndex];
-                            return { ...prev, [activeTweakPart]: partAdjustments };
-                          });
+                          commitActiveSvg(resetSvgLayerTransform(activePartSvgCode, activeShapeIndex));
                           setActiveShapeIndex(null);
                         }}
                         className="text-[9px] font-mono font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white px-1.5 py-0.5 rounded transition-colors"
@@ -1656,6 +1904,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         RESET SHAPE
                       </button>
                     )}
+                    </div>
                   </div>
 
                   {shapes.length === 0 ? (
@@ -1664,46 +1913,36 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      {/* Shape Selector Dropdown */}
                       <div className="space-y-1">
-                        <label className="text-[9px] text-zinc-400 font-mono block">Select Shape Layer</label>
-                        <select
-                          value={activeShapeIndex !== null ? activeShapeIndex : ""}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setActiveShapeIndex(val === "" ? null : parseInt(val));
+                        <label className="text-[9px] text-zinc-400 font-mono block">Stable SVG Layers</label>
+                        <SvgLayersPanel
+                          layers={layerTree}
+                          selectedId={activeShapeIndex}
+                          onSelect={setActiveShapeIndex}
+                          onRename={(id, value) => updateLayer((svg) => renameSvgLayer(svg, id, value))}
+                          onVisibility={(id, visible) => updateLayer((svg) => setSvgLayerVisibility(svg, id, visible))}
+                          onLock={(id, locked) => {
+                            updateLayer((svg) => setSvgLayerLocked(svg, id, locked));
+                            if (locked && activeShapeIndex === id) setActiveShapeIndex(null);
                           }}
-                          className="w-full text-xs font-mono px-2 py-1.5 bg-zinc-950 border border-zinc-800 rounded-md text-zinc-300 focus:outline-none focus:border-amber-500"
-                        >
-                          <option value="">-- Choose a shape path --</option>
-                          {shapes.map((s, i) => (
-                            <option key={i} value={i}>
-                              [{i}] {s.tagName.toUpperCase()} ({s.id || s.fill || "no fill"})
-                            </option>
-                          ))}
-                        </select>
+                          onMove={moveLayer}
+                        />
                       </div>
 
                       {activeShapeIndex !== null && (
                         <div className="space-y-2.5 p-2.5 bg-zinc-950/50 rounded-lg border border-zinc-900/60 animate-fade-in">
                           {/* Sub-shape transform inputs */}
                           {(() => {
-                            const currentTransform: ShapeTransform = shapeAdjustments[activeTweakPart][activeShapeIndex] || {
-                              translateX: 0,
-                              translateY: 0,
-                              scale: 1,
-                              rotate: 0,
-                            };
+                            const currentTransform: ShapeTransform = getSvgLayerTransform(activePartSvgCode, activeShapeIndex);
 
                             const updateTransform = (fields: Partial<ShapeTransform>) => {
-                              setShapeAdjustments(prev => {
-                                const partAdjustments = { ...prev[activeTweakPart] };
-                                partAdjustments[activeShapeIndex] = {
-                                  ...currentTransform,
-                                  ...fields,
-                                };
-                                return { ...prev, [activeTweakPart]: partAdjustments };
-                              });
+                              const fixedPivot = activeTweakPart === "head" ? { pivotX: 120, pivotY: 110 }
+                                : activeTweakPart === "frontLegs" ? { pivotX: 75, pivotY: 15 }
+                                : activeTweakPart === "backLegs" ? { pivotX: 195, pivotY: 15 }
+                                : activeTweakPart === "tail" ? { pivotX: 15, pivotY: 15 }
+                                : { pivotX: neckX, pivotY: neckY };
+                              const next = { ...currentTransform, ...(keepLayerAnchorFixed && fields.scale !== undefined ? fixedPivot : {}), ...fields };
+                              commitActiveSvg(setSvgLayerTransform(activePartSvgCode, activeShapeIndex, next));
                             };
 
                             return (
@@ -1763,7 +2002,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                                 <div className="space-y-1">
                                   <div className="flex justify-between text-[9px]">
                                     <span className="text-zinc-400">Shape Scale</span>
-                                    <span className="text-amber-500 font-bold">x{(currentTransform.scale !== undefined ? currentTransform.scale : 1).toFixed(2)}</span>
+                                    <span className="text-amber-500 font-bold">X {(currentTransform.scaleX ?? currentTransform.scale ?? 1).toFixed(2)} · Y {(currentTransform.scaleY ?? currentTransform.scale ?? 1).toFixed(2)}</span>
                                   </div>
                                   <input
                                     type="range"
@@ -1771,9 +2010,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                                     max="3"
                                     step="0.05"
                                     value={currentTransform.scale !== undefined ? currentTransform.scale : 1}
-                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0 })}
+                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0, scaleX: undefined, scaleY: undefined })}
                                     className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
                                   />
+                                </div>
+
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={keepLayerAnchorFixed} onChange={(event) => setKeepLayerAnchorFixed(event.target.checked)} className="accent-amber-500" />
+                                  Keep attachment anchor fixed while scaling
+                                </label>
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={proportionalLayerScaling} onChange={(event) => setProportionalLayerScaling(event.target.checked)} className="accent-amber-500" />
+                                  Proportional corner/side resizing
+                                </label>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                  <label className="text-[9px] text-zinc-400">Pivot X<input type="number" value={currentTransform.pivotX ?? 0} onChange={(event) => updateTransform({ pivotX: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
+                                  <label className="text-[9px] text-zinc-400">Pivot Y<input type="number" value={currentTransform.pivotY ?? 0} onChange={(event) => updateTransform({ pivotY: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
                                 </div>
 
                                 {/* Fill Color override */}
@@ -1813,6 +2066,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   )}
                 </div>
               </div>
+              <RigEditorPanel
+                partId={activeTweakPart}
+                selectedGroupId={activeShapeIndex}
+                groupIds={activeLayerIds}
+                defaultPivot={attachmentPivot()}
+                rig={rigDefinition}
+                rotations={rigPoseRotations}
+                onRigChange={setRigDefinition}
+                onRotationsChange={setRigPoseRotations}
+              />
             </div>
 
             {/* COLUMN 2: Basic Info & Joints */}

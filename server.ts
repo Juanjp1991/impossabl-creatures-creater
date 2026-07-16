@@ -2,12 +2,20 @@ import express from "express";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type GuidedAnimalBrief, type VisualReviewReport } from "./src/generation/contracts";
+import { validateAnimalDraft } from "./src/generation/validation";
+import { mergeTargetedRepair } from "./src/generation/repair";
+import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const HMR_PORT = Number(process.env.HMR_PORT) || 24678;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const PROMPT_VERSIONS = { planner: "p0-plan-1.0.0", generator: "p0-svg-1.0.0", reviewer: "p0-review-1.0.0", repair: "p0-repair-1.0.0" };
+const MODEL_VERSIONS = { planner: GEMINI_MODEL, generator: GEMINI_MODEL, reviewer: GEMINI_MODEL, repair: GEMINI_MODEL };
 
 // Set up body parsers
 app.use(express.json({ limit: "15mb" }));
@@ -100,160 +108,151 @@ function getFriendlyErrorMessage(error: any): string {
   return errorStr;
 }
 
-// AI-driven custom animal generator endpoint
+function imagePartFromDataUrl(image: unknown) {
+  if (typeof image !== "string" || !image.trim()) return null;
+  const match = image.match(/^data:([^;]+);base64,(.+)$/);
+  return { inlineData: { mimeType: match?.[1] || "image/png", data: match?.[2] || image } };
+}
+
+function assertBrief(value: unknown): GuidedAnimalBrief {
+  const brief = value as GuidedAnimalBrief;
+  if (!brief || typeof brief !== "object" || typeof brief.animalName !== "string" || !brief.animalName.trim() || typeof brief.summary !== "string" || !brief.summary.trim()) {
+    throw new Error("A complete guided animal brief with an editable summary is required.");
+  }
+  return brief;
+}
+
+const pointSchema = { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ["x", "y"] };
+const animalDraftSchema = {
+  type: Type.OBJECT,
+  properties: {
+    name: { type: Type.STRING }, color: { type: Type.STRING }, accentColor: { type: Type.STRING }, description: { type: Type.STRING },
+    bodyConnections: { type: Type.OBJECT, properties: { neck: pointSchema, tail: pointSchema, frontLegs: pointSchema, backLegs: pointSchema }, required: ["neck", "tail", "frontLegs", "backLegs"] },
+    headSvg: { type: Type.STRING }, bodySvg: { type: Type.STRING }, frontLegsSvg: { type: Type.STRING }, backLegsSvg: { type: Type.STRING }, tailSvg: { type: Type.STRING },
+  },
+  required: ["name", "color", "accentColor", "description", "bodyConnections", "headSvg", "bodySvg", "frontLegsSvg", "backLegsSvg", "tailSvg"],
+};
+
+const planSchema = {
+  type: Type.OBJECT,
+  properties: {
+    speciesFeatures: { type: Type.ARRAY, items: { type: Type.STRING } },
+    anatomyTemplate: { type: Type.STRING },
+    requiredParts: { type: Type.ARRAY, items: { type: Type.STRING } },
+    proportionsAndSilhouette: { type: Type.STRING }, pose: { type: Type.STRING }, orientation: { type: Type.STRING }, paletteAndMarkings: { type: Type.STRING },
+    layerPlan: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { part: { type: Type.STRING }, layer: { type: Type.STRING }, purpose: { type: Type.STRING } }, required: ["part", "layer", "purpose"] } },
+    attachmentStrategy: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { part: { type: Type.STRING }, anchor: { type: Type.STRING }, strategy: { type: Type.STRING } }, required: ["part", "anchor", "strategy"] } },
+    requiredNamedGroups: { type: Type.OBJECT, properties: Object.fromEntries(PART_TYPES.map((part) => [part, { type: Type.ARRAY, items: { type: Type.STRING } }])), required: PART_TYPES },
+    suggestedJoints: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { part: { type: Type.STRING }, name: { type: Type.STRING }, x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ["part", "name", "x", "y"] } },
+  },
+  required: ["speciesFeatures", "anatomyTemplate", "requiredParts", "proportionsAndSilhouette", "pose", "orientation", "paletteAndMarkings", "layerPlan", "attachmentStrategy", "requiredNamedGroups", "suggestedJoints"],
+};
+
+const reviewCategories = ["speciesRecognizability", "anatomicalPlausibility", "overallSilhouette", "proportionConsistency", "jointContinuity", "limbLayering", "stylePaletteConsistency", "groundAlignment", "clippingOverlaps", "mobileReadability"];
+const reviewSchema = {
+  type: Type.OBJECT,
+  properties: {
+    scores: { type: Type.OBJECT, properties: Object.fromEntries(reviewCategories.map((category) => [category, { type: Type.INTEGER }])), required: reviewCategories },
+    issues: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { category: { type: Type.STRING }, part: { type: Type.STRING }, severity: { type: Type.STRING }, description: { type: Type.STRING }, suggestedCorrection: { type: Type.STRING }, regenerationRequired: { type: Type.BOOLEAN } }, required: ["category", "part", "severity", "description", "suggestedCorrection", "regenerationRequired"] } },
+    summary: { type: Type.STRING }, approved: { type: Type.BOOLEAN },
+  }, required: ["scores", "issues", "summary", "approved"],
+};
+
+// Priority 0 controlled generation: structured plan, SVG generation, deterministic validation.
 app.post("/api/generate-animal", async (req, res) => {
   try {
-    const { prompt, image } = req.body;
-    if ((!prompt || typeof prompt !== "string" || !prompt.trim()) && !image) {
-      return res.status(400).json({ error: "A valid prompt or an inspiring image is required." });
-    }
-
-    if (!ai) {
-      return res.status(503).json({
-        error: keyValidationError || "Gemini API key is missing. Please configure GEMINI_API_KEY in Settings > Secrets.",
-      });
-    }
-
-    let imagePart: any = null;
-    if (image && typeof image === "string" && image.trim()) {
-      const match = image.match(/^data:([^;]+);base64,(.+)$/);
-      if (match) {
-        imagePart = {
-          inlineData: {
-            mimeType: match[1],
-            data: match[2],
-          },
-        };
-      } else {
-        imagePart = {
-          inlineData: {
-            mimeType: "image/png",
-            data: image,
-          },
-        };
-      }
-    }
-
-    const systemInstruction = `You are an expert vector designer and master illustrator who designs clean, adorable, and highly-detailed SVG illustrations for animals and mythological creatures. 
-Your task is to generate a complete custom animal/creature template. If an inspiring image is provided in the input, analyze its subject, features, colors, pose, and aesthetic style, and use them as direct visual inspiration to craft the custom creature.
-
-CRITICAL SVG COORDINATE SPACE AND CONNECTION AGREEMENTS:
-1. HEAD: viewBox is "0 0 160 160".
-   - The connection point where the neck/head attaches to the body is fixed at local (120, 110). Design the head's base neck connection to meet exactly at (120, 110).
-   - Draw details like eyes, ears, mouth, snout, nose, highlights, or horns.
-2. BODY: viewBox is "0 0 300 220".
-   - Choose four connection pivot coordinates (X, Y relative to the body's 300x220 space) where other parts attach:
-     * neck: typically X=40 to 120, Y=50 to 130.
-     * tail: typically X=200 to 280, Y=80 to 160.
-     * frontLegs: typically X=70 to 140, Y=130 to 190 (the front shoulder pivot).
-     * backLegs: typically X=180 to 250, Y=130 to 190 (the rear hip pivot).
-   - Draw the main body torso. Make it muscular, fluffy, sleek, or stout.
-3. FRONT LEGS: viewBox is "0 0 260 180".
-   - The connection point where the front legs join the body is fixed at local (75, 15). Design the top of the shoulder to meet at (75, 15).
-   - Draw front-layer legs (using "primary" color) and back-layer legs (darker/shaded, with slightly reduced opacity, e.g. 0.8) to represent the front limbs.
-4. BACK LEGS: viewBox is "0 0 260 180".
-   - The connection point where the back legs join the body is fixed at local (195, 15). Design the top of the hip to meet at (195, 15).
-   - Draw front-layer legs (using "primary" color) and back-layer legs (darker/shaded, with slightly reduced opacity, e.g. 0.8) to represent the back limbs.
-5. TAIL: viewBox is "0 0 160 160".
-   - The connection point where the tail joins the body is fixed at local (15, 15). Design the tail's base to meet exactly at (15, 15).
-   - Draw a gorgeous, matching tail (e.g., fluffy, scaled, thin, feathered).
-
-STYLING & COLOR CONVENTIONS:
-- Generate a beautiful primary base hex color ("color") and an accent hex color ("accentColor") for the creature.
-- Inside the SVG strings ("headSvg", "bodySvg", "frontLegsSvg", "backLegsSvg", "tailSvg"), do NOT hardcode the hex colors you generate. Instead, use the literal value "primary" (e.g., fill="primary" or stroke="primary") for elements that should use the primary color, and the literal value "accent" (e.g., fill="accent") for elements using the accent color. This enables dynamic color customizations on the frontend.
-- You can hardcode other colors for details (e.g., "#111111" for pupils, "#ffffff" for highlights, soft pinks/oranges for cheeks, translucent shadows with opacity, or dark tones for outlines like stroke="#221100").
-- Use valid SVG tags: <g>, <path>, <circle>, <rect>, <ellipse>, <polygon>, <polyline>, <line>, <defs>, <linearGradient>, <stop>.
-- Always close all tags properly. Do NOT wrap the code in <svg> tags, just return the inner elements inside a group <g> or as flat tags. Make sure the SVGs look incredibly polished and organic (lots of smooth bezier curves 'C' or quadratic 'Q', not just boxes).
-- To prevent timeout and ensure fast rendering, keep SVG path coordinates clean, compact, and minimized. Avoid excessive details or redundant path points. A highly-detailed look is best achieved with a few elegant, well-designed curves rather than massive coordinates.`;
-
-    const promptText = prompt && prompt.trim() ? prompt.trim() : "Create a beautiful custom creature inspired by the provided image.";
-    let contents: any;
-    if (imagePart) {
-      contents = {
-        parts: [
-          imagePart,
-          { text: `Create an SVG creature matching this instruction: "${promptText}"` }
-        ]
-      };
-    } else {
-      contents = `Create an SVG creature matching this prompt: "${promptText}"`;
-    }
-
-    const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.5-flash",
-      contents: contents,
+    if (!ai) return res.status(503).json({ error: keyValidationError });
+    const brief = assertBrief(req.body?.brief);
+    const originalRequest = typeof req.body?.prompt === "string" && req.body.prompt.trim() ? req.body.prompt.trim() : brief.animalName;
+    const reference = imagePartFromDataUrl(req.body?.image);
+    const planResponse = await generateContentWithRetry(ai, {
+      model: GEMINI_MODEL,
+      contents: reference ? { parts: [reference, { text: `Plan this animal from the guided brief and reference image: ${JSON.stringify(brief)}` }] } : `Plan this animal from the guided brief: ${JSON.stringify(brief)}`,
       config: {
-        systemInstruction: systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            name: { type: Type.STRING, description: "Descriptive name, e.g. Neon Phoenix" },
-            color: { type: Type.STRING, description: "Base primary color in hex format, e.g. #FF5500" },
-            accentColor: { type: Type.STRING, description: "Accent/detail color in hex format, e.g. #FFD700" },
-            description: { type: Type.STRING, description: "A creative, short summary describing this species' traits" },
-            bodyConnections: {
-              type: Type.OBJECT,
-              properties: {
-                neck: {
-                  type: Type.OBJECT,
-                  properties: {
-                    x: { type: Type.INTEGER, description: "Pivot X on the body (from 0 to 300) where the neck attaches. Usually 40 to 120." },
-                    y: { type: Type.INTEGER, description: "Pivot Y on the body (from 0 to 220) where the neck attaches. Usually 50 to 130." }
-                  },
-                  required: ["x", "y"]
-                },
-                tail: {
-                  type: Type.OBJECT,
-                  properties: {
-                    x: { type: Type.INTEGER, description: "Pivot X on the body (from 0 to 300) where the tail attaches. Usually 200 to 280." },
-                    y: { type: Type.INTEGER, description: "Pivot Y on the body (from 0 to 220) where the tail attaches. Usually 80 to 160." }
-                  },
-                  required: ["x", "y"]
-                },
-                frontLegs: {
-                  type: Type.OBJECT,
-                  properties: {
-                    x: { type: Type.INTEGER, description: "Pivot X on the body where front shoulder connects. Usually 70 to 140." },
-                    y: { type: Type.INTEGER, description: "Pivot Y on the body where front shoulder connects. Usually 130 to 190." }
-                  },
-                  required: ["x", "y"]
-                },
-                backLegs: {
-                  type: Type.OBJECT,
-                  properties: {
-                    x: { type: Type.INTEGER, description: "Pivot X on the body where rear hip connects. Usually 180 to 250." },
-                    y: { type: Type.INTEGER, description: "Pivot Y on the body where rear hip connects. Usually 130 to 190." }
-                  },
-                  required: ["x", "y"]
-                }
-              },
-              required: ["neck", "tail", "frontLegs", "backLegs"]
-            },
-            headSvg: { type: Type.STRING, description: "Inner SVG markup (e.g. wrapped in <g>) for head (160x160 space). Uses 'primary' and 'accent' fills." },
-            bodySvg: { type: Type.STRING, description: "Inner SVG markup (e.g. wrapped in <g>) for body (300x220 space). Uses 'primary' and 'accent' fills." },
-            frontLegsSvg: { type: Type.STRING, description: "Inner SVG markup (e.g. wrapped in <g>) for front legs (260x180 space). Uses 'primary' and 'accent' fills." },
-            backLegsSvg: { type: Type.STRING, description: "Inner SVG markup (e.g. wrapped in <g>) for back legs (260x180 space). Uses 'primary' and 'accent' fills." },
-            tailSvg: { type: Type.STRING, description: "Inner SVG markup (e.g. wrapped in <g>) for tail (160x160 space). Uses 'primary' and 'accent' fills." }
-          },
-          required: ["name", "color", "accentColor", "description", "bodyConnections", "headSvg", "bodySvg", "frontLegsSvg", "backLegsSvg", "tailSvg"]
-        },
-        temperature: 0.2,
+        systemInstruction: `You are the anatomy and visual-style planner for a five-part SVG animal builder. Return a precise plan only. The existing schema is fixed to head, body, frontLegs, backLegs and tail. anatomyTemplate MUST be "quadruped-five-part", requiredParts MUST list those five exact values, and orientation MUST be "left-facing". Each part needs stable named groups; always include exactly its root id: head-root, body-root, frontLegs-root, backLegs-root or tail-root, plus useful feature groups. Layer order is tail/backLegs behind body, body middle, frontLegs/head front. Plan recognizable species features, silhouette, near/far limb treatment, palette, markings, attachment geometry and suggested pivots. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.planner}.`,
+        responseMimeType: "application/json", responseSchema: planSchema, temperature: brief.mode === "draft" ? 0.15 : 0.25,
       },
     });
-
-    const text = response.text;
-    if (!text) {
-      throw new Error("Empty response from Gemini model.");
-    }
-
-    const animalData = JSON.parse(text);
-    return res.json(animalData);
+    if (!planResponse.text) throw new Error("Gemini returned an empty anatomy plan.");
+    const plan = JSON.parse(planResponse.text) as AnatomyStylePlan;
+    const generationResponse = await generateContentWithRetry(ai, {
+      model: GEMINI_MODEL,
+      contents: reference ? { parts: [reference, { text: `Generate the animal from this locked brief and plan. Brief: ${JSON.stringify(brief)} Plan: ${JSON.stringify(plan)}` }] } : `Generate the animal from this locked brief and plan. Brief: ${JSON.stringify(brief)} Plan: ${JSON.stringify(plan)}`,
+      config: {
+        systemInstruction: `Create a polished but compact left-facing animal using the existing five-part JSON schema. Follow the supplied anatomy/style plan exactly. Coordinate contract: head 160x160 with neck geometry touching (120,110); body 300x220 with neck x 40-120 y 50-130, tail x 200-280 y 80-160, frontLegs x 70-140 y 130-190, backLegs x 180-250 y 130-190; frontLegs 260x180 touching (75,15) and feet near y=180; backLegs 260x180 touching (195,15) and feet near y=180; tail 160x160 touching (15,15). SVG fields are inner XML only. Use only g,path,circle,rect,ellipse,polygon,polyline,line,defs,linearGradient,radialGradient,stop,filter,feDropShadow,feGaussianBlur,mask,clipPath. Use literal primary/accent placeholders for palette areas. Every named group in the plan must appear once with the exact id, including each part root. All IDs must be globally unique. Keep coordinates inside view bounds and geometry within 32px of every attachment anchor. For leg SVGs, represent far and near limbs in separately named groups. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.generator}.`,
+        responseMimeType: "application/json", responseSchema: animalDraftSchema, temperature: brief.mode === "draft" ? 0.15 : 0.25,
+      },
+    });
+    if (!generationResponse.text) throw new Error("Gemini returned an empty SVG response.");
+    const animal = JSON.parse(generationResponse.text) as AnimalDraft;
+    const validation = validateAnimalDraft(animal, plan);
+    return res.json({ animal, plan, validation, originalRequest, brief, models: MODEL_VERSIONS, promptVersions: PROMPT_VERSIONS });
   } catch (error: any) {
     console.error("Error generating custom animal via AI:", error);
-    return res.status(500).json({
-      error: "Failed to generate creature SVG. Details: " + getFriendlyErrorMessage(error),
+    const status = /guided animal brief|required/i.test(error?.message || "") ? 400 : 500;
+    return res.status(status).json({ error: "Failed to generate creature SVG. Details: " + getFriendlyErrorMessage(error) });
+  }
+});
+
+// Separate visual-review call. Exact coordinate checks remain in deterministic validation.
+app.post("/api/review-animal", async (req, res) => {
+  try {
+    if (!ai) return res.status(503).json({ error: keyValidationError });
+    const { animal, plan, originalRequest, brief } = req.body || {};
+    const validation = validateAnimalDraft(animal, plan);
+    if (!validation.valid) return res.status(422).json({ error: "Technical validation must pass before visual review.", validation });
+    const clean = imagePartFromDataUrl(req.body?.cleanPreview);
+    const diagnostic = imagePartFromDataUrl(req.body?.diagnosticPreview);
+    if (!clean || !diagnostic) return res.status(400).json({ error: "Clean and diagnostic PNG previews are required." });
+    const response = await generateContentWithRetry(ai, {
+      model: GEMINI_MODEL,
+      contents: { parts: [clean, diagnostic, { text: `Review image 1 as the clean assembled animal and image 2 as the diagnostic preview. Original request: ${originalRequest}. Guided brief: ${JSON.stringify(brief)}. Anatomy/style plan: ${JSON.stringify(plan)}.` }] },
+      config: {
+        systemInstruction: `You are an independent visual QA reviewer. Do not redesign the animal and do not perform exact coordinate validation. Score each category from 1 to 10: species recognizability, anatomical plausibility, overall silhouette, proportion consistency, joint continuity/gaps, near/far limb layering, style/palette consistency, ground alignment, clipping/unintended overlaps and readability at mobile-game size. Every issue must name one of head, body, frontLegs, backLegs, tail, or animal; use minor, major, or critical severity; give a specific correction; and say if part regeneration is required. Approve only when no major/critical issues remain and every score is at least 7. Prompt version ${PROMPT_VERSIONS.reviewer}.`,
+        responseMimeType: "application/json", responseSchema: reviewSchema, temperature: 0.1,
+      },
     });
+    if (!response.text) throw new Error("Gemini returned an empty visual review.");
+    const review = JSON.parse(response.text) as VisualReviewReport;
+    review.approved = review.issues.every((entry) => entry.severity === "minor") && Object.values(review.scores).every((score) => Number(score) >= 7);
+    return res.json({ review, model: MODEL_VERSIONS.reviewer, promptVersion: PROMPT_VERSIONS.reviewer });
+  } catch (error: any) {
+    console.error("Error reviewing custom animal via AI:", error);
+    return res.status(500).json({ error: "Failed to visually review creature. Details: " + getFriendlyErrorMessage(error) });
+  }
+});
+
+// Targeted repair returns a fully merged animal while changing only requested failing parts.
+app.post("/api/repair-animal", async (req, res) => {
+  try {
+    if (!ai) return res.status(503).json({ error: keyValidationError });
+    const current = req.body?.currentAnimal as AnimalDraft;
+    const plan = req.body?.plan as AnatomyStylePlan;
+    const requested = Array.isArray(req.body?.failingParts) ? req.body.failingParts.filter((part: unknown) => PART_TYPES.includes(part as any)) : [];
+    const round = Number(req.body?.round);
+    if (!current || !plan || !requested.length) return res.status(400).json({ error: "Current animal, plan and at least one failing part are required." });
+    if (!Number.isInteger(round) || round < 1 || round > 2) return res.status(400).json({ error: "Automatic repair round must be 1 or 2." });
+    const clean = imagePartFromDataUrl(req.body?.cleanPreview);
+    const diagnostic = imagePartFromDataUrl(req.body?.diagnosticPreview);
+    const visualParts = [clean, diagnostic].filter(Boolean);
+    const response = await generateContentWithRetry(ai, {
+      model: GEMINI_MODEL,
+      contents: { parts: [...visualParts, { text: `Repair ONLY these parts: ${requested.join(", ")}. Brief: ${JSON.stringify(req.body.brief)}. Plan: ${JSON.stringify(plan)}. Current animal: ${JSON.stringify(current)}. Technical errors: ${JSON.stringify(req.body.validation?.issues || [])}. Visual review: ${JSON.stringify(req.body.review || null)}.` }] },
+      config: {
+        systemInstruction: `You repair isolated SVG animal parts. Return only fields for the explicitly requested parts; omit every accepted part. Never change name, description, color or accentColor. bodyConnections may be returned only when body is requested. Preserve the fixed coordinate contract and every required group id from the plan. Address only the supplied validation/review failures. Output compact valid inner SVG XML using primary/accent placeholders. This is bounded automatic repair round ${round} of 2. Prompt version ${PROMPT_VERSIONS.repair}.`,
+        responseMimeType: "application/json",
+        responseSchema: { type: Type.OBJECT, properties: { bodyConnections: animalDraftSchema.properties.bodyConnections, headSvg: { type: Type.STRING }, bodySvg: { type: Type.STRING }, frontLegsSvg: { type: Type.STRING }, backLegsSvg: { type: Type.STRING }, tailSvg: { type: Type.STRING } }, required: [] },
+        temperature: 0.1,
+      },
+    });
+    if (!response.text) throw new Error("Gemini returned an empty targeted repair.");
+    const patch = JSON.parse(response.text) as Partial<AnimalDraft>;
+    const { animal: merged, changedParts } = mergeTargetedRepair(current, patch, requested);
+    const validation = validateAnimalDraft(merged, plan);
+    return res.json({ animal: merged, validation, changedParts, requestedParts: requested, round, model: MODEL_VERSIONS.repair, promptVersion: PROMPT_VERSIONS.repair });
+  } catch (error: any) {
+    console.error("Error repairing custom animal via AI:", error);
+    return res.status(500).json({ error: "Failed to repair creature parts. Details: " + getFriendlyErrorMessage(error) });
   }
 });
 
@@ -462,7 +461,7 @@ async function startServer() {
   if (!isProd) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: { port: HMR_PORT } },
       appType: "spa",
     });
     app.use(vite.middlewares);
