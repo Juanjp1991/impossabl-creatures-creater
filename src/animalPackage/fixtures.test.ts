@@ -160,3 +160,45 @@ test("invalid imports are rejected and official bundles serialize deterministica
   assert.equal(serializeAnimalPackageBundle(packages), serializeAnimalPackageBundle(packages));
   assert.doesNotMatch(buildNeutralPackagePreview(bear), /<animate\b|motion/i);
 });
+
+test("optional generated layout metadata transfers into Package V1 profiles and semantic limb groups", () => {
+  const bear = ANIMALS.find((animal) => animal.id === "bear")!;
+  const frontFar = "frontLegs-far"; const frontNear = "frontLegs-near"; const backFar = "backLegs-far"; const backNear = "backLegs-near";
+  const generated = {
+    ...bear,
+    id: "generated-profile-bear",
+    parts: {
+      ...bear.parts,
+      frontLegs: { ...bear.parts.frontLegs, rawContent: `<g id="${frontFar}">${bear.parts.frontLegs.rawContent}</g><g id="${frontNear}"><circle cx="120" cy="175" r="3" fill="primary"/></g>` },
+      backLegs: { ...bear.parts.backLegs, rawContent: `<g id="${backFar}">${bear.parts.backLegs.rawContent}</g><g id="${backNear}"><circle cx="220" cy="175" r="3" fill="primary"/></g>` },
+    },
+    generationMetadata: {
+      createdAt: "2026-07-21T00:00:00.000Z",
+      generatedLayout: {
+        facing: "left", groundY: 325,
+        connections: [
+          { part: "head", socketAnchor: bear.bodyConnections.neck, attachmentAnchor: bear.parts.head.connections.neck, outwardNormal: { x: -1, y: 0 }, opposingNormal: { x: 1, y: 0 }, seamWidth: 30, minimumOverlap: 16, neutralConnectionDepth: 16, allowedScale: { min: .7, max: 1.3 } },
+          { part: "frontLegs", socketAnchor: bear.bodyConnections.frontLegs, attachmentAnchor: bear.parts.frontLegs.connections.body, outwardNormal: { x: 0, y: 1 }, opposingNormal: { x: 0, y: -1 }, seamWidth: 30, minimumOverlap: 16, neutralConnectionDepth: 16, allowedScale: { min: .7, max: 1.3 } },
+          { part: "backLegs", socketAnchor: bear.bodyConnections.backLegs, attachmentAnchor: bear.parts.backLegs.connections.body, outwardNormal: { x: 0, y: 1 }, opposingNormal: { x: 0, y: -1 }, seamWidth: 30, minimumOverlap: 16, neutralConnectionDepth: 16, allowedScale: { min: .7, max: 1.3 } },
+          { part: "tail", socketAnchor: bear.bodyConnections.tail, attachmentAnchor: bear.parts.tail.connections.body, outwardNormal: { x: 1, y: 0 }, opposingNormal: { x: -1, y: 0 }, seamWidth: 30, minimumOverlap: 16, neutralConnectionDepth: 16, allowedScale: { min: .7, max: 1.3 } },
+        ],
+        groundContacts: { frontLegs: [{ x: 90, y: 175 }, { x: 120, y: 175 }], backLegs: [{ x: 190, y: 175 }, { x: 220, y: 175 }] },
+        depthGroups: { frontLegs: { farGroupId: frontFar, nearGroupId: frontNear }, backLegs: { farGroupId: backFar, nearGroupId: backNear } },
+      },
+    } as any,
+  };
+  const compiled = compileLegacyAnimalPackage(generated);
+  assert.deepEqual(compiled.compatibility, { facing: "left", groundY: 325 });
+  assert.ok(compiled.sockets.every((socket) => socket.profile));
+  assert.ok(compiled.parts.find((part) => part.category === "forelimbs")!.depthGroups?.farGroupId.includes("frontlegs-far"));
+  assert.equal(validateAnimalPackageV1(compiled).valid, true);
+});
+
+test("strict profile validation rejects non-positive seam widths and reversed scale ranges", () => {
+  const fixture = packageFor("quadruped");
+  fixture.compatibility = { facing: "left", groundY: 100 };
+  fixture.sockets[0].profile = { outwardNormal: { x: 1, y: 0 }, seamWidth: 0, minimumOverlap: 10, allowedScale: { min: 1.2, max: .8 } };
+  const result = validateAnimalPackageV1(fixture);
+  assert.ok(result.issues.some((issue) => issue.code === "socket.profile.width"));
+  assert.ok(result.issues.some((issue) => issue.code === "socket.profile.scale.order"));
+});

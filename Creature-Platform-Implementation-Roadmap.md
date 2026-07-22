@@ -41,7 +41,7 @@ Until both workflows work, advanced editor and game improvements risk being buil
 
 ### Objective
 
-Make Gemini 3.5 Flash produce more recognizable, visually coherent and technically compatible animals while keeping generation approachable for a user who enters only a short request such as “cow.”
+Make Gemini 3.6 Flash produce more recognizable, visually coherent and technically compatible animals while keeping generation approachable for a user who enters only a short request such as “cow.”
 
 ### P0.1 — Add a guided animal brief
 
@@ -306,6 +306,8 @@ Pose articulated parts while preserving their SVG artwork.
 
 ## 9. Phase 5 — Create the offline Creature Game PWA
 
+**Implementation status: complete (2026-07-17).** The separate `game/` React and TypeScript PWA includes an eight-animal Package V1 library spanning all four initial anatomy templates, body-driven compatible part selection, shared recipe assembly/rendering, animation, IndexedDB saves, offline shell and asset caching, and manual save export/import.
+
 ### Objective
 
 Build the smallest game application that proves exported animals can become playable hybrids.
@@ -336,6 +338,8 @@ Use eight to twelve polished animals, covering at least quadruped, bird, snake a
 - The same animal renders consistently in the builder and game.
 
 ## 10. Phase 6 — Add one complete gameplay loop
+
+**Implementation status: complete (2026-07-17).** Every official part now contributes health, power, armor, speed and traits; anatomy determines locomotion; the result card explains each contribution; a compact deterministic arena resolves in at most twelve rounds; and persistent gene credits unlock additional animals to complete the create → test → reward → unlock → improve loop.
 
 ### Objective
 

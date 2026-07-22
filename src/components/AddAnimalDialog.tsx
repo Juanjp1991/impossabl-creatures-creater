@@ -3,8 +3,9 @@ import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move,
 import { Animal } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
-import { runGenerationPipeline } from "../generation/clientPipeline";
-import type { AnimalDraft, GenerationMetadata, GuidedAnimalBrief } from "../generation/contracts";
+import { populateGuidedBrief, runGenerationPipeline } from "../generation/clientPipeline";
+import type { AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode } from "../generation/contracts";
+import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
 import { SvgLayersPanel } from "./SvgLayersPanel";
 import { RigEditorPanel } from "./RigEditorPanel";
@@ -182,8 +183,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   // AI Generation State
   const [aiPrompt, setAiPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isAutoFillingBrief, setIsAutoFillingBrief] = useState(false);
   const [generationStep, setGenerationStep] = useState("");
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
   const [isDragging, setIsDragging] = useState(false);
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
@@ -303,6 +306,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setAccentColor(editingAnimal.accentColor);
         setDescription(editingAnimal.description);
         setGenerationMetadata(editingAnimal.generationMetadata);
+        setReferenceMode(editingAnimal.generationMetadata?.referenceMode ?? "match");
         setGuidedBrief(editingAnimal.generationMetadata?.brief ?? createDefaultBrief(editingAnimal.name));
         setPipelinePreviews(null);
         setRigDefinition(editingAnimal.rig);
@@ -372,6 +376,26 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   }, [isOpen, editingAnimal]);
 
+  // Keep the pipeline previews synchronized with palette, connection and SVG
+  // edits. This also re-colourizes older generated drafts that used CSS
+  // variable placeholders before the preview renderer supported them.
+  useEffect(() => {
+    if (!generationMetadata || !headSvg.trim() || !bodySvg.trim() || !frontLegsSvg.trim() || !backLegsSvg.trim() || !tailSvg.trim()) return;
+    const draft: AnimalDraft = {
+      name: name || "Generated creature",
+      color,
+      accentColor,
+      description: description || name || "Generated creature",
+      bodyConnections: {
+        neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY },
+        frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY },
+      },
+      headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg,
+      layoutMetadata: generationMetadata.generatedLayout,
+    };
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(draft), diagnosticSvg: buildAssembledPreviewSvg(draft, true) });
+  }, [generationMetadata, name, color, accentColor, description, neckX, neckY, tailX, tailY, frontLegsX, frontLegsY, backLegsX, backLegsY, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
+
   const applyAnimalDraft = (data: AnimalDraft) => {
     setName(data.name || ""); setColor(data.color || "#cccccc"); setAccentColor(data.accentColor || "#ffaa00"); setDescription(data.description || "");
     setNeckX(data.bodyConnections?.neck?.x ?? 75); setNeckY(data.bodyConnections?.neck?.y ?? 90);
@@ -379,6 +403,28 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setFrontLegsX(data.bodyConnections?.frontLegs?.x ?? 115); setFrontLegsY(data.bodyConnections?.frontLegs?.y ?? 160);
     setBackLegsX(data.bodyConnections?.backLegs?.x ?? 235); setBackLegsY(data.bodyConnections?.backLegs?.y ?? 160);
     setHeadSvg(data.headSvg || ""); setBodySvg(data.bodySvg || ""); setFrontLegsSvg(data.frontLegsSvg || ""); setBackLegsSvg(data.backLegsSvg || ""); setTailSvg(data.tailSvg || "");
+  };
+
+  const handleAutoFillBrief = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
+      setErrorMsg("Enter an animal name or upload a reference image before auto-filling details.");
+      return;
+    }
+    setIsAutoFillingBrief(true);
+    setErrorMsg("");
+    setGenerationStep("Gemini 3.6 Flash is preparing the guided prompt details...");
+    try {
+      const brief = await populateGuidedBrief({ currentBrief: { ...guidedBrief, animalName }, image: uploadedImage, referenceMode });
+      setGuidedBrief(brief);
+      setAiPrompt(brief.animalName);
+      setGenerationStep("Prompt details populated. Review or edit them before generating.");
+    } catch (error: any) {
+      setErrorMsg(error?.message || "Could not auto-fill the guided prompt details.");
+      setGenerationStep("Prompt auto-fill stopped; your existing details were preserved.");
+    } finally {
+      setIsAutoFillingBrief(false);
+    }
   };
 
   const handleGenerateWithAI = async () => {
@@ -395,7 +441,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setGenerationStep("Starting controlled Gemini pipeline...");
 
     try {
-      const result = await runGenerationPipeline({ prompt: brief.animalName, image: uploadedImage, brief, onStep: setGenerationStep, onDraft: applyAnimalDraft });
+      const result = await runGenerationPipeline({ prompt: brief.animalName, image: uploadedImage, referenceMode, brief, onStep: setGenerationStep, onDraft: applyAnimalDraft });
       applyAnimalDraft(result.animal);
       setGenerationMetadata(result.metadata);
       setPipelinePreviews({ cleanSvg: result.cleanSvg, diagnosticSvg: result.diagnosticSvg });
@@ -414,6 +460,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     } catch (err: any) {
       console.error(err);
       setErrorMsg(err?.message || "An unexpected error occurred during generation. Make sure GEMINI_API_KEY is configured.");
+      setGenerationStep("Generation stopped. The current SVG draft has been preserved.");
     } finally {
       setIsGenerating(false);
     }
@@ -427,7 +474,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     setIsGenerating(true);
     setErrorMsg("");
-    setGenerationStep(`Refining ${refinePart === "all" ? "the entire creature" : refinePart} with Gemini 3.5 Flash...`);
+    setGenerationStep(`Refining ${refinePart === "all" ? "the entire creature" : refinePart} with Gemini 3.6 Flash...`);
 
     try {
       const timers = [
@@ -446,6 +493,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           prompt: refinePrompt.trim(),
           targetPart: refinePart,
           image: uploadedImage,
+          referenceMode,
           currentAnimal: {
             name,
             color,
@@ -491,13 +539,20 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       const data = await response.json().catch(() => {
         throw new Error("Failed to parse the modified creature JSON data from the server.");
       });
-      
-      setName(data.name || name);
-      setColor(data.color || color);
-      setAccentColor(data.accentColor || accentColor);
-      setDescription(data.description || description);
-      
-      if (data.bodyConnections) {
+
+      if (refinePart !== "all" && !data.modifiedParts?.includes(refinePart)) {
+        throw new Error(`Gemini did not return a changed ${refinePart} SVG. Every existing part was preserved.`);
+      }
+      const changedSvg = (value: unknown, fallback: string) => typeof value === "string" && value.trim() && !/^(?:null|undefined)$/i.test(value.trim()) ? value : fallback;
+
+      if (refinePart === "all") {
+        setName(data.name || name);
+        setColor(data.color || color);
+        setAccentColor(data.accentColor || accentColor);
+        setDescription(data.description || description);
+      }
+
+      if ((refinePart === "all" || refinePart === "body") && data.bodyConnections) {
         if (data.bodyConnections.neck) {
           setNeckX(data.bodyConnections.neck.x ?? neckX);
           setNeckY(data.bodyConnections.neck.y ?? neckY);
@@ -516,11 +571,17 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         }
       }
 
-      setHeadSvg(data.headSvg || headSvg);
-      setBodySvg(data.bodySvg || bodySvg);
-      setFrontLegsSvg(data.frontLegsSvg || frontLegsSvg);
-      setBackLegsSvg(data.backLegsSvg || backLegsSvg);
-      setTailSvg(data.tailSvg || tailSvg);
+      if (refinePart === "all") {
+        setHeadSvg(changedSvg(data.headSvg, headSvg));
+        setBodySvg(changedSvg(data.bodySvg, bodySvg));
+        setFrontLegsSvg(changedSvg(data.frontLegsSvg, frontLegsSvg));
+        setBackLegsSvg(changedSvg(data.backLegsSvg, backLegsSvg));
+        setTailSvg(changedSvg(data.tailSvg, tailSvg));
+      } else if (refinePart === "head") setHeadSvg(changedSvg(data.headSvg, headSvg));
+      else if (refinePart === "body") setBodySvg(changedSvg(data.bodySvg, bodySvg));
+      else if (refinePart === "frontLegs") setFrontLegsSvg(changedSvg(data.frontLegsSvg, frontLegsSvg));
+      else if (refinePart === "backLegs") setBackLegsSvg(changedSvg(data.backLegsSvg, backLegsSvg));
+      else if (refinePart === "tail") setTailSvg(changedSvg(data.tailSvg, tailSvg));
 
       setRefinePrompt("");
       setGenerationStep(`Success! Iterative modification applied to ${refinePart === "all" ? "creature" : refinePart}.`);
@@ -577,13 +638,15 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
     let finalGenerationMetadata = generationMetadata;
     if (generationMetadata) {
-      const validation = validateAnimalDraft({ name, color, accentColor, description: description || name, bodyConnections: { neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY }, frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY } }, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg }, generationMetadata.plan);
-      finalGenerationMetadata = { ...generationMetadata, validationHistory: [...generationMetadata.validationHistory, validation], finalStatus: validation.valid ? generationMetadata.finalStatus : "technical-failure" };
+      const validation = validateAnimalDraft({ name, color, accentColor, description: description || name, bodyConnections: { neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY }, frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY } }, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg, layoutMetadata: generationMetadata.generatedLayout }, generationMetadata.plan);
+      finalGenerationMetadata = {
+        ...generationMetadata,
+        validationHistory: [...generationMetadata.validationHistory, validation],
+        finalStatus: validation.valid ? generationMetadata.finalStatus : "warnings",
+        forgedWithTechnicalWarnings: !validation.valid || generationMetadata.forgedWithTechnicalWarnings,
+      };
       setGenerationMetadata(finalGenerationMetadata);
-      if (!validation.valid) {
-        setErrorMsg(`Technical validation found ${validation.issues.filter((entry) => entry.severity === "error").length} blocking issue(s). Repair the listed SVG parts before forging.`);
-        return;
-      }
+      if (!validation.valid) console.warn(`Forging with ${validation.issues.filter((entry) => entry.severity === "error").length} unresolved technical validation warning(s).`);
     }
 
     // Helper to bake the custom transformations into the raw SVG strings via group wraps
@@ -1106,6 +1169,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const frontLegsTransformStr = `translate(${frontLegsTranslate.x + frontLegsTx}, ${frontLegsTranslate.y + frontLegsTy}) translate(${frontLegsPivotX}, ${frontLegsPivotY}) scale(${frontLegsScale}) translate(${-frontLegsPivotX}, ${-frontLegsPivotY}) rotate(${frontLegsRot}, ${frontLegsPivotX}, ${frontLegsPivotY})`;
   const backLegsTransformStr = `translate(${backLegsTranslate.x + backLegsTx}, ${backLegsTranslate.y + backLegsTy}) translate(${backLegsPivotX}, ${backLegsPivotY}) scale(${backLegsScale}) translate(${-backLegsPivotX}, ${-backLegsPivotY}) rotate(${backLegsRot}, ${backLegsPivotX}, ${backLegsPivotY})`;
   const tailTransformStr = `translate(${tailTranslate.x + tailTx}, ${tailTranslate.y + tailTy}) translate(${tailPivotX}, ${tailPivotY}) scale(${tailScale}) translate(${-tailPivotX}, ${-tailPivotY}) rotate(${tailRot}, ${tailPivotX}, ${tailPivotY})`;
+  const frontPreviewDepthLayers = splitSvgDepthLayers(frontLegsSvg, generationMetadata?.generatedLayout?.depthGroups.frontLegs);
+  const backPreviewDepthLayers = splitSvgDepthLayers(backLegsSvg, generationMetadata?.generatedLayout?.depthGroups.backLegs);
 
   if (!isOpen) return null;
 
@@ -1166,7 +1231,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                 </div>
                 <div>
                   <p className="text-xs font-mono font-bold text-amber-400 uppercase tracking-wide flex items-center gap-2">
-                    AI Creature Lab <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-normal font-sans tracking-normal capitalize">Powered by Gemini 3.5 Flash</span>
+                    AI Creature Lab <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-normal font-sans tracking-normal capitalize">Powered by Gemini 3.6 Flash</span>
                   </p>
                   <p className="text-[11px] text-zinc-400 leading-normal mt-0.5">
                     {aiMode === "summon" 
@@ -1211,7 +1276,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               {/* Left Column: Optional Visual Reference */}
               <div className="md:col-span-4 flex flex-col justify-between">
                 <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold mb-1.5 block">
-                  Optional Visual Inspiration:
+                  Optional Visual Reference:
                 </label>
                 <div
                   onDragOver={handleDragOver}
@@ -1234,10 +1299,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       />
                       <div className="flex-1 min-w-0">
                         <p className="text-[10px] font-mono font-bold text-zinc-300 truncate">
-                          Inspiration Loaded
+                          Reference Loaded
                         </p>
                         <p className="text-[9px] font-sans text-zinc-500">
-                          AI will be inspired by this image
+                          Used during planning, review and repair
                         </p>
                       </div>
                       <button
@@ -1267,6 +1332,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     </label>
                   )}
                 </div>
+                {uploadedImage && (
+                  <div className="mt-2 grid grid-cols-2 gap-1 rounded-lg border border-zinc-800 bg-zinc-950 p-1">
+                    {([[
+                      "match", "CLOSE MATCH"
+                    ], ["inspire", "LOOSE INSPIRATION"]] as Array<[ReferenceMode, string]>).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        disabled={isGenerating}
+                        onClick={() => setReferenceMode(mode)}
+                        className={`rounded px-2 py-1.5 text-[8px] font-mono font-bold transition-colors ${referenceMode === mode ? "bg-amber-500 text-zinc-950" : "text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"}`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Right Column: Text Prompts & Action triggers */}
@@ -1275,12 +1357,12 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   <div className="flex flex-col gap-2.5 w-full">
                     <div className="grid grid-cols-2 gap-2">
                       <label className="text-[9px] font-mono text-zinc-400 uppercase">Preset
-                        <select value={guidedBrief.preset} disabled={isGenerating} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                        <select value={guidedBrief.preset} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
                           {GENERATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
                         </select>
                       </label>
                       <label className="text-[9px] font-mono text-zinc-400 uppercase">Quality
-                        <select value={guidedBrief.mode} disabled={isGenerating} onChange={(event) => updateBriefField("mode", event.target.value as GuidedAnimalBrief["mode"])} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                        <select value={guidedBrief.mode} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => updateBriefField("mode", event.target.value as GuidedAnimalBrief["mode"])} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
                           <option value="draft">Draft</option><option value="high-quality">High quality</option>
                         </select>
                       </label>
@@ -1289,7 +1371,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     <div className="flex gap-2">
                       <input
                         type="text"
-                        disabled={isGenerating}
+                        disabled={isGenerating || isAutoFillingBrief}
                         placeholder="e.g. cow"
                         value={aiPrompt}
                         onChange={(e) => { setAiPrompt(e.target.value); updateBriefField("animalName", e.target.value); }}
@@ -1303,7 +1385,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       />
                       <button
                         type="button"
-                        disabled={isGenerating}
+                        disabled={isGenerating || isAutoFillingBrief}
                         onClick={handleGenerateWithAI}
                         className="px-4 py-2 bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-600 hover:shadow-lg disabled:shadow-none text-zinc-950 text-xs font-mono font-bold rounded-xl transition-all flex items-center gap-1.5 whitespace-nowrap active:scale-95 disabled:pointer-events-none"
                       >
@@ -1320,6 +1402,15 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         )}
                       </button>
                     </div>
+                    <button
+                      type="button"
+                      disabled={isGenerating || isAutoFillingBrief}
+                      onClick={handleAutoFillBrief}
+                      className="self-start rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[9px] font-mono font-bold text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40 flex items-center gap-2"
+                    >
+                      {isAutoFillingBrief ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                      {isAutoFillingBrief ? "AUTO-FILLING DETAILS..." : "AUTO-FILL DETAILS WITH GEMINI 3.6 FLASH"}
+                    </button>
                     <details className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-2">
                       <summary className="cursor-pointer text-[10px] font-mono font-bold text-amber-400">GUIDED BRIEF OPTIONS</summary>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
@@ -1333,7 +1424,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           ["expression", "Expression", ["friendly", "calm", "alert", "determined", "curious and cheerful"]],
                         ] as Array<[keyof GuidedAnimalBrief, string, string[]]>).map(([key, label, values]) => (
                           <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
-                            <select value={String(guidedBrief[key])} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300">
+                            <select disabled={isGenerating || isAutoFillingBrief} value={String(guidedBrief[key])} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300">
                               {values.map((value) => <option key={value} value={value}>{value}</option>)}
                             </select>
                           </label>
@@ -1344,13 +1435,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           "mainColour", "Main colour", "natural species colours"
                         ], ["markings", "Markings", "recognizable species markings"], ["definingAnatomy", "Defining anatomy", "horns, tusks, mane, shell..."], ["advancedInstructions", "Advanced instructions", "Optional extra direction"]] as Array<[keyof GuidedAnimalBrief, string, string]>).map(([key, label, placeholder]) => (
                           <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
-                            <input value={String(guidedBrief[key])} placeholder={placeholder} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300" />
+                            <input disabled={isGenerating || isAutoFillingBrief} value={String(guidedBrief[key])} placeholder={placeholder} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300" />
                           </label>
                         ))}
                       </div>
                     </details>
                     <label className="text-[9px] font-mono text-zinc-400 uppercase">Editable expanded brief
-                      <textarea rows={3} value={guidedBrief.summary} onChange={(event) => updateBriefField("summary", event.target.value)} className="mt-1 w-full text-[10px] leading-relaxed p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-300 resize-y" />
+                      <textarea disabled={isGenerating || isAutoFillingBrief} rows={3} value={guidedBrief.summary} onChange={(event) => updateBriefField("summary", event.target.value)} className="mt-1 w-full text-[10px] leading-relaxed p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-300 resize-y" />
                     </label>
                   </div>
                 ) : (
@@ -1446,19 +1537,29 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             )}
             {generationMetadata && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
-                <div className="md:col-span-1 text-[9px] font-mono text-zinc-400 space-y-1">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="md:col-span-2 text-[10px] leading-relaxed font-mono text-zinc-400 space-y-1.5 rounded-lg border border-zinc-800/80 bg-zinc-950 p-3">
                   <p className="font-bold text-amber-400 uppercase">Pipeline record: {generationMetadata.finalStatus}</p>
                   <p>Model: {generationMetadata.models.generator}</p>
+                  {generationMetadata.referenceMode && <p>Reference: {generationMetadata.referenceMode === "match" ? "close match" : "loose inspiration"}</p>}
+                  {generationMetadata.plan.referenceAnalysis && (
+                    <p className="text-zinc-300">Detected reference: {generationMetadata.plan.referenceAnalysis.pose} · tail {generationMetadata.plan.referenceAnalysis.externalTail}</p>
+                  )}
                   <p>Prompts: {Object.values(generationMetadata.promptVersions).join(" · ")}</p>
                   <p>Automatic repairs: {generationMetadata.completedRepairRounds}/{generationMetadata.automaticRepairLimit}</p>
                   <p>Validation runs: {generationMetadata.validationHistory.length} · Reviews: {generationMetadata.reviewHistory.length}</p>
                   <div className="flex items-center gap-1 pt-1"><span>Final rating:</span>{[1, 2, 3, 4, 5].map((rating) => <button type="button" key={rating} onClick={() => setGenerationMetadata((current) => current ? { ...current, finalUserRating: rating } : current)} className={`h-5 w-5 rounded border text-[9px] ${generationMetadata.finalUserRating === rating ? "border-amber-400 bg-amber-500 text-zinc-950" : "border-zinc-700 bg-zinc-900"}`}>{rating}</button>)}</div>
                   {(generationMetadata.validationHistory.at(-1)?.issues.length ?? 0) > 0 && (
-                    <ul className="mt-2 max-h-20 overflow-auto text-red-300">
+                    <ul className="mt-2 space-y-1 break-words text-red-300">
                       {generationMetadata.validationHistory.at(-1)!.issues.map((entry, index) => <li key={`${entry.code}-${index}`}>{entry.part}: {entry.message}</li>)}
                     </ul>
                   )}
+                  {(generationMetadata.reviewHistory.at(-1)?.issues.length ?? 0) > 0 && (
+                    <ul className="mt-2 space-y-1 break-words text-amber-300">
+                      {generationMetadata.reviewHistory.at(-1)!.issues.map((entry, index) => <li key={`${entry.category}-${index}`}>{entry.affectedParts.join(", ") || entry.part}: {entry.description}</li>)}
+                    </ul>
+                  )}
+                  {generationMetadata.metrics && <p>First-pass geometry: {generationMetadata.metrics.firstPassGeometrySuccess ? "pass" : "repair needed"} · {generationMetadata.metrics.latencyMs}ms</p>}
                   {generationMetadata.finalStatus !== "approved" && <p className="text-amber-300">Remaining warnings are visible; use part-only refinement or the SVG editors below.</p>}
                 </div>
                 {pipelinePreviews && (["cleanSvg", "diagnosticSvg"] as const).map((key) => (
@@ -1550,14 +1651,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 2. BACK LEGS LAYER (Behind body) */}
+                  {/* 2. FAR HIND LIMB (or complete legacy hind-limb part) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("backLegs")}
                   >
                     <g data-editor-part="backLegs" transform={backLegsTransformStr}>
-                      {renderPartPreview("backLegs", backLegsSvg)}
-                      {renderLayerSelection("backLegs")}
+                      {renderPartPreview("backLegs", backPreviewDepthLayers?.far ?? backLegsSvg)}
+                      {!backPreviewDepthLayers && renderLayerSelection("backLegs")}
                     </g>
                     {activeTweakPart === "backLegs" && (
                       <rect
@@ -1573,7 +1674,19 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 3. BODY LAYER */}
+                  {/* 3. FAR FORELIMB (semantic generated parts only) */}
+                  {frontPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("frontLegs")}
+                    >
+                      <g data-editor-part="frontLegs-far" transform={frontLegsTransformStr}>
+                        {renderPartPreview("frontLegs", frontPreviewDepthLayers.far)}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 4. BODY LAYER */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("body")}
@@ -1596,13 +1709,26 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 4. FRONT LEGS LAYER (In front of body) */}
+                  {/* 5. NEAR HIND LIMB (semantic generated parts only) */}
+                  {backPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("backLegs")}
+                    >
+                      <g data-editor-part="backLegs-near" transform={backLegsTransformStr}>
+                        {renderPartPreview("backLegs", backPreviewDepthLayers.near)}
+                        {renderLayerSelection("backLegs")}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 6. NEAR FORELIMB (or complete legacy forelimb part) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("frontLegs")}
                   >
                     <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
-                      {renderPartPreview("frontLegs", frontLegsSvg)}
+                      {renderPartPreview("frontLegs", frontPreviewDepthLayers?.near ?? frontLegsSvg)}
                       {renderLayerSelection("frontLegs")}
                     </g>
                     {activeTweakPart === "frontLegs" && (
@@ -1619,7 +1745,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 5. HEAD LAYER (In front of body) */}
+                  {/* 7. HEAD LAYER (In front of body) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("head")}

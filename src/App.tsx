@@ -750,12 +750,6 @@ export default function App() {
             onChange={handleActiveAdjustmentChange}
             onResetActive={handleResetActiveAdjustment}
             onResetAll={handleResetAllAdjustments}
-            rawSvg={activePartObj ? activePartObj.rawContent : undefined}
-            shapeAdjustments={activePart ? adjustments.shapeAdjustments?.[activePart] : undefined}
-            activeShapeIndex={activeShapeIndex}
-            onChangeShapeIndex={setActiveShapeIndex}
-            onChangeShapeAdjustment={handleShapeAdjustmentChange}
-            onResetShapeAdjustment={handleResetShapeAdjustment}
           />
         </div>
 

@@ -2,6 +2,8 @@ import type { AnimalPartType, BodyConnectionPoints } from "../types";
 
 export const PART_TYPES: AnimalPartType[] = ["head", "body", "frontLegs", "backLegs", "tail"];
 
+export type ReferenceMode = "match" | "inspire";
+
 export type GenerationPresetId =
   | "friendly-cartoon"
   | "natural-semi-realistic"
@@ -39,6 +41,53 @@ export interface AnatomyStylePlan {
   attachmentStrategy: Array<{ part: AnimalPartType; anchor: string; strategy: string }>;
   requiredNamedGroups: Record<AnimalPartType, string[]>;
   suggestedJoints: Array<{ part: AnimalPartType; name: string; x: number; y: number }>;
+  blueprint?: AnimalLayoutBlueprint;
+  referenceAnalysis?: {
+    fidelityTarget: "close-match" | "inspiration" | "none";
+    silhouette: string;
+    pose: string;
+    proportions: string;
+    speciesCues: string[];
+    palette: string;
+    externalTail: "visible" | "absent" | "unclear";
+    backgroundElementsToIgnore: string[];
+  };
+}
+
+export interface BlueprintConnectionProfile {
+  part: Exclude<AnimalPartType, "body">;
+  socketAnchor: { x: number; y: number };
+  attachmentAnchor: { x: number; y: number };
+  outwardNormal: { x: number; y: number };
+  opposingNormal: { x: number; y: number };
+  seamWidth: number;
+  minimumOverlap: number;
+  neutralConnectionDepth: number;
+  allowedScale: { min: number; max: number };
+}
+
+export interface AnimalLayoutBlueprint {
+  occupiedBounds: Record<AnimalPartType, { x: number; y: number; width: number; height: number }>;
+  groundY: number;
+  connections: BlueprintConnectionProfile[];
+  landmarks: {
+    noseTip: { x: number; y: number };
+    eye: { x: number; y: number };
+    neckBase: { x: number; y: number };
+    shoulder: { x: number; y: number };
+    hip: { x: number; y: number };
+    pawBottoms: Array<{ x: number; y: number; raised?: boolean }>;
+    heels: Array<{ x: number; y: number }>;
+    toeTips: Array<{ x: number; y: number }>;
+  };
+}
+
+export interface GeneratedLayoutMetadata {
+  facing: "left" | "right";
+  groundY: number;
+  connections: BlueprintConnectionProfile[];
+  groundContacts: Partial<Record<"frontLegs" | "backLegs", Array<{ x: number; y: number; raised?: boolean }>>>;
+  depthGroups: Partial<Record<"frontLegs" | "backLegs", { farGroupId: string; nearGroupId: string }>>;
 }
 
 export interface AnimalDraft {
@@ -52,6 +101,7 @@ export interface AnimalDraft {
   frontLegsSvg: string;
   backLegsSvg: string;
   tailSvg: string;
+  layoutMetadata?: GeneratedLayoutMetadata;
 }
 
 export type ValidationSeverity = "error" | "warning";
@@ -71,6 +121,7 @@ export interface ValidationResult {
 }
 
 export type ReviewCategory =
+  | "referenceFidelity"
   | "speciesRecognizability"
   | "anatomicalPlausibility"
   | "overallSilhouette"
@@ -85,6 +136,7 @@ export type ReviewCategory =
 export interface VisualReviewIssue {
   category: ReviewCategory;
   part: AnimalPartType | "animal";
+  affectedParts: AnimalPartType[];
   severity: "minor" | "major" | "critical";
   description: string;
   suggestedCorrection: string;
@@ -119,5 +171,13 @@ export interface GenerationMetadata {
   completedRepairRounds: number;
   finalStatus: "approved" | "warnings" | "technical-failure";
   createdAt: string;
+  generatedLayout?: GeneratedLayoutMetadata;
+  referenceMode?: ReferenceMode;
+  forgedWithTechnicalWarnings?: boolean;
+  metrics?: {
+    firstPassGeometrySuccess: boolean;
+    repairCount: number;
+    latencyMs: number;
+  };
   finalUserRating?: number;
 }

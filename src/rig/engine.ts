@@ -26,7 +26,9 @@ export function clampJointRotation(joint: RigJoint, rotation: number) {
 }
 
 export function resolvePoseRotations(rig: RigDefinition, pose?: RigPose | Record<string, number>) {
-  const supplied = pose && "rotations" in pose ? pose.rotations : pose;
+  const supplied: Record<string, number> | undefined = pose && typeof (pose as RigPose).rotations === "object"
+    ? (pose as RigPose).rotations
+    : pose as Record<string, number> | undefined;
   return Object.fromEntries(rig.joints.map((joint) => [joint.id, clampJointRotation(joint, supplied?.[joint.id] ?? rig.bindPose[joint.id] ?? joint.bindRotation)]));
 }
 

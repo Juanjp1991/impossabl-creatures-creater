@@ -1,7 +1,44 @@
 import type { AnimalDraft } from "./contracts";
+import { analyzeDraftGeometry } from "./geometry";
 
 const escapeAttr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-const colourize = (svg: string, draft: AnimalDraft) => svg.replace(/(["'])primary\1/gi, `"${escapeAttr(draft.color)}"`).replace(/(["'])accent\1/gi, `"${escapeAttr(draft.accentColor)}"`);
+const colourize = (svg: string, draft: AnimalDraft) => {
+  const primary = escapeAttr(draft.color);
+  const accent = escapeAttr(draft.accentColor);
+  return svg
+    .replace(/(["'])\s*(?:primary|var\(\s*--primary\s*\))\s*\1/gi, `"${primary}"`)
+    .replace(/(["'])\s*(?:accent|var\(\s*--accent\s*\))\s*\1/gi, `"${accent}"`)
+    .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(?:primary|var\(\s*--primary\s*\))(?=\s*(?:;|["']|$))/gi, `$1${primary}`)
+    .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(?:accent|var\(\s*--accent\s*\))(?=\s*(?:;|["']|$))/gi, `$1${accent}`);
+};
+
+export interface SvgDepthLayers {
+  far: string;
+  near: string;
+}
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function hideSvgGroup(svg: string, groupId: string): string | undefined {
+  const group = new RegExp(`<g\\b(?=[^>]*\\bid\\s*=\\s*["']${escapeRegExp(groupId)}["'])[^>]*>`, "i");
+  if (!group.test(svg)) return undefined;
+  return svg.replace(group, (tag) => {
+    if (/\bdisplay\s*=\s*["'][^"']*["']/i.test(tag)) return tag.replace(/\bdisplay\s*=\s*["'][^"']*["']/i, `display="none"`);
+    return tag.replace(/>$/, ` display="none">`);
+  });
+}
+
+/**
+ * Produces two complete copies of a limb SVG while hiding the opposite semantic
+ * depth group in each copy. Keeping the complete wrapper preserves transforms,
+ * masks, gradients and coordinate-normalization inherited from ancestor groups.
+ */
+export function splitSvgDepthLayers(svg: string, depthGroups?: { farGroupId: string; nearGroupId: string }): SvgDepthLayers | undefined {
+  if (!depthGroups) return undefined;
+  const far = hideSvgGroup(svg, depthGroups.nearGroupId);
+  const near = hideSvgGroup(svg, depthGroups.farGroupId);
+  return far && near ? { far, near } : undefined;
+}
 
 export function buildAssembledPreviewSvg(draft: AnimalDraft, diagnostic = false): string {
   const origin = { x: 150, y: 150 };
@@ -18,9 +55,49 @@ export function buildAssembledPreviewSvg(draft: AnimalDraft, diagnostic = false)
     frontLegs: `translate(${targets.frontLegs.x - 75} ${targets.frontLegs.y - 15})`,
     backLegs: `translate(${targets.backLegs.x - 195} ${targets.backLegs.y - 15})`,
   };
-  const bounds = diagnostic ? `<g fill="none" stroke="#00d4ff" stroke-width="1" stroke-dasharray="5 4" opacity=".8"><rect x="${targets.neck.x - 120}" y="${targets.neck.y - 110}" width="160" height="160"/><rect x="150" y="150" width="300" height="220"/><rect x="${targets.frontLegs.x - 75}" y="${targets.frontLegs.y - 15}" width="260" height="180"/><rect x="${targets.backLegs.x - 195}" y="${targets.backLegs.y - 15}" width="260" height="180"/><rect x="${targets.tail.x - 15}" y="${targets.tail.y - 15}" width="160" height="160"/></g>` : "";
+  const geometry = analyzeDraftGeometry(draft);
+  const groundLine = geometry.groundY;
+  const bounds = diagnostic ? `<g fill="none" stroke="#00d4ff" stroke-width="1" stroke-dasharray="5 4" opacity=".8">${Object.values(geometry.parts).filter((part) => part.bounds).map((part) => `<rect x="${part.bounds!.x}" y="${part.bounds!.y}" width="${part.bounds!.width}" height="${part.bounds!.height}"/>`).join("")}${geometry.seams.map((seam) => { const target = targets[seam.part === "head" ? "neck" : seam.part]; return `<rect x="${target.x - 9}" y="${target.y - 9}" width="18" height="18" stroke="${seam.jointZoneOverlapPixels >= 40 ? "#22c55e" : "#ef4444"}"/>`; }).join("")}</g>` : "";
   const anchors = diagnostic ? `<g font-family="monospace" font-size="9" stroke="#111" stroke-width="1">${Object.entries(targets).map(([name, point]) => `<circle cx="${point.x}" cy="${point.y}" r="6" fill="#ff3d9a"/><text x="${point.x + 8}" y="${point.y - 6}" fill="#ff3d9a" stroke="none">${name}</text>`).join("")}</g>` : "";
-  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 500" width="600" height="500"><rect width="600" height="500" fill="#fafafa"/><line x1="0" y1="350" x2="600" y2="350" stroke="#bbb" stroke-dasharray="4 4"/><g id="preview-tail" transform="${transforms.tail}">${colourize(draft.tailSvg, draft)}</g><g id="preview-backLegs" transform="${transforms.backLegs}">${colourize(draft.backLegsSvg, draft)}</g><g id="preview-body" transform="${transforms.body}">${colourize(draft.bodySvg, draft)}</g><g id="preview-frontLegs" transform="${transforms.frontLegs}">${colourize(draft.frontLegsSvg, draft)}</g><g id="preview-head" transform="${transforms.head}">${colourize(draft.headSvg, draft)}</g>${bounds}${anchors}</svg>`;
+  const frontLayers = splitSvgDepthLayers(draft.frontLegsSvg, draft.layoutMetadata?.depthGroups.frontLegs);
+  const backLayers = splitSvgDepthLayers(draft.backLegsSvg, draft.layoutMetadata?.depthGroups.backLegs);
+  const layer = (id: string, transform: string, svg: string) => `<g id="${id}" transform="${transform}">${colourize(svg, draft)}</g>`;
+  const behindBody = [
+    layer("preview-tail", transforms.tail, draft.tailSvg),
+    layer(backLayers ? "preview-backLegs-far" : "preview-backLegs", transforms.backLegs, backLayers?.far ?? draft.backLegsSvg),
+    ...(frontLayers ? [layer("preview-frontLegs-far", transforms.frontLegs, frontLayers.far)] : []),
+  ].join("");
+  const inFrontOfBody = [
+    ...(backLayers ? [layer("preview-backLegs-near", transforms.backLegs, backLayers.near)] : []),
+    layer(frontLayers ? "preview-frontLegs-near" : "preview-frontLegs", transforms.frontLegs, frontLayers?.near ?? draft.frontLegsSvg),
+    layer("preview-head", transforms.head, draft.headSvg),
+  ].join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 500" width="600" height="500" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="600" height="500" fill="#fafafa"/><line x1="0" y1="${groundLine}" x2="600" y2="${groundLine}" stroke="#bbb" stroke-dasharray="4 4" data-derived-ground="true"/>${behindBody}${layer("preview-body", transforms.body, draft.bodySvg)}${inFrontOfBody}${bounds}${anchors}</svg>`;
+}
+
+function innerSvg(svg: string) {
+  return svg.replace(/^<svg\b[^>]*>/i, "").replace(/<\/svg>\s*$/i, "");
+}
+
+function buildSilhouetteLayer(clean: string): string {
+  return clean
+    .replace(/<rect\b(?=[^>]*\bwidth=["']600["'])(?=[^>]*\bheight=["']500["'])[^>]*\/>/i, "")
+    .replace(/<line\b(?=[^>]*\bdata-derived-ground=["']true["'])[^>]*\/>/i, "")
+    .replace(/\b(?:fill|stroke)\s*=\s*["'][^"']*["']/gi, (attribute) => /["']none["']/i.test(attribute) ? attribute : `${attribute.slice(0, attribute.indexOf("="))}="#09090b"`)
+    .replace(/(\b(?:fill|stroke)\s*:\s*)([^;"']+)/gi, (_match, prefix: string, value: string) => /^(?:none|transparent)\s*$/i.test(value) ? `${prefix}${value}` : `${prefix}#09090b`);
+}
+
+export function buildReviewCompositeSvg(draft: AnimalDraft): string {
+  const clean = innerSvg(buildAssembledPreviewSvg(draft));
+  const diagnostic = innerSvg(buildAssembledPreviewSvg(draft, true));
+  const silhouette = buildSilhouetteLayer(clean);
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720"><rect width="1200" height="720" fill="#18181b"/><g font-family="monospace" font-size="16" fill="#e4e4e7"><text x="24" y="28">CLEAN COLOUR</text><text x="624" y="28">SILHOUETTE</text><text x="24" y="388">DIAGNOSTIC SEAMS</text><text x="624" y="388">MOBILE THUMBNAIL</text></g><svg x="20" y="40" width="560" height="320" viewBox="0 0 600 500">${clean}</svg><rect x="620" y="40" width="560" height="320" fill="#fafafa"/><svg x="620" y="40" width="560" height="320" viewBox="0 0 600 500">${silhouette}</svg><svg x="20" y="400" width="560" height="300" viewBox="0 0 600 500">${diagnostic}</svg><rect x="770" y="430" width="256" height="213" rx="20" fill="#fafafa"/><svg x="770" y="430" width="256" height="213" viewBox="0 0 600 500">${clean}</svg></svg>`;
+}
+
+export function buildJointCropSvg(draft: AnimalDraft, part: Exclude<keyof AnimalDraft["bodyConnections"], never>): string {
+  const connection = draft.bodyConnections[part];
+  const target = { x: 150 + connection.x, y: 150 + connection.y };
+  return buildAssembledPreviewSvg(draft, true).replace(/viewBox="0 0 600 500"/, `viewBox="${target.x - 55} ${target.y - 55} 110 110"`);
 }
 
 function normalizeSvgForImage(svg: string): string {
@@ -60,14 +137,14 @@ async function loadSvgImage(sources: string[]): Promise<HTMLImageElement> {
   throw lastError instanceof Error ? lastError : new Error("Could not render SVG preview.");
 }
 
-export async function renderSvgToPngDataUrl(svg: string): Promise<string> {
+export async function renderSvgToPngDataUrl(svg: string, width = 600, height = 500): Promise<string> {
   const normalized = normalizeSvgForImage(svg);
   const blobUrl = URL.createObjectURL(new Blob([normalized], { type: "image/svg+xml;charset=utf-8" }));
   try {
     const image = await loadSvgImage([blobUrl, svgDataUrl(normalized)]);
-    const canvas = document.createElement("canvas"); canvas.width = 600; canvas.height = 500;
+    const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
     const context = canvas.getContext("2d"); if (!context) throw new Error("Canvas preview rendering is unavailable.");
-    context.drawImage(image, 0, 0, 600, 500);
+    context.drawImage(image, 0, 0, width, height);
     return canvas.toDataURL("image/png");
   } finally { URL.revokeObjectURL(blobUrl); }
 }

@@ -35,6 +35,8 @@ export function migrateLegacyAnimalToV1(animal: LegacyAnimal, now = new Date().t
   const bodyPart = animal.parts?.body;
   if (!bodyPart) throw new Error(`Legacy animal '${animalId}' is missing body.`);
   const bodyId = `${animalId}-body`;
+  const generatedLayout = animal.generationMetadata?.generatedLayout;
+  const generatedConnection = (part: "head" | "frontLegs" | "backLegs" | "tail") => generatedLayout?.connections.find((entry) => entry.part === part);
 
   const parts: AnimalPartV1[] = LEGACY_PARTS.map(({ oldKey, category, layerOrder, socketKey }) => {
     const legacyPart = animal.parts?.[oldKey];
@@ -43,15 +45,20 @@ export function migrateLegacyAnimalToV1(animal: LegacyAnimal, now = new Date().t
     const rootGroup = `${id}-root`;
     const svg = typeof legacyPart.rawContent === "string" ? legacyPart.rawContent.trim() : "";
     if (!svg) throw new Error(`Legacy animal '${animalId}' has no SVG for ${oldKey}.`);
+    const connection = socketKey ? generatedConnection(socketKey === "neck" ? "head" : socketKey) : undefined;
+    const depthGroups = (oldKey === "frontLegs" || oldKey === "backLegs") ? generatedLayout?.depthGroups?.[oldKey] : undefined;
+    const groundContacts = (oldKey === "frontLegs" || oldKey === "backLegs") ? generatedLayout?.groundContacts?.[oldKey] : undefined;
     return {
       id,
       name: legacyPart.name || `${animal.name} ${category}`,
       category,
       viewBox: parseViewBox(legacyPart.viewBox),
       svg: `<g id="${rootGroup}">${svg}</g>`,
-      namedGroups: [rootGroup],
+      namedGroups: [rootGroup, ...(depthGroups ? [depthGroups.farGroupId, depthGroups.nearGroupId] : [])],
       layerOrder,
-      ...(socketKey ? { attachment: { socketId: `${animalId}-socket-${category}`, anchor: localAnchor(legacyPart, category) } } : {}),
+      ...(socketKey ? { attachment: { socketId: `${animalId}-socket-${category}`, anchor: localAnchor(legacyPart, category), ...(connection ? { profile: { opposingNormal: connection.opposingNormal, seamWidth: connection.seamWidth, neutralConnectionDepth: connection.neutralConnectionDepth } } : {}) } } : {}),
+      ...(groundContacts?.length ? { groundContacts } : {}),
+      ...(depthGroups ? { depthGroups } : {}),
     };
   });
 
@@ -66,7 +73,8 @@ export function migrateLegacyAnimalToV1(animal: LegacyAnimal, now = new Date().t
   const sockets = socketEntries.map(({ key, category, name }) => {
     const point = animal.bodyConnections?.[key];
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error(`Legacy animal '${animalId}' is missing body ${key} anchor.`);
-    return { id: `${animalId}-socket-${category}`, name, ownerPartId: bodyId, category, accepts: [category], anchor: { x: point.x, y: point.y }, required: true };
+    const connection = generatedConnection(key === "neck" ? "head" : key);
+    return { id: `${animalId}-socket-${category}`, name, ownerPartId: bodyId, category, accepts: [category], anchor: { x: point.x, y: point.y }, required: true, ...(connection ? { profile: { outwardNormal: connection.outwardNormal, seamWidth: connection.seamWidth, minimumOverlap: connection.minimumOverlap, allowedScale: connection.allowedScale } } : {}) };
   });
   const source = animalId === "bear" || animalId === "cheetah" ? "built-in" as const : "legacy-migration" as const;
   const migrated: AnimalPackageV1 = {
@@ -78,6 +86,7 @@ export function migrateLegacyAnimalToV1(animal: LegacyAnimal, now = new Date().t
     palette: { primary: animal.color, accent: animal.accentColor },
     anatomyTemplateId: "quadruped",
     centralSkeleton: { rootPartId: bodyId, viewBox: parseViewBox(bodyPart.viewBox) },
+    ...(generatedLayout ? { compatibility: { facing: generatedLayout.facing, groundY: generatedLayout.groundY } } : {}),
     sockets,
     parts,
     ...(animal.rig ? {

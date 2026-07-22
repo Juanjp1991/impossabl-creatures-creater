@@ -1,6 +1,7 @@
 import { ANATOMY_TEMPLATES } from "./templates";
 import { ANIMAL_PACKAGE_FORMAT_VERSION, type AnatomicalCategory, type AnimalPackageV1 } from "./schema";
 import { validateRigDefinition } from "../rig/engine";
+import { mapPoint, readCoordinateNormalization } from "../generation/normalize";
 
 export interface PackageValidationIssue {
   code: string;
@@ -17,7 +18,7 @@ const ID_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const HEX_PATTERN = /^#[0-9a-f]{6}$/i;
 const ALLOWED_SVG_TAGS = new Set(["g", "path", "circle", "rect", "ellipse", "polygon", "polyline", "line", "defs", "lineargradient", "radialgradient", "stop", "filter", "fedropshadow", "fegaussianblur", "mask", "clippath"]);
-const ALLOWED_SVG_ATTRIBUTES = new Set(["id", "d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "points", "fill", "fill-opacity", "fillopacity", "fill-rule", "fillrule", "stroke", "stroke-width", "strokewidth", "stroke-linecap", "strokelinecap", "stroke-linejoin", "strokelinejoin", "stroke-dasharray", "strokedasharray", "stroke-opacity", "strokeopacity", "opacity", "display", "transform", "offset", "stop-color", "stopcolor", "stop-opacity", "stopopacity", "gradientunits", "gradienttransform", "fx", "fy", "stddeviation", "dx", "dy", "flood-color", "floodcolor", "flood-opacity", "floodopacity", "filter", "mask", "clip-path", "clippath", "href", "xlink:href", "class", "style", "data-name", "data-locked", "data-base-transform", "data-base-fill", "data-editor-transform"]);
+const ALLOWED_SVG_ATTRIBUTES = new Set(["id", "d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "points", "fill", "fill-opacity", "fillopacity", "fill-rule", "fillrule", "stroke", "stroke-width", "strokewidth", "stroke-linecap", "strokelinecap", "stroke-linejoin", "strokelinejoin", "stroke-dasharray", "strokedasharray", "stroke-opacity", "strokeopacity", "opacity", "display", "transform", "offset", "stop-color", "stopcolor", "stop-opacity", "stopopacity", "gradientunits", "gradienttransform", "fx", "fy", "stddeviation", "dx", "dy", "flood-color", "floodcolor", "flood-opacity", "floodopacity", "filter", "mask", "clip-path", "clippath", "href", "xlink:href", "class", "style", "data-name", "data-locked", "data-base-transform", "data-base-fill", "data-editor-transform", "data-coordinate-normalization", "data-normalization-scale", "data-normalization-x", "data-normalization-y"]);
 
 function countByCategory(items: Array<{ category: AnatomicalCategory }>, category: AnatomicalCategory) {
   return items.filter((item) => item.category === category).length;
@@ -25,6 +26,15 @@ function countByCategory(items: Array<{ category: AnatomicalCategory }>, categor
 
 function add(issues: PackageValidationIssue[], code: string, path: string, message: string) {
   issues.push({ code, path, message });
+}
+
+function finitePoint(value: unknown): value is { x: number; y: number } {
+  const point = value as { x?: unknown; y?: unknown } | undefined;
+  return Boolean(point && Number.isFinite(point.x) && Number.isFinite(point.y));
+}
+
+function validatePositive(issues: PackageValidationIssue[], value: unknown, code: string, path: string, label: string) {
+  if (!Number.isFinite(value) || Number(value) <= 0) add(issues, code, path, `${label} must be a finite positive number.`);
 }
 
 function geometryPoints(svg: string) {
@@ -39,7 +49,8 @@ function geometryPoints(svg: string) {
     if (Number.isFinite(attrs.x) && Number.isFinite(attrs.y)) points.push({ x: attrs.x, y: attrs.y }, { x: attrs.x + (attrs.width || 0), y: attrs.y + (attrs.height || 0) });
     if (Number.isFinite(attrs.x1) && Number.isFinite(attrs.y1)) points.push({ x: attrs.x1, y: attrs.y1 }, { x: attrs.x2, y: attrs.y2 });
   }
-  return points;
+  const normalization = readCoordinateNormalization(svg);
+  return normalization ? points.map((point) => mapPoint(point, normalization)) : points;
 }
 
 export function validateAnimalPackageV1(candidate: unknown): PackageValidationResult {
@@ -54,6 +65,10 @@ export function validateAnimalPackageV1(candidate: unknown): PackageValidationRe
   if (typeof value.assetVersion !== "string" || !SEMVER_PATTERN.test(value.assetVersion)) add(issues, "asset.version", "assetVersion", "Asset version must be valid SemVer.");
   if (typeof value.name !== "string" || !value.name.trim()) add(issues, "animal.name", "name", "Animal name is required.");
   if (!value.palette || !HEX_PATTERN.test(value.palette.primary) || !HEX_PATTERN.test(value.palette.accent)) add(issues, "palette.colour", "palette", "Primary and accent colours must be six-digit hex values.");
+  if (value.compatibility) {
+    if (value.compatibility.facing !== "left" && value.compatibility.facing !== "right") add(issues, "compatibility.facing", "compatibility.facing", "Facing must be 'left' or 'right'.");
+    if (!Number.isFinite(value.compatibility.groundY)) add(issues, "compatibility.ground", "compatibility.groundY", "Root-local groundY must be finite.");
+  }
 
   const template = value.anatomyTemplateId ? ANATOMY_TEMPLATES[value.anatomyTemplateId] : undefined;
   if (!template) add(issues, "anatomy.template", "anatomyTemplateId", "Unknown anatomy template.");
@@ -110,6 +125,39 @@ export function validateAnimalPackageV1(candidate: unknown): PackageValidationRe
     if (!points.length) add(issues, "geometry.empty", `${path}.svg`, "Part has no detectable visible geometry.");
     if (points.some((point) => point.x < part.viewBox.x - part.viewBox.width * .25 || point.x > part.viewBox.x + part.viewBox.width * 1.25 || point.y < part.viewBox.y - part.viewBox.height * .25 || point.y > part.viewBox.y + part.viewBox.height * 1.25)) add(issues, "geometry.bounds", `${path}.svg`, "Part geometry extends far outside its viewBox.");
     if (part.attachment && !points.some((point) => Math.hypot(point.x - part.attachment!.anchor.x, point.y - part.attachment!.anchor.y) <= 32)) add(issues, "attachment.geometry", `${path}.attachment.anchor`, "No visible geometry exists within 32px of the part attachment anchor.");
+    if (part.groundContacts) {
+      if (!Array.isArray(part.groundContacts) || !part.groundContacts.length) add(issues, "ground.contacts", `${path}.groundContacts`, "Ground contacts must contain at least one local paw/foot point.");
+      else for (const [contactIndex, contact] of part.groundContacts.entries()) if (!finitePoint(contact)) add(issues, "ground.contact", `${path}.groundContacts[${contactIndex}]`, "Ground contact coordinates must be finite.");
+    }
+    if (part.attachment?.profile) {
+      const profile = part.attachment.profile;
+      if (!finitePoint(profile.opposingNormal) || Math.hypot(profile.opposingNormal.x, profile.opposingNormal.y) < .001) add(issues, "attachment.profile.normal", `${path}.attachment.profile.opposingNormal`, "Attachment opposing normal must be a finite non-zero vector.");
+      validatePositive(issues, profile.seamWidth, "attachment.profile.width", `${path}.attachment.profile.seamWidth`, "Attachment seam width");
+      validatePositive(issues, profile.neutralConnectionDepth, "attachment.profile.overlap", `${path}.attachment.profile.neutralConnectionDepth`, "Neutral connection depth");
+    }
+    if (part.depthGroups) {
+      const { farGroupId, nearGroupId } = part.depthGroups;
+      if (part.category !== "forelimbs" && part.category !== "hindlimbs") add(issues, "depth.category", `${path}.depthGroups`, "Depth groups are only valid on forelimb or hindlimb parts.");
+      if (farGroupId === nearGroupId) add(issues, "depth.distinct", `${path}.depthGroups`, "Far and near depth group IDs must be distinct.");
+      for (const [key, id] of [["farGroupId", farGroupId], ["nearGroupId", nearGroupId]] as const) {
+        const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const count = [...part.svg.matchAll(new RegExp(`<g\\b[^>]*\\bid=["']${escaped}["']`, "gi"))].length;
+        if (count !== 1) add(issues, "depth.group", `${path}.depthGroups.${key}`, `Depth group '${id}' must exist exactly once in the part SVG.`);
+        if (!part.namedGroups.includes(id)) add(issues, "depth.named", `${path}.namedGroups`, `Depth group '${id}' must be declared as a named group.`);
+      }
+      const stack: string[] = [];
+      let defsDepth = 0;
+      for (const token of part.svg.matchAll(/<\s*(\/?)\s*([A-Za-z][\w:-]*)([^>]*)>/g)) {
+        const closing = Boolean(token[1]); const tag = token[2].toLowerCase(); const selfClosing = /\/\s*$/.test(token[3]);
+        if (closing) { if (tag === "g") stack.pop(); if (tag === "defs") defsDepth = Math.max(0, defsDepth - 1); continue; }
+        const id = token[3].match(/\bid\s*=\s*["']([^"']+)["']/i)?.[1];
+        if (tag === "g") stack.push(id || "");
+        if (tag === "defs") defsDepth++;
+        if (["path", "circle", "rect", "ellipse", "polygon", "polyline", "line"].includes(tag) && defsDepth === 0 && !stack.includes(farGroupId) && !stack.includes(nearGroupId)) add(issues, "depth.geometry", `${path}.svg`, "Visible limb geometry must be nested under the declared far or near group.");
+        if (selfClosing && tag === "g") stack.pop();
+        if (selfClosing && tag === "defs") defsDepth = Math.max(0, defsDepth - 1);
+      }
+    }
   }
   for (const reference of svgReferences) if (!svgIds.has(reference.id)) add(issues, "svg.reference", reference.path, `SVG reference '#${reference.id}' does not resolve inside this package.`);
   if (value.rig) {
@@ -127,6 +175,15 @@ export function validateAnimalPackageV1(candidate: unknown): PackageValidationRe
     if (!partIds.has(socket.ownerPartId)) add(issues, "socket.owner", `${path}.ownerPartId`, `Socket owner '${socket.ownerPartId}' does not exist.`);
     if (!Array.isArray(socket.accepts) || socket.accepts.length !== 1 || socket.accepts[0] !== socket.category) add(issues, "socket.strict", `${path}.accepts`, "A Version 1 socket must accept only its strict anatomical category.");
     if (!socket.anchor || !Number.isFinite(socket.anchor.x) || !Number.isFinite(socket.anchor.y)) add(issues, "socket.anchor", `${path}.anchor`, "Socket anchor must contain finite x and y coordinates.");
+    if (socket.profile) {
+      const profile = socket.profile;
+      if (!finitePoint(profile.outwardNormal) || Math.hypot(profile.outwardNormal.x, profile.outwardNormal.y) < .001) add(issues, "socket.profile.normal", `${path}.profile.outwardNormal`, "Socket outward normal must be a finite non-zero vector.");
+      validatePositive(issues, profile.seamWidth, "socket.profile.width", `${path}.profile.seamWidth`, "Socket seam width");
+      validatePositive(issues, profile.minimumOverlap, "socket.profile.overlap", `${path}.profile.minimumOverlap`, "Minimum overlap");
+      validatePositive(issues, profile.allowedScale?.min, "socket.profile.scale", `${path}.profile.allowedScale.min`, "Minimum allowed scale");
+      validatePositive(issues, profile.allowedScale?.max, "socket.profile.scale", `${path}.profile.allowedScale.max`, "Maximum allowed scale");
+      if (Number.isFinite(profile.allowedScale?.min) && Number.isFinite(profile.allowedScale?.max) && profile.allowedScale.min > profile.allowedScale.max) add(issues, "socket.profile.scale.order", `${path}.profile.allowedScale`, "Allowed scale minimum cannot exceed maximum.");
+    }
   }
 
   for (const [index, part] of parts.entries()) {

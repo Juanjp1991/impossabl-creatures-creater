@@ -37,7 +37,12 @@ function namespacePartSvg(part: AnimalPartV1, animalId: string, assetVersion: st
       .replace(new RegExp(`url\\(\\s*#${escaped}\\s*\\)`, "g"), `url(#${newId})`)
       .replace(new RegExp(`((?:href|xlink:href)\\s*=\\s*["'])#${escaped}(["'])`, "g"), `$1#${newId}$2`);
   }
-  return { ...part, svg, namedGroups: part.namedGroups.map((group) => mapping.get(group) ?? group) };
+  return {
+    ...part,
+    svg,
+    namedGroups: part.namedGroups.map((group) => mapping.get(group) ?? group),
+    ...(part.depthGroups ? { depthGroups: { farGroupId: mapping.get(part.depthGroups.farGroupId) ?? part.depthGroups.farGroupId, nearGroupId: mapping.get(part.depthGroups.nearGroupId) ?? part.depthGroups.nearGroupId } } : {}),
+  };
 }
 
 export function namespaceAnimalPackageSvg(pkg: AnimalPackageV1): AnimalPackageV1 {
