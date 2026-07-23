@@ -41,7 +41,7 @@ const modernPlan: AnatomyStylePlan = {
   blueprint: {
     occupiedBounds: {
       head: { x: 100, y: 90, width: 40, height: 40 }, body: { x: 60, y: 80, width: 210, height: 100 },
-      frontLegs: { x: 65, y: 5, width: 80, height: 173 }, backLegs: { x: 155, y: 5, width: 80, height: 173 }, tail: { x: 0, y: 0, width: 45, height: 35 },
+      frontLegs: { x: 65, y: 5, width: 70, height: 173 }, backLegs: { x: 185, y: 5, width: 70, height: 173 }, tail: { x: 0, y: 0, width: 45, height: 35 },
     },
     groundY: 323,
     connections: [
@@ -91,6 +91,11 @@ test("validator reports affected part for unsafe markup and missing anchor geome
   assert.equal(result.valid, false);
   assert.ok(result.issues.some((entry) => entry.part === "head" && entry.code === "svg.tag"));
   assert.ok(result.issues.some((entry) => entry.part === "head" && entry.code === "anchor.geometry"));
+});
+
+test("animal-wide technical errors always map to repairable parts", () => {
+  const result = validateAnimalDraft({ ...draft, color: "not-a-colour" }, plan);
+  assert.deepEqual(technicalFailingParts(result), ["head", "body", "frontLegs", "backLegs", "tail"]);
 });
 
 test("assembled clean and diagnostic previews use the editor attachment contract", () => {
@@ -311,4 +316,51 @@ test("planner invariants and depth-group aliases are normalized before validatio
   const normalized = normalizeGeneratedSvgSyntax(aliasDraft).animal;
   assert.match(normalized.frontLegsSvg, /id="frontLegs-far"/);
   assert.deepEqual(normalized.layoutMetadata!.depthGroups.frontLegs, { farGroupId: "frontLegs-far", nearGroupId: "frontLegs-near" });
+});
+
+test("sequential part repairs isolate metadata and preserve earlier part patches", () => {
+  const frontMetadata = structuredClone(modernDraft.layoutMetadata!);
+  frontMetadata.facing = "right";
+  frontMetadata.groundContacts.frontLegs = [{ x: 82, y: 176 }, { x: 122, y: 176 }];
+  frontMetadata.connections = frontMetadata.connections.map((connection) => connection.part === "frontLegs" ? { ...connection, seamWidth: 34 } : connection);
+  const front = mergeTargetedRepair(modernDraft, { frontLegsSvg: modernDraft.frontLegsSvg.replace("width=\"30\"", "width=\"31\""), layoutMetadata: frontMetadata }, ["frontLegs"]);
+
+  const backMetadata = structuredClone(modernDraft.layoutMetadata!);
+  backMetadata.groundContacts.backLegs = [{ x: 197, y: 176 }, { x: 237, y: 176 }];
+  backMetadata.connections = backMetadata.connections.map((connection) => connection.part === "backLegs" ? { ...connection, seamWidth: 36 } : connection);
+  const back = mergeTargetedRepair(front.animal, { backLegsSvg: modernDraft.backLegsSvg.replace("width=\"30\"", "width=\"32\""), layoutMetadata: backMetadata }, ["backLegs"]);
+
+  assert.equal(back.animal.layoutMetadata!.facing, "left");
+  assert.deepEqual(back.animal.layoutMetadata!.groundContacts.frontLegs, frontMetadata.groundContacts.frontLegs);
+  assert.deepEqual(back.animal.layoutMetadata!.groundContacts.backLegs, backMetadata.groundContacts.backLegs);
+  assert.equal(back.animal.layoutMetadata!.connections.find((connection) => connection.part === "frontLegs")!.seamWidth, 34);
+  assert.equal(back.animal.layoutMetadata!.connections.find((connection) => connection.part === "backLegs")!.seamWidth, 36);
+});
+
+test("critical reference feature groups and visible near/far limbs are enforceable", () => {
+  const featurePlan = structuredClone(modernPlan);
+  featurePlan.referenceAnalysis = {
+    fidelityTarget: "close-match",
+    silhouette: "wolf-like quadruped",
+    pose: "standing",
+    proportions: "long body and four visible legs",
+    speciesCues: ["upright ears"],
+    palette: "grey and cream",
+    paletteSwatches: ["#666666", "#dddddd"],
+    externalTail: "visible",
+    backgroundElementsToIgnore: ["watermark"],
+    referenceFeatures: [{ id: "eye", part: "head", kind: "facial", description: "visible eye", normalizedBounds: { x: .1, y: .1, width: .1, height: .1 }, importance: "critical", requiredGroupId: "head-feature-eye" }],
+  };
+  featurePlan.blueprint!.limbPlan = {
+    frontLegs: { expectedVisibleCount: 2, groundedCount: 2, raisedCount: 0, toeDirection: "left" },
+    backLegs: { expectedVisibleCount: 2, groundedCount: 2, raisedCount: 0, toeDirection: "left" },
+  };
+  const featured = { ...modernDraft, headSvg: `<g id="head-root"><rect x="100" y="90" width="40" height="40" fill="primary"/><g id="head-feature-eye"><circle cx="112" cy="102" r="6" fill="accent"/></g></g>` };
+  const valid = validateAnimalDraft(featured, featurePlan);
+  assert.ok(!valid.issues.some((entry) => entry.code === "reference.feature.geometry" || entry.code === "geometry.limbGroup.empty"), valid.issues.map((entry) => entry.message).join("\n"));
+
+  const missing = validateAnimalDraft(modernDraft, featurePlan);
+  assert.ok(missing.issues.some((entry) => entry.code === "reference.feature.geometry" && entry.part === "head"));
+  const emptyFar = { ...featured, frontLegsSvg: featured.frontLegsSvg.replace(/<rect x="65"[^>]*\/>/, "") };
+  assert.ok(validateAnimalDraft(emptyFar, featurePlan).issues.some((entry) => entry.code === "geometry.limbGroup.empty" && entry.part === "frontLegs"));
 });

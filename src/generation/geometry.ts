@@ -97,6 +97,31 @@ function shapePixels(svg: string, width: number, height: number): PixelMask {
   return { pixels, points: geometryPoints, bounds };
 }
 
+function extractGroupMarkup(svg: string, groupId: string): string | undefined {
+  const escaped = groupId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const opening = new RegExp(`<g\\b(?=[^>]*\\bid\\s*=\\s*["']${escaped}["'])[^>]*>`, "i").exec(svg);
+  if (!opening || opening.index === undefined) return undefined;
+  const start = opening.index;
+  const token = /<\/?g\b[^>]*>/gi;
+  token.lastIndex = start;
+  let depth = 0;
+  let match: RegExpExecArray | null;
+  while ((match = token.exec(svg))) {
+    if (/^<\/g/i.test(match[0])) depth--;
+    else depth++;
+    if (depth === 0) return svg.slice(start, token.lastIndex);
+  }
+  return undefined;
+}
+
+export function analyzeSvgGroupGeometry(svg: string, part: AnimalPartType, groupId: string) {
+  const markup = extractGroupMarkup(svg, groupId);
+  if (!markup) return undefined;
+  const view = VIEW[part];
+  const mask = shapePixels(markup, view.width, view.height);
+  return { occupiedPixels: mask.pixels.size, bounds: mask.bounds };
+}
+
 function intersection(a: Set<number>, b: Set<number>, zone?: { x: number; y: number; radius: number }) {
   let count = 0;
   const smaller = a.size <= b.size ? a : b; const larger = smaller === a ? b : a;

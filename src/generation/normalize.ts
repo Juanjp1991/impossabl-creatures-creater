@@ -91,6 +91,19 @@ export function normalizeAnatomyPlanContract(input: AnatomyStylePlan): AnatomySt
     { part: "frontLegs", layer: "front", purpose: "semantic far and near forelimbs" },
     { part: "head", layer: "front", purpose: "recognizable face and head silhouette" },
   ];
+  if (plan.referenceAnalysis) {
+    const swatches = (plan.referenceAnalysis.paletteSwatches ?? []).filter((colour) => /^#[0-9a-f]{6}$/i.test(colour)).slice(0, 4);
+    plan.referenceAnalysis.paletteSwatches = swatches.length >= 2 ? swatches : ["#6B7280", "#D1D5DB"];
+    const seen = new Set<string>();
+    plan.referenceAnalysis.referenceFeatures = (plan.referenceAnalysis.referenceFeatures ?? []).map((feature, index) => {
+      const safeId = (feature.id || `feature-${index + 1}`).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || `feature-${index + 1}`;
+      let requiredGroupId = `${feature.part}-feature-${safeId}`;
+      while (seen.has(requiredGroupId)) requiredGroupId = `${feature.part}-feature-${safeId}-${index + 1}`;
+      seen.add(requiredGroupId);
+      plan.requiredNamedGroups[feature.part] = [...new Set([...(plan.requiredNamedGroups[feature.part] ?? []), requiredGroupId])];
+      return { ...feature, id: safeId, requiredGroupId };
+    });
+  }
   if (plan.blueprint) {
     const { landmarks } = plan.blueprint;
     landmarks.toeTips = landmarks.toeTips.map((toe, index) => {

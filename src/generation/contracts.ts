@@ -49,9 +49,35 @@ export interface AnatomyStylePlan {
     proportions: string;
     speciesCues: string[];
     palette: string;
+    paletteSwatches?: string[];
     externalTail: "visible" | "absent" | "unclear";
     backgroundElementsToIgnore: string[];
+    referenceFeatures?: ReferenceFeature[];
   };
+}
+
+export interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ReferenceFeature {
+  id: string;
+  part: AnimalPartType;
+  kind: "contour" | "marking" | "facial" | "limb-joint" | "tail";
+  description: string;
+  normalizedBounds: Bounds;
+  importance: "critical" | "major" | "detail";
+  requiredGroupId: string;
+}
+
+export interface ExpectedLimbSet {
+  expectedVisibleCount: number;
+  groundedCount: number;
+  raisedCount: number;
+  toeDirection: "left";
 }
 
 export interface BlueprintConnectionProfile {
@@ -67,9 +93,11 @@ export interface BlueprintConnectionProfile {
 }
 
 export interface AnimalLayoutBlueprint {
-  occupiedBounds: Record<AnimalPartType, { x: number; y: number; width: number; height: number }>;
+  occupiedBounds: Record<AnimalPartType, Bounds>;
+  assembledBounds?: Record<AnimalPartType | "animal", Bounds>;
   groundY: number;
   connections: BlueprintConnectionProfile[];
+  limbPlan?: Partial<Record<"frontLegs" | "backLegs", ExpectedLimbSet>>;
   landmarks: {
     noseTip: { x: number; y: number };
     eye: { x: number; y: number };
@@ -131,9 +159,12 @@ export type ReviewCategory =
   | "stylePaletteConsistency"
   | "groundAlignment"
   | "clippingOverlaps"
-  | "mobileReadability";
+  | "mobileReadability"
+  | "shapeAccuracy"
+  | "featurePlacementAndDetail";
 
 export interface VisualReviewIssue {
+  id?: string;
   category: ReviewCategory;
   part: AnimalPartType | "animal";
   affectedParts: AnimalPartType[];
@@ -143,11 +174,36 @@ export interface VisualReviewIssue {
   regenerationRequired: boolean;
 }
 
+export interface VisualReviewComparison {
+  verdict: "better" | "same" | "worse";
+  summary: string;
+  resolvedIssueIds: string[];
+  persistentIssueIds: string[];
+  introducedIssueIds: string[];
+}
+
 export interface VisualReviewReport {
   scores: Record<ReviewCategory, number>;
   issues: VisualReviewIssue[];
   summary: string;
   approved: boolean;
+  provisional?: boolean;
+  comparison?: VisualReviewComparison;
+}
+
+export type RepairStrategy = "technical" | "part" | "cluster" | "full-rescue";
+
+export interface GenerationAttemptRecord {
+  attempt: number;
+  strategy: RepairStrategy;
+  requestedParts: AnimalPartType[];
+  changedParts: AnimalPartType[];
+  failedParts: AnimalPartType[];
+  validation: ValidationResult;
+  review?: VisualReviewReport;
+  accepted: boolean;
+  reason: string;
+  scoreDelta?: number;
 }
 
 export interface RepairRecord {
@@ -169,6 +225,10 @@ export interface GenerationMetadata {
   repairs: RepairRecord[];
   automaticRepairLimit: number;
   completedRepairRounds: number;
+  attemptHistory?: GenerationAttemptRecord[];
+  bestAttempt?: number;
+  stopReason?: "approved" | "attempt-limit" | "no-progress" | "no-actionable-issues" | "technical-failure";
+  rescueUsed?: boolean;
   finalStatus: "approved" | "warnings" | "technical-failure";
   createdAt: string;
   generatedLayout?: GeneratedLayoutMetadata;

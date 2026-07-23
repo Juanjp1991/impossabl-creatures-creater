@@ -191,6 +191,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
   const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
+  const displayedValidation = generationMetadata
+    ? generationMetadata.validationHistory[generationMetadata.bestAttempt ?? generationMetadata.validationHistory.length - 1] ?? generationMetadata.validationHistory.at(-1)
+    : undefined;
+  const displayedReview = generationMetadata
+    ? [...(generationMetadata.attemptHistory ?? [])].reverse().find((attempt) => attempt.accepted && attempt.attempt <= (generationMetadata.bestAttempt ?? Number.MAX_SAFE_INTEGER) && attempt.review)?.review
+      ?? generationMetadata.reviewHistory[0]
+      ?? generationMetadata.reviewHistory.at(-1)
+    : undefined;
 
   const handleImageUpload = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -455,7 +463,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setActiveTweakPart("head");
 
       setAiMode("refine"); // Auto-switch to refine mode upon successful generation
-      const remaining = result.metadata.validationHistory.at(-1)?.issues.length ?? 0;
+      const remaining = result.metadata.validationHistory[result.metadata.bestAttempt ?? result.metadata.validationHistory.length - 1]?.issues.length ?? 0;
       setGenerationStep(result.metadata.finalStatus === "approved" ? "Pipeline complete: visual review approved." : `Pipeline stopped safely with ${remaining} technical issue(s) or visual warnings. Manual editing remains available.`);
     } catch (err: any) {
       console.error(err);
@@ -1365,6 +1373,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         <select value={guidedBrief.mode} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => updateBriefField("mode", event.target.value as GuidedAnimalBrief["mode"])} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
                           <option value="draft">Draft</option><option value="high-quality">High quality</option>
                         </select>
+                        <span className="mt-1 block text-[8px] normal-case text-zinc-600">{guidedBrief.mode === "draft" ? "One fast improving pass" : "Up to four improving passes with rollback and one rescue"}</span>
                       </label>
                     </div>
                     <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">Animal name (required)</label>
@@ -1548,17 +1557,32 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   <p>Prompts: {Object.values(generationMetadata.promptVersions).join(" · ")}</p>
                   <p>Automatic repairs: {generationMetadata.completedRepairRounds}/{generationMetadata.automaticRepairLimit}</p>
                   <p>Validation runs: {generationMetadata.validationHistory.length} · Reviews: {generationMetadata.reviewHistory.length}</p>
+                  {generationMetadata.attemptHistory && (
+                    <>
+                      <p>Best attempt: {generationMetadata.bestAttempt ?? 0} · Stop: {generationMetadata.stopReason ?? "legacy"} · Rescue: {generationMetadata.rescueUsed ? "used" : "not used"}</p>
+                      <ul className="mt-2 space-y-1 break-words text-zinc-300">
+                        {generationMetadata.attemptHistory.map((attempt) => (
+                          <li key={attempt.attempt} className={attempt.accepted ? "text-emerald-300" : "text-zinc-500"}>
+                            Attempt {attempt.attempt} · {attempt.strategy} · {attempt.accepted ? "accepted" : "rejected"}{attempt.scoreDelta !== undefined ? ` · score ${attempt.scoreDelta >= 0 ? "+" : ""}${attempt.scoreDelta}` : ""}: {attempt.reason}
+                            {attempt.failedParts.length ? ` Failed: ${attempt.failedParts.join(", ")}.` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
                   <div className="flex items-center gap-1 pt-1"><span>Final rating:</span>{[1, 2, 3, 4, 5].map((rating) => <button type="button" key={rating} onClick={() => setGenerationMetadata((current) => current ? { ...current, finalUserRating: rating } : current)} className={`h-5 w-5 rounded border text-[9px] ${generationMetadata.finalUserRating === rating ? "border-amber-400 bg-amber-500 text-zinc-950" : "border-zinc-700 bg-zinc-900"}`}>{rating}</button>)}</div>
-                  {(generationMetadata.validationHistory.at(-1)?.issues.length ?? 0) > 0 && (
+                  {(displayedValidation?.issues.length ?? 0) > 0 && (
                     <ul className="mt-2 space-y-1 break-words text-red-300">
-                      {generationMetadata.validationHistory.at(-1)!.issues.map((entry, index) => <li key={`${entry.code}-${index}`}>{entry.part}: {entry.message}</li>)}
+                      {displayedValidation!.issues.map((entry, index) => <li key={`${entry.code}-${index}`}>{entry.part}: {entry.message}</li>)}
                     </ul>
                   )}
-                  {(generationMetadata.reviewHistory.at(-1)?.issues.length ?? 0) > 0 && (
+                  {displayedReview && <p className="text-zinc-300">Best review: {Object.entries(displayedReview.scores).map(([category, score]) => `${category} ${score}`).join(" · ")}</p>}
+                  {(displayedReview?.issues.length ?? 0) > 0 && (
                     <ul className="mt-2 space-y-1 break-words text-amber-300">
-                      {generationMetadata.reviewHistory.at(-1)!.issues.map((entry, index) => <li key={`${entry.category}-${index}`}>{entry.affectedParts.join(", ") || entry.part}: {entry.description}</li>)}
+                      {displayedReview!.issues.map((entry, index) => <li key={`${entry.id ?? entry.category}-${index}`}>[{entry.severity}] {entry.affectedParts.join(", ") || entry.part}: {entry.description} Correction: {entry.suggestedCorrection}</li>)}
                     </ul>
                   )}
+                  {displayedReview?.comparison && <p className="text-zinc-300">Resolved: {displayedReview.comparison.resolvedIssueIds.length} · Persistent: {displayedReview.comparison.persistentIssueIds.length} · New: {displayedReview.comparison.introducedIssueIds.length}</p>}
                   {generationMetadata.metrics && <p>First-pass geometry: {generationMetadata.metrics.firstPassGeometrySuccess ? "pass" : "repair needed"} · {generationMetadata.metrics.latencyMs}ms</p>}
                   {generationMetadata.finalStatus !== "approved" && <p className="text-amber-300">Remaining warnings are visible; use part-only refinement or the SVG editors below.</p>}
                 </div>

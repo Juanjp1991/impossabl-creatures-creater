@@ -1,4 +1,5 @@
 import type { AnimalDraft } from "./contracts";
+import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry } from "./geometry";
 
 const escapeAttr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
@@ -98,6 +99,13 @@ export function buildJointCropSvg(draft: AnimalDraft, part: Exclude<keyof Animal
   const connection = draft.bodyConnections[part];
   const target = { x: 150 + connection.x, y: 150 + connection.y };
   return buildAssembledPreviewSvg(draft, true).replace(/viewBox="0 0 600 500"/, `viewBox="${target.x - 55} ${target.y - 55} 110 110"`);
+}
+
+export function buildIsolatedPartPreviewSvg(draft: AnimalDraft, part: AnimalPartType): string {
+  const views = { head: [160, 160], body: [300, 220], frontLegs: [260, 180], backLegs: [260, 180], tail: [160, 160] } as const;
+  const fields = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg" } as const;
+  const [width, height] = views[part];
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="${width}" height="${height}" fill="#fafafa"/>${colourize(draft[fields[part]], draft)}</svg>`;
 }
 
 function normalizeSvgForImage(svg: string): string {

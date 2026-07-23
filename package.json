@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "dev:local": "bash scripts/dev-with-proxy.sh",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "test": "node --import tsx --test src/generation/fixtures.test.ts src/animalPackage/fixtures.test.ts src/editor/svgLayers.test.ts src/rig/engine.test.ts",
+    "test": "node --import tsx --test src/generation/fixtures.test.ts src/generation/quality.test.ts src/animalPackage/fixtures.test.ts src/editor/svgLayers.test.ts src/rig/engine.test.ts",
     "game:dev": "vite --config game/vite.config.ts",
     "game:build": "vite build --config game/vite.config.ts",
     "game:lint": "tsc -p game/tsconfig.json --noEmit",
