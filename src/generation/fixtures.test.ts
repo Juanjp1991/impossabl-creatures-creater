@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AnimalDraft, AnatomyStylePlan, GenerationMetadata } from "./contracts";
+import type { AnimalDraft, AnatomyStylePlan, BlueprintConnectionProfile, GenerationMetadata } from "./contracts";
 import { createDefaultBrief } from "./brief";
-import { buildAssembledPreviewSvg, buildReviewCompositeSvg } from "./preview";
+import { buildAssembledPreviewSvg } from "./preview";
 import { analyzeDraftGeometry } from "./geometry";
-import { extractSvgBounds, normalizeAnimalDraftCoordinates, normalizeAnatomyPlanContract, normalizeGeneratedSvgSyntax } from "./normalize";
-import { technicalFailingParts } from "./clientPipeline";
+import { extractSvgBounds, normalizeAnimalDraftCoordinates, normalizeAnatomyPlanContract, normalizeGeneratedSvgSyntax, readCoordinateNormalization, snapAttachedPartsToAnchors } from "./normalize";
 import { mergeTargetedModification, mergeTargetedRepair } from "./repair";
-import { validateAnimalDraft } from "./validation";
+import { technicalFailingParts, validateAnimalDraft } from "./validation";
 
 const plan: AnatomyStylePlan = {
   speciesFeatures: ["broad muzzle", "cloven hooves"], anatomyTemplate: "quadruped-five-part", requiredParts: ["head", "body", "frontLegs", "backLegs", "tail"],
@@ -31,32 +30,21 @@ const draft: AnimalDraft = {
   tailSvg: `<g id="tail-root"><path d="M15 15 Q55 25 85 90" fill="accent"/></g>`,
 };
 
-const profile = (part: "head" | "frontLegs" | "backLegs" | "tail", socketAnchor: { x: number; y: number }, attachmentAnchor: { x: number; y: number }, outwardNormal: { x: number; y: number }) => ({
+// Per-part socket/attachment profiles the generator emits inside layoutMetadata.
+const profile = (part: "head" | "frontLegs" | "backLegs" | "tail", socketAnchor: { x: number; y: number }, attachmentAnchor: { x: number; y: number }, outwardNormal: { x: number; y: number }): BlueprintConnectionProfile => ({
   part, socketAnchor, attachmentAnchor, outwardNormal, opposingNormal: { x: -outwardNormal.x, y: -outwardNormal.y }, seamWidth: 30, minimumOverlap: 16, neutralConnectionDepth: 16, allowedScale: { min: .7, max: 1.3 },
 });
+
+const modernConnections: BlueprintConnectionProfile[] = [
+  profile("head", draft.bodyConnections.neck, { x: 120, y: 110 }, { x: -1, y: 0 }),
+  profile("frontLegs", draft.bodyConnections.frontLegs, { x: 75, y: 15 }, { x: 0, y: 1 }),
+  profile("backLegs", draft.bodyConnections.backLegs, { x: 195, y: 15 }, { x: 0, y: 1 }),
+  profile("tail", draft.bodyConnections.tail, { x: 15, y: 15 }, { x: 1, y: 0 }),
+];
 
 const modernPlan: AnatomyStylePlan = {
   ...plan,
   requiredNamedGroups: { ...plan.requiredNamedGroups, frontLegs: ["frontLegs-root", "frontLegs-far", "frontLegs-near"], backLegs: ["backLegs-root", "backLegs-far", "backLegs-near"] },
-  blueprint: {
-    occupiedBounds: {
-      head: { x: 100, y: 90, width: 40, height: 40 }, body: { x: 60, y: 80, width: 210, height: 100 },
-      frontLegs: { x: 65, y: 5, width: 70, height: 173 }, backLegs: { x: 185, y: 5, width: 70, height: 173 }, tail: { x: 0, y: 0, width: 45, height: 35 },
-    },
-    groundY: 323,
-    connections: [
-      profile("head", draft.bodyConnections.neck, { x: 120, y: 110 }, { x: -1, y: 0 }),
-      profile("frontLegs", draft.bodyConnections.frontLegs, { x: 75, y: 15 }, { x: 0, y: 1 }),
-      profile("backLegs", draft.bodyConnections.backLegs, { x: 195, y: 15 }, { x: 0, y: 1 }),
-      profile("tail", draft.bodyConnections.tail, { x: 15, y: 15 }, { x: 1, y: 0 }),
-    ],
-    landmarks: {
-      noseTip: { x: 28, y: 100 }, eye: { x: 65, y: 78 }, neckBase: { x: 120, y: 110 }, shoulder: { x: 115, y: 160 }, hip: { x: 235, y: 160 },
-      pawBottoms: [{ x: 70, y: 178 }, { x: 120, y: 178 }, { x: 185, y: 178 }, { x: 225, y: 178 }],
-      heels: [{ x: 82, y: 178 }, { x: 132, y: 178 }, { x: 197, y: 178 }, { x: 237, y: 178 }],
-      toeTips: [{ x: 70, y: 178 }, { x: 120, y: 178 }, { x: 185, y: 178 }, { x: 225, y: 178 }],
-    },
-  },
 };
 
 const modernDraft: AnimalDraft = {
@@ -67,7 +55,7 @@ const modernDraft: AnimalDraft = {
   backLegsSvg: `<g id="backLegs-root"><g id="backLegs-far"><rect x="185" y="5" width="30" height="173" fill="primary"/></g><g id="backLegs-near"><rect x="225" y="5" width="30" height="173" fill="primary"/></g></g>`,
   tailSvg: `<g id="tail-root"><rect x="0" y="0" width="45" height="35" fill="accent"/></g>`,
   layoutMetadata: {
-    facing: "left", groundY: 323, connections: modernPlan.blueprint!.connections,
+    facing: "left", groundY: 323, connections: modernConnections,
     groundContacts: { frontLegs: [{ x: 80, y: 178 }, { x: 120, y: 178 }], backLegs: [{ x: 195, y: 178 }, { x: 235, y: 178 }] },
     depthGroups: { frontLegs: { farGroupId: "frontLegs-far", nearGroupId: "frontLegs-near" }, backLegs: { farGroupId: "backLegs-far", nearGroupId: "backLegs-near" } },
   },
@@ -85,12 +73,11 @@ test("deterministic validation accepts schema, safe SVG, anchors and baseline", 
   assert.equal(result.valid, true, result.issues.map((entry) => entry.message).join("\n"));
 });
 
-test("validator reports affected part for unsafe markup and missing anchor geometry", () => {
+test("validator reports the affected part for unsafe markup", () => {
   const broken = { ...draft, headSvg: `<g id="head-root"><script>alert(1)</script><circle cx="5" cy="5" r="2" fill="primary"/></g>` };
   const result = validateAnimalDraft(broken, plan);
   assert.equal(result.valid, false);
   assert.ok(result.issues.some((entry) => entry.part === "head" && entry.code === "svg.tag"));
-  assert.ok(result.issues.some((entry) => entry.part === "head" && entry.code === "anchor.geometry"));
 });
 
 test("animal-wide technical errors always map to repairable parts", () => {
@@ -120,16 +107,6 @@ test("semantic limb depth groups straddle the body in canonical order", () => {
   assert.ok(body < backNear && backNear < frontNear && frontNear < head);
   assert.match(preview.slice(backFar, frontFar), /id="backLegs-near"[^>]*display="none"/);
   assert.match(preview.slice(frontNear, head), /id="frontLegs-far"[^>]*display="none"/);
-});
-
-test("review silhouette has a white panel and excludes the clean-preview canvas", () => {
-  const composite = buildReviewCompositeSvg(modernDraft);
-  assert.doesNotMatch(composite, /filter:brightness/);
-  assert.match(composite, /<rect x="620" y="40" width="560" height="320" fill="#fafafa"\/>/);
-  const silhouettePanel = composite.match(/<svg x="620" y="40"[^>]*>([\s\S]*?)<\/svg>/)?.[1] ?? "";
-  assert.doesNotMatch(silhouettePanel, /width="600" height="500" fill="#fafafa"/);
-  assert.doesNotMatch(silhouettePanel, /data-derived-ground="true"/);
-  assert.match(silhouettePanel, /fill="#09090b"/);
 });
 
 test("assembled preview resolves CSS-variable and inline-style palette placeholders", () => {
@@ -164,7 +141,7 @@ test("targeted back-leg modification cannot overwrite the tail or another accept
   assert.deepEqual(result.changedParts, ["backLegs"]);
 });
 
-test("targeted modification reports no change when Gemini omits the requested field", () => {
+test("targeted modification reports no change when the model omits the requested field", () => {
   const result = mergeTargetedModification(draft, { tailSvg: `<g id="tail-root"></g>` }, "backLegs");
   assert.deepEqual(result.animal, draft);
   assert.deepEqual(result.changedParts, []);
@@ -194,52 +171,24 @@ test("geometry fixtures identify visible gaps, floating feet and excessive inten
   assert.ok(validateAnimalDraft(overlap, modernPlan).issues.some((entry) => entry.code === "geometry.seam.excessive-overlap" && entry.part === "head"));
 });
 
-test("tailless species accept a compact hidden seam-cap and reject a protruding tail", () => {
-  const frogPlan = structuredClone(modernPlan);
-  frogPlan.referenceAnalysis = {
-    fidelityTarget: "close-match", silhouette: "low crouched frog", pose: "folded limbs", proportions: "large folded hind legs",
-    speciesCues: ["long toes", "tailless adult"], palette: "green", externalTail: "absent", backgroundElementsToIgnore: ["watermark"],
-  };
-  const compact = validateAnimalDraft(modernDraft, frogPlan);
-  assert.ok(!compact.issues.some((entry) => entry.code === "reference.tail.protruding"), compact.issues.map((entry) => entry.message).join("\n"));
-  assert.ok(!compact.issues.some((entry) => entry.code === "geometry.seam.excessive-overlap" && entry.part === "tail"));
-  const protruding = { ...modernDraft, tailSvg: `<g id="tail-root"><rect x="0" y="0" width="100" height="80" fill="primary"/></g>` };
-  const result = validateAnimalDraft(protruding, frogPlan);
-  assert.ok(result.issues.some((entry) => entry.code === "reference.tail.protruding" && entry.part === "tail"));
+test("snap-always translates each attached part so its declared anchor hits the fixed local anchor", () => {
+  // Default modernDraft already declares each attachment exactly on its fixed anchor, so
+  // snapping is a no-op there. Move the head's declared anchor off and confirm the snap
+  // translates the art by the exact delta and rewrites the connection anchor.
+  const off = structuredClone(modernDraft);
+  off.layoutMetadata!.connections = off.layoutMetadata!.connections.map((connection) => connection.part === "head" ? { ...connection, attachmentAnchor: { x: 100, y: 95 } } : connection);
+  const snapped = snapAttachedPartsToAnchors(off);
+  const headConnection = snapped.layoutMetadata!.connections.find((connection) => connection.part === "head")!;
+  assert.deepEqual(headConnection.attachmentAnchor, { x: 120, y: 110 });
+  const map = readCoordinateNormalization(snapped.headSvg);
+  assert.ok(map && Math.abs(map.scale - 1) < 1e-6 && Math.abs(map.x - 20) < 1e-6 && Math.abs(map.y - 15) < 1e-6, JSON.stringify(map));
+  // A part already on its anchor is left untouched (no normalization wrapper added).
+  assert.equal(readCoordinateNormalization(snapped.tailSvg), undefined);
+  // The snapped animal still passes the deterministic checks.
+  assert.equal(validateAnimalDraft(snapped).valid, true, validateAnimalDraft(snapped).issues.map((entry) => entry.message).join("\n"));
 });
 
-test("malformed left-facing blueprint relationships produce part-specific repair issues", () => {
-  const malformed = structuredClone(modernPlan);
-  malformed.blueprint!.landmarks.noseTip.x = 100;
-  malformed.blueprint!.connections.find((entry) => entry.part === "frontLegs")!.opposingNormal = { x: 0, y: 1 };
-  const result = validateAnimalDraft(modernDraft, malformed);
-  assert.ok(result.issues.some((entry) => entry.code === "blueprint.facing.head" && entry.part === "head"));
-  assert.ok(result.issues.some((entry) => entry.code === "blueprint.connection.normal" && entry.part === "frontLegs"));
-});
-
-test("cow, horse, crocodile, elephant and rabbit blueprints keep distinct valid proportions", () => {
-  const variants = [
-    ["cow", { head: [100, 90, 40, 40], body: [60, 80, 210, 100] }],
-    ["horse", { head: [92, 62, 48, 76], body: [55, 72, 225, 92] }],
-    ["crocodile", { head: [72, 104, 68, 30], body: [45, 108, 245, 58] }],
-    ["elephant", { head: [70, 55, 80, 100], body: [50, 65, 235, 120] }],
-    ["rabbit", { head: [100, 42, 38, 96], body: [82, 96, 168, 78] }],
-  ] as const;
-  const silhouettes = new Set<string>();
-  for (const [species, dimensions] of variants) {
-    const candidate = structuredClone(modernPlan);
-    const [hx, hy, hw, hh] = dimensions.head; const [bx, by, bw, bh] = dimensions.body;
-    candidate.proportionsAndSilhouette = `${species} fixture proportions`;
-    candidate.blueprint!.occupiedBounds.head = { x: hx, y: hy, width: hw, height: hh };
-    candidate.blueprint!.occupiedBounds.body = { x: bx, y: by, width: bw, height: bh };
-    silhouettes.add(JSON.stringify(candidate.blueprint!.occupiedBounds));
-    const result = validateAnimalDraft(modernDraft, candidate);
-    assert.ok(!result.issues.some((entry) => entry.code.startsWith("blueprint.")), `${species}: ${result.issues.map((entry) => entry.message).join("\n")}`);
-  }
-  assert.equal(silhouettes.size, variants.length);
-});
-
-test("shared-canvas model output is normalized into fixed local part spaces before repair", () => {
+test("shared-canvas model output is normalized into fixed local part spaces", () => {
   const shared = structuredClone(modernDraft);
   shared.bodyConnections = { neck: { x: 330, y: 250 }, tail: { x: 630, y: 260 }, frontLegs: { x: 370, y: 320 }, backLegs: { x: 570, y: 320 } };
   shared.headSvg = `<g id="head-root"><rect x="230" y="180" width="120" height="120" fill="primary"/></g>`;
@@ -250,14 +199,7 @@ test("shared-canvas model output is normalized into fixed local part spaces befo
   shared.layoutMetadata!.connections = shared.layoutMetadata!.connections.map((connection) => ({ ...connection, socketAnchor: shared.bodyConnections[connection.part === "head" ? "neck" : connection.part], attachmentAnchor: shared.bodyConnections[connection.part === "head" ? "neck" : connection.part] }));
   shared.layoutMetadata!.groundY = 490;
   shared.layoutMetadata!.groundContacts = { frontLegs: [{ x: 360, y: 490 }, { x: 420, y: 490 }], backLegs: [{ x: 560, y: 490 }, { x: 620, y: 490 }] };
-  const globalPlan = structuredClone(modernPlan);
-  globalPlan.blueprint!.connections = shared.layoutMetadata!.connections;
-  globalPlan.blueprint!.groundY = 490;
-  globalPlan.blueprint!.occupiedBounds = {
-    head: { x: 230, y: 180, width: 120, height: 120 }, body: { x: 320, y: 180, width: 330, height: 220 },
-    frontLegs: { x: 340, y: 300, width: 100, height: 190 }, backLegs: { x: 540, y: 300, width: 100, height: 190 }, tail: { x: 610, y: 240, width: 140, height: 70 },
-  };
-  const result = normalizeAnimalDraftCoordinates(shared, globalPlan);
+  const result = normalizeAnimalDraftCoordinates(shared, structuredClone(modernPlan));
   assert.equal(result.normalized, true);
   assert.deepEqual(new Set(result.normalizedParts), new Set(["head", "body", "frontLegs", "backLegs", "tail"]));
   assert.ok(result.animal.bodyConnections.neck.x >= 40 && result.animal.bodyConnections.neck.x <= 120);
@@ -270,10 +212,12 @@ test("shared-canvas model output is normalized into fixed local part spaces befo
   assert.ok(!validation.issues.some((entry) => entry.code === "geometry.bounds" || entry.code === "anchor.bounds" || entry.code === "anchor.contract"), validation.issues.map((entry) => entry.message).join("\n"));
 });
 
-test("palette placeholder warnings do not trigger destructive automatic part repair", () => {
-  const warningOnly = validateAnimalDraft({ ...draft, tailSvg: `<g id="tail-root"><path d="M15 15 Q55 25 85 90" fill="#8B4513"/></g>` }, plan);
-  assert.ok(warningOnly.issues.some((entry) => entry.code === "palette.placeholder" && entry.part === "tail"));
-  assert.ok(!technicalFailingParts(warningOnly).includes("tail"));
+test("off-ramp raw colours are rejected as technical errors (§5.2 one-palette rule)", () => {
+  const rawHex = validateAnimalDraft({ ...draft, tailSvg: `<g id="tail-root"><path d="M15 15 Q55 25 85 90" fill="#8B4513"/></g>` }, plan);
+  assert.ok(rawHex.issues.some((entry) => entry.code === "palette.rawHex" && entry.part === "tail"));
+  assert.ok(technicalFailingParts(rawHex).includes("tail"));
+  // A token-clean animal carries no palette error at all.
+  assert.ok(!validateAnimalDraft(draft, plan).issues.some((entry) => entry.code === "palette.rawHex"));
 });
 
 test("literal palette colours and React-style SVG attributes are normalized without AI repair", () => {
@@ -301,15 +245,9 @@ test("planner invariants and depth-group aliases are normalized before validatio
   driftingPlan.anatomyTemplate = "quadruped-five-part";
   driftingPlan.requiredParts = ["head", "body"] as any;
   driftingPlan.requiredNamedGroups.frontLegs = ["frontLegs-root", "front-limb-far", "front-limb-near"];
-  driftingPlan.blueprint = structuredClone(modernPlan.blueprint);
-  driftingPlan.blueprint!.landmarks.toeTips[0].x = driftingPlan.blueprint!.landmarks.heels[0].x + 10;
-  driftingPlan.blueprint!.connections[0].opposingNormal = driftingPlan.blueprint!.connections[0].outwardNormal;
   const locked = normalizeAnatomyPlanContract(driftingPlan);
   assert.deepEqual(locked.requiredParts, ["head", "body", "frontLegs", "backLegs", "tail"]);
   assert.ok(locked.requiredNamedGroups.frontLegs.includes("frontLegs-far"));
-  assert.ok(locked.blueprint!.landmarks.toeTips[0].x < locked.blueprint!.landmarks.heels[0].x);
-  const connection = locked.blueprint!.connections[0];
-  assert.equal(connection.outwardNormal.x * connection.opposingNormal.x + connection.outwardNormal.y * connection.opposingNormal.y, -1);
   const aliasDraft = structuredClone(modernDraft);
   aliasDraft.frontLegsSvg = aliasDraft.frontLegsSvg.replace(/frontLegs-far/g, "front-limb-far").replace(/frontLegs-near/g, "front-limb-near");
   aliasDraft.layoutMetadata!.depthGroups.frontLegs = { farGroupId: "front-limb-far", nearGroupId: "front-limb-near" };
@@ -335,32 +273,4 @@ test("sequential part repairs isolate metadata and preserve earlier part patches
   assert.deepEqual(back.animal.layoutMetadata!.groundContacts.backLegs, backMetadata.groundContacts.backLegs);
   assert.equal(back.animal.layoutMetadata!.connections.find((connection) => connection.part === "frontLegs")!.seamWidth, 34);
   assert.equal(back.animal.layoutMetadata!.connections.find((connection) => connection.part === "backLegs")!.seamWidth, 36);
-});
-
-test("critical reference feature groups and visible near/far limbs are enforceable", () => {
-  const featurePlan = structuredClone(modernPlan);
-  featurePlan.referenceAnalysis = {
-    fidelityTarget: "close-match",
-    silhouette: "wolf-like quadruped",
-    pose: "standing",
-    proportions: "long body and four visible legs",
-    speciesCues: ["upright ears"],
-    palette: "grey and cream",
-    paletteSwatches: ["#666666", "#dddddd"],
-    externalTail: "visible",
-    backgroundElementsToIgnore: ["watermark"],
-    referenceFeatures: [{ id: "eye", part: "head", kind: "facial", description: "visible eye", normalizedBounds: { x: .1, y: .1, width: .1, height: .1 }, importance: "critical", requiredGroupId: "head-feature-eye" }],
-  };
-  featurePlan.blueprint!.limbPlan = {
-    frontLegs: { expectedVisibleCount: 2, groundedCount: 2, raisedCount: 0, toeDirection: "left" },
-    backLegs: { expectedVisibleCount: 2, groundedCount: 2, raisedCount: 0, toeDirection: "left" },
-  };
-  const featured = { ...modernDraft, headSvg: `<g id="head-root"><rect x="100" y="90" width="40" height="40" fill="primary"/><g id="head-feature-eye"><circle cx="112" cy="102" r="6" fill="accent"/></g></g>` };
-  const valid = validateAnimalDraft(featured, featurePlan);
-  assert.ok(!valid.issues.some((entry) => entry.code === "reference.feature.geometry" || entry.code === "geometry.limbGroup.empty"), valid.issues.map((entry) => entry.message).join("\n"));
-
-  const missing = validateAnimalDraft(modernDraft, featurePlan);
-  assert.ok(missing.issues.some((entry) => entry.code === "reference.feature.geometry" && entry.part === "head"));
-  const emptyFar = { ...featured, frontLegsSvg: featured.frontLegsSvg.replace(/<rect x="65"[^>]*\/>/, "") };
-  assert.ok(validateAnimalDraft(emptyFar, featurePlan).issues.some((entry) => entry.code === "geometry.limbGroup.empty" && entry.part === "frontLegs"));
 });

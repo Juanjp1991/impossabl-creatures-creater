@@ -1,17 +1,12 @@
 import type { AnimalDraft } from "./contracts";
 import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry } from "./geometry";
+import { applyRamp, resolveRamp } from "./palette";
 
 const escapeAttr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-const colourize = (svg: string, draft: AnimalDraft) => {
-  const primary = escapeAttr(draft.color);
-  const accent = escapeAttr(draft.accentColor);
-  return svg
-    .replace(/(["'])\s*(?:primary|var\(\s*--primary\s*\))\s*\1/gi, `"${primary}"`)
-    .replace(/(["'])\s*(?:accent|var\(\s*--accent\s*\))\s*\1/gi, `"${accent}"`)
-    .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(?:primary|var\(\s*--primary\s*\))(?=\s*(?:;|["']|$))/gi, `$1${primary}`)
-    .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(?:accent|var\(\s*--accent\s*\))(?=\s*(?:;|["']|$))/gi, `$1${accent}`);
-};
+// Resolve the whole shared ramp (primary/accent plus the derived steps and fixed neutrals),
+// so a part painted in primary-dark or the outline token renders identically for every species.
+const colourize = (svg: string, draft: AnimalDraft) => applyRamp(svg, resolveRamp(draft.color, draft.accentColor));
 
 export interface SvgDepthLayers {
   far: string;
@@ -74,25 +69,6 @@ export function buildAssembledPreviewSvg(draft: AnimalDraft, diagnostic = false)
     layer("preview-head", transforms.head, draft.headSvg),
   ].join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 500" width="600" height="500" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="600" height="500" fill="#fafafa"/><line x1="0" y1="${groundLine}" x2="600" y2="${groundLine}" stroke="#bbb" stroke-dasharray="4 4" data-derived-ground="true"/>${behindBody}${layer("preview-body", transforms.body, draft.bodySvg)}${inFrontOfBody}${bounds}${anchors}</svg>`;
-}
-
-function innerSvg(svg: string) {
-  return svg.replace(/^<svg\b[^>]*>/i, "").replace(/<\/svg>\s*$/i, "");
-}
-
-function buildSilhouetteLayer(clean: string): string {
-  return clean
-    .replace(/<rect\b(?=[^>]*\bwidth=["']600["'])(?=[^>]*\bheight=["']500["'])[^>]*\/>/i, "")
-    .replace(/<line\b(?=[^>]*\bdata-derived-ground=["']true["'])[^>]*\/>/i, "")
-    .replace(/\b(?:fill|stroke)\s*=\s*["'][^"']*["']/gi, (attribute) => /["']none["']/i.test(attribute) ? attribute : `${attribute.slice(0, attribute.indexOf("="))}="#09090b"`)
-    .replace(/(\b(?:fill|stroke)\s*:\s*)([^;"']+)/gi, (_match, prefix: string, value: string) => /^(?:none|transparent)\s*$/i.test(value) ? `${prefix}${value}` : `${prefix}#09090b`);
-}
-
-export function buildReviewCompositeSvg(draft: AnimalDraft): string {
-  const clean = innerSvg(buildAssembledPreviewSvg(draft));
-  const diagnostic = innerSvg(buildAssembledPreviewSvg(draft, true));
-  const silhouette = buildSilhouetteLayer(clean);
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720"><rect width="1200" height="720" fill="#18181b"/><g font-family="monospace" font-size="16" fill="#e4e4e7"><text x="24" y="28">CLEAN COLOUR</text><text x="624" y="28">SILHOUETTE</text><text x="24" y="388">DIAGNOSTIC SEAMS</text><text x="624" y="388">MOBILE THUMBNAIL</text></g><svg x="20" y="40" width="560" height="320" viewBox="0 0 600 500">${clean}</svg><rect x="620" y="40" width="560" height="320" fill="#fafafa"/><svg x="620" y="40" width="560" height="320" viewBox="0 0 600 500">${silhouette}</svg><svg x="20" y="400" width="560" height="300" viewBox="0 0 600 500">${diagnostic}</svg><rect x="770" y="430" width="256" height="213" rx="20" fill="#fafafa"/><svg x="770" y="430" width="256" height="213" viewBox="0 0 600 500">${clean}</svg></svg>`;
 }
 
 export function buildJointCropSvg(draft: AnimalDraft, part: Exclude<keyof AnimalDraft["bodyConnections"], never>): string {

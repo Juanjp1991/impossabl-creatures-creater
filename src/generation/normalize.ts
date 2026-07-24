@@ -1,5 +1,6 @@
 import type { AnimalPartType } from "../types";
 import type { AnimalDraft, AnatomyStylePlan, BlueprintConnectionProfile } from "./contracts";
+import { isNearBlack, isNearWhite } from "./palette";
 
 export interface CoordinateMap { scale: number; x: number; y: number; }
 export interface SvgBounds { x: number; y: number; width: number; height: number; }
@@ -21,6 +22,17 @@ const SVG_ATTRIBUTE_REPLACEMENTS: Record<string, string> = {
   fillOpacity: "fill-opacity", fillRule: "fill-rule", stopColor: "stop-color", stopOpacity: "stop-opacity", gradientUnits: "gradientUnits", gradientTransform: "gradientTransform",
   floodColor: "flood-color", floodOpacity: "flood-opacity", clipPath: "clip-path", xlinkHref: "xlink:href",
 };
+
+// Fold the model's raw near-black outlines and near-white highlights onto the fixed
+// `outline`/`highlight` ramp tokens before the validator's raw-hex gate sees them. This is
+// resolving to the ramp (those tokens ARE a fixed near-black / off-white), not inventing a
+// colour; genuine mid-tone off-palette hexes are left raw so the validator rejects them.
+function foldNeutralHexToTokens(svg: string): string {
+  const token = (hex: string) => isNearBlack(hex) ? "outline" : isNearWhite(hex) ? "highlight" : null;
+  return svg
+    .replace(/(\b(?:fill|stroke|stop-color)\s*=\s*)(["'])(#[0-9a-f]{3,8})\2/gi, (match, prefix: string, _quote: string, hex: string) => { const mapped = token(hex); return mapped ? `${prefix}"${mapped}"` : match; })
+    .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(#[0-9a-f]{3,8})/gi, (match, prefix: string, hex: string) => { const mapped = token(hex); return mapped ? `${prefix}${mapped}` : match; });
+}
 
 function promoteDominantFillToPrimary(svg: string): string {
   if (/(?:fill|stroke)\s*=\s*["'](?:primary|accent|var\(\s*--(?:primary|accent)\s*\))/i.test(svg)) return svg;
@@ -51,6 +63,7 @@ export function normalizeGeneratedSvgSyntax(input: AnimalDraft): { animal: Anima
     svg = svg
       .replace(new RegExp(`(["'])${escaped(animal.color)}\\1`, "gi"), '"primary"')
       .replace(new RegExp(`(["'])${escaped(animal.accentColor)}\\1`, "gi"), '"accent"');
+    svg = foldNeutralHexToTokens(svg);
     svg = promoteDominantFillToPrimary(svg);
     if (part === "frontLegs" || part === "backLegs") {
       const expected = { farGroupId: `${part}-far`, nearGroupId: `${part}-near` };
@@ -102,19 +115,6 @@ export function normalizeAnatomyPlanContract(input: AnatomyStylePlan): AnatomySt
       seen.add(requiredGroupId);
       plan.requiredNamedGroups[feature.part] = [...new Set([...(plan.requiredNamedGroups[feature.part] ?? []), requiredGroupId])];
       return { ...feature, id: safeId, requiredGroupId };
-    });
-  }
-  if (plan.blueprint) {
-    const { landmarks } = plan.blueprint;
-    landmarks.toeTips = landmarks.toeTips.map((toe, index) => {
-      const heel = landmarks.heels[index];
-      return heel && toe.x >= heel.x ? { ...toe, x: heel.x - 4 } : toe;
-    });
-    plan.blueprint.connections = plan.blueprint.connections.map((connection) => {
-      const length = Math.hypot(connection.outwardNormal.x, connection.outwardNormal.y);
-      if (!Number.isFinite(length) || length <= 0) return connection;
-      const outwardNormal = { x: connection.outwardNormal.x / length, y: connection.outwardNormal.y / length };
-      return { ...connection, outwardNormal, opposingNormal: { x: -outwardNormal.x, y: -outwardNormal.y } };
     });
   }
   return plan;
@@ -262,14 +262,52 @@ export function normalizeAnimalDraftCoordinates(input: AnimalDraft, inputPlan: A
     animal.layoutMetadata.connections = animal.layoutMetadata.connections.map((connection) => ({ ...transformConnection(connection, bodyConnectionMap, maps[connection.part] ?? IDENTITY), socketAnchor: animal.bodyConnections[CONNECTION[connection.part]] }));
     for (const part of ["frontLegs", "backLegs"] as const) if (animal.layoutMetadata.groundContacts[part]) animal.layoutMetadata.groundContacts[part] = animal.layoutMetadata.groundContacts[part]!.map((point) => ({ ...mapPoint(point, maps[part]), ...(point.raised ? { raised: true } : {}) }));
   }
-  if (plan.blueprint) {
-    plan.blueprint.groundY = mapPoint({ x: 0, y: plan.blueprint.groundY }, bodyConnectionMap).y;
-    for (const part of PARTS) plan.blueprint.occupiedBounds[part] = mapBounds(plan.blueprint.occupiedBounds[part], maps[part]);
-    plan.blueprint.connections = plan.blueprint.connections.map((connection) => ({ ...transformConnection(connection, bodyConnectionMap, maps[connection.part] ?? IDENTITY), socketAnchor: animal.bodyConnections[CONNECTION[connection.part]] }));
-    const landmarkMap = bodyMap;
-    for (const key of ["noseTip", "eye", "neckBase", "shoulder", "hip"] as const) plan.blueprint.landmarks[key] = mapPoint(plan.blueprint.landmarks[key], landmarkMap);
-    for (const key of ["pawBottoms", "heels", "toeTips"] as const) plan.blueprint.landmarks[key] = plan.blueprint.landmarks[key].map((point) => ({ ...point, ...mapPoint(point, landmarkMap) }));
-  }
   plan.suggestedJoints = plan.suggestedJoints.map((joint) => ({ ...joint, ...mapPoint(joint, maps[joint.part]) }));
   return { animal, plan, normalized: true, normalizedParts };
+}
+
+function anchorOpeningTag(map: CoordinateMap): string {
+  const value = (number: number) => Number(number.toFixed(6));
+  return `<g data-coordinate-normalization="true" data-normalization-scale="${value(map.scale)}" data-normalization-x="${value(map.x)}" data-normalization-y="${value(map.y)}" transform="matrix(${value(map.scale)} 0 0 ${value(map.scale)} ${value(map.x)} ${value(map.y)})">`;
+}
+
+// A pure translation composes with any existing coordinate-normalization matrix, so we
+// just add the delta to that part's map (or add a scale-1 map if none exists). Keeping a
+// single normalization marker matters: readCoordinateNormalization reads exactly one.
+function augmentNormalization(svg: string, dx: number, dy: number): string {
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return svg;
+  const existing = readCoordinateNormalization(svg);
+  if (existing) return svg.replace(/<g\b[^>]*\bdata-coordinate-normalization=["']true["'][^>]*>/i, anchorOpeningTag({ scale: existing.scale, x: existing.x + dx, y: existing.y + dy }));
+  return wrapNormalization(svg, { scale: 1, x: dx, y: dy });
+}
+
+/**
+ * Snap-always (§5.1 dec.1): after coordinate normalization, unconditionally translate
+ * each attached part so its declared attachment anchor (from layoutMetadata.connections,
+ * else the bounds-nearest heuristic) lands exactly on the fixed local anchor. This erases
+ * the redundant anchor-hit failure class — the seam-pixel check remains the real gate —
+ * and makes the assembled preview's fixed offsets reliable. Ground contacts and the
+ * connection anchor for each part shift by the same delta so metadata stays consistent.
+ */
+export function snapAttachedPartsToAnchors(input: AnimalDraft): AnimalDraft {
+  const animal = structuredClone(input);
+  for (const part of ATTACHED) {
+    const fixed = VIEW[part].anchor;
+    if (!fixed) continue;
+    const localBounds = extractSvgBounds(animal[FIELD[part]]);
+    const declared = animal.layoutMetadata?.connections.find((entry) => entry.part === part)?.attachmentAnchor;
+    const anchor = declared ?? (localBounds ? fallbackSourceAnchor(part, localBounds) : fixed);
+    const dx = fixed.x - anchor.x;
+    const dy = fixed.y - anchor.y;
+    if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) continue;
+    animal[FIELD[part]] = augmentNormalization(animal[FIELD[part]], dx, dy);
+    if (animal.layoutMetadata) {
+      const connection = animal.layoutMetadata.connections.find((entry) => entry.part === part);
+      if (connection) connection.attachmentAnchor = { x: fixed.x, y: fixed.y };
+      if ((part === "frontLegs" || part === "backLegs") && animal.layoutMetadata.groundContacts[part]) {
+        animal.layoutMetadata.groundContacts[part] = animal.layoutMetadata.groundContacts[part]!.map((point) => ({ ...point, x: point.x + dx, y: point.y + dy }));
+      }
+    }
+  }
+  return animal;
 }

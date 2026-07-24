@@ -1,27 +1,39 @@
 import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type ValidationIssue, type ValidationResult } from "./contracts";
 import type { AnimalPartType } from "../types";
-import { analyzeDraftGeometry, analyzeSvgGroupGeometry } from "./geometry";
-import { extractSvgBounds, mapPoint, readCoordinateNormalization } from "./normalize";
+import { analyzeDraftGeometry } from "./geometry";
+import { mapPoint, readCoordinateNormalization } from "./normalize";
+import { RAMP_TOKENS } from "./palette";
+import { DENSITY_BANDS, FILL_BAND, STROKE, classifyStrokeWidths, firstRawColour, localFillRatio, visibleElementCount } from "./metrics";
 
 export const VALIDATOR_VERSION = "p1-svg-validator-3.0.0";
 
-const PART_CONFIG: Record<AnimalPartType, { width: number; height: number; anchors: Array<{ name: string; x: number; y: number }> }> = {
-  head: { width: 160, height: 160, anchors: [{ name: "neck", x: 120, y: 110 }] },
-  body: { width: 300, height: 220, anchors: [] },
-  frontLegs: { width: 260, height: 180, anchors: [{ name: "body", x: 75, y: 15 }] },
-  backLegs: { width: 260, height: 180, anchors: [{ name: "body", x: 195, y: 15 }] },
-  tail: { width: 160, height: 160, anchors: [{ name: "body", x: 15, y: 15 }] },
+const PART_CONFIG: Record<AnimalPartType, { width: number; height: number }> = {
+  head: { width: 160, height: 160 },
+  body: { width: 300, height: 220 },
+  frontLegs: { width: 260, height: 180 },
+  backLegs: { width: 260, height: 180 },
+  tail: { width: 160, height: 160 },
 };
 
 const SVG_FIELD: Record<AnimalPartType, keyof AnimalDraft> = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg" };
+// Required stable group ids, hardcoded (§5.1 dec.4 — no planner blueprint to derive them
+// from). Far/near limb groups are enforced separately by the layout depth-group check
+// whenever layoutMetadata is present.
+const REQUIRED_GROUPS: Record<AnimalPartType, string[]> = {
+  head: ["head-root"], body: ["body-root"], frontLegs: ["frontLegs-root"], backLegs: ["backLegs-root"], tail: ["tail-root"],
+};
 const CONNECTION_BOUNDS = {
   neck: { minX: 40, maxX: 120, minY: 50, maxY: 130 },
   tail: { minX: 200, maxX: 280, minY: 80, maxY: 160 },
   frontLegs: { minX: 70, maxX: 140, minY: 130, maxY: 190 },
   backLegs: { minX: 180, maxX: 250, minY: 130, maxY: 190 },
 } as const;
-const ALLOWED_TAGS = new Set(["g", "path", "circle", "rect", "ellipse", "polygon", "polyline", "line", "defs", "lineargradient", "radialgradient", "stop", "filter", "fedropshadow", "fegaussianblur", "mask", "clippath"]);
-const ALLOWED_ATTRS = new Set(["id", "d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "points", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "stroke-opacity", "opacity", "transform", "offset", "stop-color", "stop-opacity", "gradientunits", "gradienttransform", "fx", "fy", "stddeviation", "dx", "dy", "flood-color", "flood-opacity", "filter", "mask", "clip-path", "href", "xlink:href", "class", "style", "data-name", "data-coordinate-normalization", "data-normalization-scale", "data-normalization-x", "data-normalization-y"]);
+// Tightened per §3: gradients, filters, masks and clipPaths are banned outright (they are
+// expensive on old Android WebViews), so their tags and supporting attributes are gone.
+const ALLOWED_TAGS = new Set(["g", "path", "circle", "rect", "ellipse", "polygon", "polyline", "line"]);
+const ALLOWED_ATTRS = new Set(["id", "d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "points", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "stroke-opacity", "opacity", "transform", "class", "style", "data-name", "data-coordinate-normalization", "data-normalization-scale", "data-normalization-x", "data-normalization-y"]);
+// A fill/stroke/stop-color that references any shared ramp token (bare or via var(--…)).
+const RAMP_TOKEN_REFERENCE = new RegExp(`(?:fill|stroke|stop-color)\\s*[=:]\\s*["']?\\s*(?:var\\(\\s*--)?(?:${RAMP_TOKENS.join("|")})\\b`, "i");
 
 function issue(code: string, severity: "error" | "warning", part: AnimalPartType | "animal", message: string): ValidationIssue {
   return { code, severity, part, message };
@@ -51,22 +63,23 @@ function geometryPoints(svg: string): Array<{ x: number; y: number }> {
   return normalization ? finite.map((point) => mapPoint(point, normalization)) : finite;
 }
 
-function boundsDeviation(actual: { x: number; y: number; width: number; height: number }, expected: { x: number; y: number; width: number; height: number }) {
-  const actualCenter = { x: actual.x + actual.width / 2, y: actual.y + actual.height / 2 };
-  const expectedCenter = { x: expected.x + expected.width / 2, y: expected.y + expected.height / 2 };
-  return Math.max(
-    Math.abs(actual.width - expected.width) / Math.max(1, expected.width),
-    Math.abs(actual.height - expected.height) / Math.max(1, expected.height),
-    Math.abs(actualCenter.x - expectedCenter.x) / Math.max(12, expected.width),
-    Math.abs(actualCenter.y - expectedCenter.y) / Math.max(12, expected.height),
-  );
-}
-
 export function failingParts(result: ValidationResult): AnimalPartType[] {
   return PART_TYPES.filter((part) => result.issues.some((entry) => entry.severity === "error" && entry.part === part));
 }
 
-export function validateAnimalDraft(candidate: unknown, plan?: AnatomyStylePlan, anchorRadius = 32): ValidationResult {
+/** Parts to treat as failing: any part named by an error, and every part when an animal-wide error fires. */
+export function technicalFailingParts(result: ValidationResult): AnimalPartType[] {
+  const animalWide = result.issues.some((entry) => entry.part === "animal" && entry.severity === "error");
+  return PART_TYPES.filter((part) => animalWide || result.issues.some((entry) => entry.part === part && entry.severity === "error"));
+}
+
+/**
+ * Deterministic structural validation with physical ground truth only. There is no
+ * planner blueprint to conform to (§5.1 dec.4): checks that graded the art against
+ * another model's invented numbers (blueprint.*, reference.*, anchor.geometry) are gone.
+ * The `_plan` argument is accepted for call-site compatibility but no longer consulted.
+ */
+export function validateAnimalDraft(candidate: unknown, _plan?: AnatomyStylePlan): ValidationResult {
   const issues: ValidationIssue[] = [];
   const draft = candidate as Partial<AnimalDraft> | null;
   if (!draft || typeof draft !== "object") {
@@ -119,67 +132,29 @@ export function validateAnimalDraft(candidate: unknown, plan?: AnatomyStylePlan,
     const points = geometryPoints(svg);
     if (!points.length) issues.push(issue("geometry.empty", "error", part, `${part} has no detectable visible geometry.`));
     if (points.some((point) => point.x < -config.width * .25 || point.x > config.width * 1.25 || point.y < -config.height * .25 || point.y > config.height * 1.25)) issues.push(issue("geometry.bounds", "error", part, `${part} contains coordinates far outside its ${config.width}x${config.height} view.`));
-    const anchors = part === "body" && connections ? Object.entries(connections).map(([name, point]) => ({ name, ...point })) : config.anchors;
-    for (const anchor of anchors) {
-      const near = points.some((point) => Math.hypot(point.x - anchor.x, point.y - anchor.y) <= anchorRadius);
-      if (!near) issues.push(issue("anchor.geometry", "error", part, `${part} has no visible geometry within ${anchorRadius}px of '${anchor.name}' anchor (${anchor.x}, ${anchor.y}).`));
-    }
     if ((part === "frontLegs" || part === "backLegs") && !points.some((point) => point.y >= config.height - 25)) issues.push(issue("ground.baseline", "error", part, `${part} has no foot geometry near the expected baseline.`));
-    if (!/(?:fill|stroke)\s*=\s*["'](?:primary|accent|var\(--(?:primary|accent)\))/i.test(svg)) issues.push(issue("palette.placeholder", "warning", part, `${part} does not use a primary or accent colour placeholder.`));
-    const requiredGroups = plan?.requiredNamedGroups?.[part] ?? [`${part}-root`];
-    for (const group of requiredGroups) if (!new RegExp(`<g\\b[^>]*\\bid=["']${group.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`, "i").test(svg)) issues.push(issue("group.required", "error", part, `${part} is missing required stable group id '${group}'.`));
-  }
-  if (plan) {
-    if (plan.anatomyTemplate !== "quadruped-five-part" || PART_TYPES.some((part) => !plan.requiredParts.includes(part))) issues.push(issue("plan.anatomy", "error", "animal", "Anatomy plan must use the existing five-part quadruped schema."));
-    const layerParts = new Set(plan.layerPlan?.map((layer) => layer.part));
-    for (const part of PART_TYPES) if (!layerParts.has(part)) issues.push(issue("plan.layers", "error", part, `Layer plan does not define ${part}.`));
-    const swatches = plan.referenceAnalysis?.paletteSwatches;
-    if (swatches && (swatches.length < 2 || swatches.length > 4 || swatches.some((colour) => !/^#[0-9a-f]{6}$/i.test(colour)))) {
-      issues.push(issue("reference.palette", "error", "animal", "Reference palette must contain 2-4 six-digit hex colours."));
-    }
-    for (const feature of plan.referenceAnalysis?.referenceFeatures ?? []) {
-      const bounds = feature.normalizedBounds;
-      if (!feature.id || !PART_TYPES.includes(feature.part) || !feature.requiredGroupId || !bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.x < 0 || bounds.y < 0 || bounds.width <= 0 || bounds.height <= 0 || bounds.x + bounds.width > 1.001 || bounds.y + bounds.height > 1.001) {
-        issues.push(issue("reference.feature", "error", PART_TYPES.includes(feature.part) ? feature.part : "animal", `Reference feature '${feature.id || "unnamed"}' must have a valid part, group ID and normalized 0-1 bounds.`));
-      }
-    }
-    if (plan.blueprint) {
-      const blueprint = plan.blueprint;
-      for (const part of PART_TYPES) {
-        const bounds = blueprint.occupiedBounds?.[part];
-        if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) issues.push(issue("blueprint.bounds", "error", part, `Blueprint occupied bounds for ${part} must be finite with positive dimensions.`));
-      }
-      if (blueprint.assembledBounds) {
-        for (const part of [...PART_TYPES, "animal"] as const) {
-          const bounds = blueprint.assembledBounds[part];
-          if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) issues.push(issue("blueprint.assembledBounds", "error", part === "animal" ? "animal" : part, `Assembled bounds for ${part} must be finite with positive dimensions.`));
-        }
-      }
-      for (const part of ["frontLegs", "backLegs"] as const) {
-        const limbPlan = blueprint.limbPlan?.[part];
-        if (limbPlan && (!Number.isInteger(limbPlan.expectedVisibleCount) || limbPlan.expectedVisibleCount < 1 || limbPlan.expectedVisibleCount > 2 || limbPlan.groundedCount < 0 || limbPlan.raisedCount < 0 || limbPlan.groundedCount + limbPlan.raisedCount !== limbPlan.expectedVisibleCount || limbPlan.toeDirection !== "left")) {
-          issues.push(issue("blueprint.limbPlan", "error", part, `${part} limb plan must describe one or two visible limbs whose grounded and raised counts add up.`));
-        }
-      }
-      if (!Number.isFinite(blueprint.groundY)) issues.push(issue("blueprint.ground", "error", "frontLegs", "Blueprint groundY must be finite."));
-      const landmarks = blueprint.landmarks;
-      if (!landmarks || ![landmarks.noseTip, landmarks.eye, landmarks.neckBase, landmarks.shoulder, landmarks.hip].every((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y))) issues.push(issue("blueprint.landmarks", "error", "head", "Blueprint must define finite nose, eye, neck, shoulder and hip landmarks."));
-      else {
-        if (!(landmarks.noseTip.x < landmarks.eye.x && landmarks.eye.x < landmarks.neckBase.x)) issues.push(issue("blueprint.facing.head", "error", "head", "Left-facing blueprint requires nose.x < eye.x < neckBase.x."));
-        if (!(landmarks.shoulder.x < landmarks.hip.x)) issues.push(issue("blueprint.facing.body", "error", "body", "Left-facing blueprint requires shoulder.x < hip.x."));
-        if (landmarks.toeTips?.some((toe, index) => !landmarks.heels?.[index] || toe.x >= landmarks.heels[index].x)) issues.push(issue("blueprint.facing.feet", "error", "frontLegs", "Left-facing toe tips must point ahead of their corresponding heels."));
-      }
-      const byPart = new Map(blueprint.connections?.map((connection) => [connection.part, connection]));
-      for (const part of ["head", "frontLegs", "backLegs", "tail"] as const) {
-        const connection = byPart.get(part);
-        if (!connection) { issues.push(issue("blueprint.connection", "error", part, `Blueprint connection profile for ${part} is required.`)); continue; }
-        const values = [connection.socketAnchor.x, connection.socketAnchor.y, connection.attachmentAnchor.x, connection.attachmentAnchor.y, connection.outwardNormal.x, connection.outwardNormal.y, connection.opposingNormal.x, connection.opposingNormal.y, connection.seamWidth, connection.minimumOverlap, connection.neutralConnectionDepth, connection.allowedScale.min, connection.allowedScale.max];
-        if (!values.every(Number.isFinite) || connection.seamWidth <= 0 || connection.minimumOverlap <= 0 || connection.neutralConnectionDepth <= 0 || connection.allowedScale.min <= 0 || connection.allowedScale.max < connection.allowedScale.min) issues.push(issue("blueprint.connection.profile", "error", part, `${part} connection profile must contain finite positive widths, overlap, depth and an ordered scale range.`));
-        const a = connection.outwardNormal; const b = connection.opposingNormal; const lengths = Math.hypot(a.x, a.y) * Math.hypot(b.x, b.y);
-        if (!lengths || (a.x * b.x + a.y * b.y) / lengths > -.8) issues.push(issue("blueprint.connection.normal", "error", part, `${part} socket and attachment normals must oppose each other.`));
-      }
-      const fore = byPart.get("frontLegs"); const hind = byPart.get("backLegs");
-      if (fore && hind && fore.socketAnchor.x >= hind.socketAnchor.x) issues.push(issue("blueprint.facing.attachments", "error", "body", "Left-facing blueprint requires the front attachment before the hind attachment."));
+    for (const group of REQUIRED_GROUPS[part]) if (!new RegExp(`<g\\b[^>]*\\bid=["']${group.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`, "i").test(svg)) issues.push(issue("group.required", "error", part, `${part} is missing required stable group id '${group}'.`));
+
+    // §5.2 canonical standard. Stroke weight and the palette ramp apply to every part:
+    // sub-1px strokes vanish on cheap screens (hard error) and off-ramp raw colours defeat
+    // the one-palette rule that makes a frankenstein read as one creature (hard error). An
+    // off-standard-but-visible stroke is a soft signal.
+    const strokes = classifyStrokeWidths(svg);
+    for (const width of strokes.belowMinimum) issues.push(issue("stroke.tooThin", "error", part, `${part} uses stroke-width ${width}, below the ${STROKE.minVisible}px minimum; it disappears on a cheap 360px-wide screen.`));
+    for (const width of strokes.offStandard) issues.push(issue("stroke.weight", "warning", part, `${part} uses off-standard stroke-width ${width}; use ${STROKE.silhouette} for silhouettes and ${STROKE.detailMin}-${STROKE.detailMax} for detail.`));
+    const rawColour = firstRawColour(svg);
+    if (rawColour) issues.push(issue("palette.rawHex", "error", part, `${part} uses raw colour '${rawColour}'; parts may only use the shared ramp tokens (${RAMP_TOKENS.join(", ")}).`));
+    if (!RAMP_TOKEN_REFERENCE.test(svg)) issues.push(issue("palette.placeholder", "warning", part, `${part} does not reference any shared ramp token.`));
+
+    // Fill ratio and detail density are consistency bands across the roster, not structural
+    // failures; they are surfaced as warnings and gated (like the geometry checks) to real
+    // pipeline output, which carries layoutMetadata.
+    if (draft.layoutMetadata) {
+      const fill = localFillRatio(svg, part);
+      if (fill < FILL_BAND[0] || fill > FILL_BAND[1]) issues.push(issue("scale.fill", "warning", part, `${part} occupies ${Math.round(fill * 100)}% of its view height; the shared band is ${Math.round(FILL_BAND[0] * 100)}-${Math.round(FILL_BAND[1] * 100)}%.`));
+      const elements = visibleElementCount(svg);
+      const [minElements, maxElements] = DENSITY_BANDS[part];
+      if (elements < minElements || elements > maxElements) issues.push(issue("density.count", "warning", part, `${part} has ${elements} visible elements; the shared band is ${minElements}-${maxElements}.`));
     }
   }
   if (draft.layoutMetadata) {
@@ -194,69 +169,11 @@ export function validateAnimalDraft(candidate: unknown, plan?: AnatomyStylePlan,
         if ([...svg.matchAll(new RegExp(`<g\\b[^>]*\\bid=["']${escaped}["']`, "gi"))].length !== 1) issues.push(issue("layout.depthGroup", "error", part, `${part} ${name} '${id}' must exist exactly once in its SVG.`));
       }
     }
-  } else if (plan?.blueprint) issues.push(issue("layout.metadata", "error", "animal", "Generated quadruped must emit compatibility, ground-contact and depth-group metadata."));
-  // Legacy plans predate geometry masks. New blueprints opt into the stricter
-  // seam/ground contract without invalidating stored V1 generation records.
-  if ((plan?.blueprint || draft.layoutMetadata) && PART_TYPES.every((part) => typeof draft[SVG_FIELD[part]] === "string") && connections && [connections.neck, connections.tail, connections.frontLegs, connections.backLegs].every(Boolean)) {
+  }
+  // Physical geometry ground truth only — seam pixels, ground line, unrelated overlap.
+  if (draft.layoutMetadata && PART_TYPES.every((part) => typeof draft[SVG_FIELD[part]] === "string") && connections && [connections.neck, connections.tail, connections.frontLegs, connections.backLegs].every(Boolean)) {
     const geometry = analyzeDraftGeometry(draft as AnimalDraft);
-    if (plan?.blueprint) {
-      for (const part of PART_TYPES) {
-        const actualLocal = extractSvgBounds(draft[SVG_FIELD[part]] as string);
-        const expectedLocal = plan.blueprint.occupiedBounds?.[part];
-        if (actualLocal && expectedLocal) {
-          const deviation = boundsDeviation(actualLocal, expectedLocal);
-          if (deviation > .3) issues.push(issue("geometry.blueprint.bounds", "error", part, `${part} occupied bounds differ from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-          else if (deviation > .15) issues.push(issue("geometry.blueprint.bounds", "warning", part, `${part} occupied bounds differ from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-        }
-        const expectedAssembled = plan.blueprint.assembledBounds?.[part];
-        const actualAssembled = geometry.parts[part].bounds;
-        if (expectedAssembled && actualAssembled) {
-          const deviation = boundsDeviation(actualAssembled, expectedAssembled);
-          if (deviation > .3) issues.push(issue("geometry.blueprint.assembled", "error", part, `${part} assembled placement differs from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-          else if (deviation > .15) issues.push(issue("geometry.blueprint.assembled", "warning", part, `${part} assembled placement differs from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-        }
-      }
-      const assembled = Object.values(geometry.parts).map((part) => part.bounds).filter(Boolean) as Array<{ x: number; y: number; width: number; height: number }>;
-      const expectedAnimal = plan.blueprint.assembledBounds?.animal;
-      if (assembled.length && expectedAnimal) {
-        const minX = Math.min(...assembled.map((bounds) => bounds.x)); const minY = Math.min(...assembled.map((bounds) => bounds.y));
-        const maxX = Math.max(...assembled.map((bounds) => bounds.x + bounds.width)); const maxY = Math.max(...assembled.map((bounds) => bounds.y + bounds.height));
-        const deviation = boundsDeviation({ x: minX, y: minY, width: maxX - minX, height: maxY - minY }, expectedAnimal);
-        if (deviation > .3) issues.push(issue("geometry.blueprint.animal", "error", "animal", `Assembled animal silhouette bounds differ from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-        else if (deviation > .15) issues.push(issue("geometry.blueprint.animal", "warning", "animal", `Assembled animal silhouette bounds differ from the locked blueprint by ${Math.round(deviation * 100)}%.`));
-      }
-      for (const feature of plan.referenceAnalysis?.referenceFeatures ?? []) {
-        if (feature.importance === "detail") continue;
-        const metrics = analyzeSvgGroupGeometry(draft[SVG_FIELD[feature.part]] as string, feature.part, feature.requiredGroupId);
-        const minimumPixels = Math.max(80, Math.round(geometry.parts[feature.part].occupiedPixels * .05));
-        if (!metrics || metrics.occupiedPixels < minimumPixels) issues.push(issue("reference.feature.geometry", "error", feature.part, `Reference feature '${feature.id}' group '${feature.requiredGroupId}' must contain at least ${minimumPixels} visible pixels.`));
-      }
-      for (const part of ["frontLegs", "backLegs"] as const) {
-        const depth = draft.layoutMetadata?.depthGroups?.[part];
-        const limbPlan = plan.blueprint.limbPlan?.[part];
-        if (!depth || !limbPlan || limbPlan.expectedVisibleCount < 2) continue;
-        for (const groupId of [depth.farGroupId, depth.nearGroupId]) {
-          const metrics = analyzeSvgGroupGeometry(draft[SVG_FIELD[part]] as string, part, groupId);
-          const minimumPixels = Math.max(80, Math.round(geometry.parts[part].occupiedPixels * .05));
-          if (!metrics || metrics.occupiedPixels < minimumPixels) issues.push(issue("geometry.limbGroup.empty", "error", part, `${part} depth group '${groupId}' lacks meaningful visible limb geometry.`));
-        }
-        const contacts = draft.layoutMetadata?.groundContacts?.[part] ?? [];
-        const grounded = contacts.filter((point) => !point.raised).length;
-        const raised = contacts.filter((point) => point.raised).length;
-        if (grounded < limbPlan.groundedCount || raised < limbPlan.raisedCount) issues.push(issue("geometry.limbPlan.contacts", "error", part, `${part} provides ${grounded} grounded and ${raised} raised contacts; the blueprint requires ${limbPlan.groundedCount} grounded and ${limbPlan.raisedCount} raised.`));
-      }
-    }
-    const tailless = plan?.referenceAnalysis?.externalTail === "absent";
-    if (tailless) {
-      const tail = geometry.parts.tail;
-      if (!tail.bounds || tail.occupiedPixels > 1600 || tail.bounds.width > 48 || tail.bounds.height > 48) {
-        issues.push(issue("reference.tail.protruding", "error", "tail", "This species is tailless; tail must be a compact rump seam-cap no larger than 48x48 and hidden behind the body."));
-      }
-    }
-    issues.push(...geometry.issues.filter((entry) => !tailless || !(
-      (entry.code === "geometry.seam.excessive-overlap" && entry.part === "tail") ||
-      (entry.code === "geometry.overlap.unrelated" && entry.part === "tail")
-    )));
+    issues.push(...geometry.issues);
   }
   return { valid: !issues.some((entry) => entry.severity === "error"), checkedAt: new Date().toISOString(), validatorVersion: VALIDATOR_VERSION, issues };
 }

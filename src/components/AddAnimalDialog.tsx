@@ -3,10 +3,12 @@ import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move,
 import { Animal } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
-import { populateGuidedBrief, runGenerationPipeline } from "../generation/clientPipeline";
-import type { AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode } from "../generation/contracts";
+import { populateGuidedBrief } from "../generation/clientPipeline";
+import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode } from "../generation/contracts";
 import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
+import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
+import { ContactSheetSelector } from "./ContactSheetSelector";
 import { SvgLayersPanel } from "./SvgLayersPanel";
 import { RigEditorPanel } from "./RigEditorPanel";
 import { ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
@@ -137,6 +139,22 @@ const TEMPLATES = [
   }
 ];
 
+// Minimal plan used only to shape a metadata record when a sampled composition has no
+// usable per-sample plan. Never used to gate: validation runs against the real plan.
+const FALLBACK_PLAN: AnatomyStylePlan = {
+  speciesFeatures: [],
+  anatomyTemplate: "quadruped-five-part",
+  requiredParts: ["head", "body", "frontLegs", "backLegs", "tail"],
+  proportionsAndSilhouette: "",
+  pose: "",
+  orientation: "left-facing",
+  paletteAndMarkings: "",
+  layerPlan: [],
+  attachmentStrategy: [],
+  requiredNamedGroups: { head: ["head-root"], body: ["body-root"], frontLegs: ["frontLegs-root"], backLegs: ["backLegs-root"], tail: ["tail-root"] },
+  suggestedJoints: [],
+};
+
 export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }: AddAnimalDialogProps) {
   const [name, setName] = useState("");
   const [color, setColor] = useState("#3B82F6");
@@ -191,6 +209,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
   const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
+  // §5.3 parallel-sample-and-select state. When `samples` is set the contact sheet is shown.
+  const [samples, setSamples] = useState<GeneratedSample[] | null>(null);
+  const [sampleCount, setSampleCount] = useState(DEFAULT_SAMPLE_COUNT);
+  const [sampleProgress, setSampleProgress] = useState<{ done: number; total: number } | null>(null);
   const displayedValidation = generationMetadata
     ? generationMetadata.validationHistory[generationMetadata.bestAttempt ?? generationMetadata.validationHistory.length - 1] ?? generationMetadata.validationHistory.at(-1)
     : undefined;
@@ -308,6 +330,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     if (isOpen) {
       setSvgUndo(EMPTY_HISTORY());
       setSvgRedo(EMPTY_HISTORY());
+      setSamples(null);
+      setSampleProgress(null);
       if (editingAnimal) {
         setName(editingAnimal.name);
         setColor(editingAnimal.color);
@@ -435,43 +459,83 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   };
 
-  const handleGenerateWithAI = async () => {
-    if (!aiPrompt.trim() && !uploadedImage) {
+  // §5.3: generate N whole-animal samples in parallel, then let the user pick the best
+  // part per slot from a contact sheet. No review/repair loop, no new endpoint.
+  const handleGenerateSamples = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
       setErrorMsg("Please enter an animal description or upload an inspiring image first.");
       return;
     }
-
+    const brief: GuidedAnimalBrief = { ...guidedBrief, animalName: animalName || guidedBrief.animalName, summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: animalName || guidedBrief.animalName }) };
+    setGuidedBrief(brief);
     setIsGenerating(true);
     setErrorMsg("");
-    const brief = { ...guidedBrief, animalName: aiPrompt.trim() || guidedBrief.animalName, summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: aiPrompt.trim() || guidedBrief.animalName }) };
-    if (!brief.animalName.trim()) { setErrorMsg("Animal name is required."); setIsGenerating(false); return; }
-    setGuidedBrief(brief);
-    setGenerationStep("Starting controlled Gemini pipeline...");
-
+    setSamples(null);
+    setSampleProgress({ done: 0, total: sampleCount });
+    setGenerationStep(`Generating ${sampleCount} variations in parallel (concurrency ${DEFAULT_SAMPLE_CONCURRENCY})...`);
     try {
-      const result = await runGenerationPipeline({ prompt: brief.animalName, image: uploadedImage, referenceMode, brief, onStep: setGenerationStep, onDraft: applyAnimalDraft });
-      applyAnimalDraft(result.animal);
-      setGenerationMetadata(result.metadata);
-      setPipelinePreviews({ cleanSvg: result.cleanSvg, diagnosticSvg: result.diagnosticSvg });
-
-      // Reset transform adjustments for fresh generation
-      setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
-      setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-      setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
-      setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
-      setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
-      setActiveTweakPart("head");
-
-      setAiMode("refine"); // Auto-switch to refine mode upon successful generation
-      const remaining = result.metadata.validationHistory[result.metadata.bestAttempt ?? result.metadata.validationHistory.length - 1]?.issues.length ?? 0;
-      setGenerationStep(result.metadata.finalStatus === "approved" ? "Pipeline complete: visual review approved." : `Pipeline stopped safely with ${remaining} technical issue(s) or visual warnings. Manual editing remains available.`);
+      const results = await runSampleGeneration({
+        prompt: brief.animalName,
+        image: uploadedImage,
+        referenceMode,
+        brief,
+        sampleCount,
+        concurrency: DEFAULT_SAMPLE_CONCURRENCY,
+        onProgress: (done, total) => setSampleProgress({ done, total }),
+      });
+      const usable = results.filter((sample) => sample.animal).length;
+      if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every sample failed to generate.");
+      setSamples(results);
+      setGenerationStep(`Generated ${usable}/${results.length} usable samples. Pick the best part for each slot.`);
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err?.message || "An unexpected error occurred during generation. Make sure GEMINI_API_KEY is configured.");
-      setGenerationStep("Generation stopped. The current SVG draft has been preserved.");
+      setErrorMsg(err?.message || "Variation generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Variation generation stopped.");
     } finally {
       setIsGenerating(false);
+      setSampleProgress(null);
     }
+  };
+
+  const handleUseSelection = (animal: AnimalDraft, provenance: SampleProvenance) => {
+    applyAnimalDraft(animal);
+    // Validate the composed frankenstein on physical ground truth only (the validator no
+    // longer consults the plan; parts came from different samples anyway).
+    const plan = provenance.plan;
+    const validation = validateAnimalDraft(animal);
+    const metadata: GenerationMetadata = {
+      originalRequest: aiPrompt.trim() || guidedBrief.animalName,
+      brief: guidedBrief,
+      plan: plan ?? FALLBACK_PLAN,
+      models: provenance.models ?? { planner: "sampled", generator: "sampled", reviewer: "n/a", repair: "n/a" },
+      promptVersions: provenance.promptVersions ?? { planner: "sample", generator: "sample", reviewer: "n/a", repair: "n/a" },
+      validationHistory: [validation],
+      reviewHistory: [],
+      repairs: [],
+      automaticRepairLimit: 0,
+      completedRepairRounds: 0,
+      attemptHistory: [],
+      bestAttempt: 0,
+      stopReason: validation.valid ? "approved" : "no-actionable-issues",
+      rescueUsed: false,
+      finalStatus: validation.valid ? "approved" : "warnings",
+      createdAt: new Date().toISOString(),
+      generatedLayout: animal.layoutMetadata,
+      referenceMode: uploadedImage ? referenceMode : undefined,
+      metrics: { firstPassGeometrySuccess: validation.valid && !validation.issues.some((entry) => entry.code.startsWith("geometry.")), repairCount: 0, latencyMs: 0 },
+    };
+    setGenerationMetadata(metadata);
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(animal), diagnosticSvg: buildAssembledPreviewSvg(animal, true) });
+    setSamples(null);
+    setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
+    setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
+    setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
+    setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
+    setActiveTweakPart("head");
+    setAiMode("refine");
+    setGenerationStep(validation.valid ? "Selection applied and passes the deterministic checks. Refine or forge." : "Selection applied with warnings. Refine a part, edit the SVG, or forge as-is.");
   };
 
   const handleRefineWithAI = async () => {
@@ -1363,53 +1427,43 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               <div className="md:col-span-8 flex flex-col justify-end">
                 {aiMode === "summon" ? (
                   <div className="flex flex-col gap-2.5 w-full">
-                    <div className="grid grid-cols-2 gap-2">
-                      <label className="text-[9px] font-mono text-zinc-400 uppercase">Preset
-                        <select value={guidedBrief.preset} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
-                          {GENERATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
-                        </select>
-                      </label>
-                      <label className="text-[9px] font-mono text-zinc-400 uppercase">Quality
-                        <select value={guidedBrief.mode} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => updateBriefField("mode", event.target.value as GuidedAnimalBrief["mode"])} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
-                          <option value="draft">Draft</option><option value="high-quality">High quality</option>
-                        </select>
-                        <span className="mt-1 block text-[8px] normal-case text-zinc-600">{guidedBrief.mode === "draft" ? "One fast improving pass" : "Up to four improving passes with rollback and one rescue"}</span>
-                      </label>
-                    </div>
+                    <label className="text-[9px] font-mono text-zinc-400 uppercase">Preset
+                      <select value={guidedBrief.preset} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                        {GENERATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                      </select>
+                    </label>
                     <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">Animal name (required)</label>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        disabled={isGenerating || isAutoFillingBrief}
-                        placeholder="e.g. cow"
-                        value={aiPrompt}
-                        onChange={(e) => { setAiPrompt(e.target.value); updateBriefField("animalName", e.target.value); }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            handleGenerateWithAI();
-                          }
-                        }}
-                        className="flex-1 text-xs font-mono px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-50"
-                      />
+                    <input
+                      type="text"
+                      disabled={isGenerating || isAutoFillingBrief}
+                      placeholder="e.g. cow"
+                      value={aiPrompt}
+                      onChange={(e) => { setAiPrompt(e.target.value); updateBriefField("animalName", e.target.value); }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          handleGenerateSamples();
+                        }
+                      }}
+                      className="w-full text-xs font-mono px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-50"
+                    />
+                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 p-2">
                       <button
                         type="button"
                         disabled={isGenerating || isAutoFillingBrief}
-                        onClick={handleGenerateWithAI}
-                        className="px-4 py-2 bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-600 hover:shadow-lg disabled:shadow-none text-zinc-950 text-xs font-mono font-bold rounded-xl transition-all flex items-center gap-1.5 whitespace-nowrap active:scale-95 disabled:pointer-events-none"
+                        onClick={handleGenerateSamples}
+                        className="flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-100 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-all hover:bg-white active:scale-95 disabled:pointer-events-none disabled:bg-zinc-800 disabled:text-zinc-600"
                       >
-                        {isGenerating ? (
-                          <>
-                            <Loader2 size={14} className="animate-spin" />
-                            GENERATING...
-                          </>
-                        ) : (
-                          <>
-                            <Wand2 size={14} />
-                            SUMMON CREATURE
-                          </>
-                        )}
+                        {isGenerating && sampleProgress ? <Loader2 size={14} className="animate-spin" /> : <Layers size={14} />}
+                        {isGenerating && sampleProgress ? `SAMPLING ${sampleProgress.done}/${sampleProgress.total}` : "GENERATE VARIATIONS"}
                       </button>
+                      <label className="flex items-center gap-1 text-[9px] font-mono uppercase text-zinc-400">
+                        samples
+                        <select value={sampleCount} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setSampleCount(Number(event.target.value))} className="rounded border border-zinc-800 bg-zinc-950 px-1.5 py-1 text-[10px] text-zinc-200">
+                          {[2, 3, 4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}
+                        </select>
+                      </label>
+                      <span className="text-[9px] leading-snug text-zinc-500">Best part-per-slot from N parallel draws — no repair loop.</span>
                     </div>
                     <button
                       type="button"
@@ -1539,6 +1593,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             </div>
 
+            {samples && (
+              <div className="rounded-2xl border border-amber-500/20 bg-zinc-950/40 p-3">
+                <ContactSheetSelector samples={samples} onUse={handleUseSelection} onCancel={() => setSamples(null)} />
+              </div>
+            )}
             {generationStep && (
               <div className="flex items-center gap-2 text-[10px] font-mono text-amber-500/80 bg-amber-500/5 px-3 py-1.5 rounded-lg border border-amber-500/10">
                 {isGenerating && <Loader2 size={10} className="animate-spin text-amber-500" />}

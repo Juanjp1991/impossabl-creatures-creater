@@ -41,7 +41,6 @@ export interface AnatomyStylePlan {
   attachmentStrategy: Array<{ part: AnimalPartType; anchor: string; strategy: string }>;
   requiredNamedGroups: Record<AnimalPartType, string[]>;
   suggestedJoints: Array<{ part: AnimalPartType; name: string; x: number; y: number }>;
-  blueprint?: AnimalLayoutBlueprint;
   referenceAnalysis?: {
     fidelityTarget: "close-match" | "inspiration" | "none";
     silhouette: string;
@@ -73,13 +72,8 @@ export interface ReferenceFeature {
   requiredGroupId: string;
 }
 
-export interface ExpectedLimbSet {
-  expectedVisibleCount: number;
-  groundedCount: number;
-  raisedCount: number;
-  toeDirection: "left";
-}
-
+// Per-part socket/attachment profile the generator emits inside layoutMetadata.
+// Snap-always (normalize.ts) reads attachmentAnchor; composition carries one per slot.
 export interface BlueprintConnectionProfile {
   part: Exclude<AnimalPartType, "body">;
   socketAnchor: { x: number; y: number };
@@ -90,24 +84,6 @@ export interface BlueprintConnectionProfile {
   minimumOverlap: number;
   neutralConnectionDepth: number;
   allowedScale: { min: number; max: number };
-}
-
-export interface AnimalLayoutBlueprint {
-  occupiedBounds: Record<AnimalPartType, Bounds>;
-  assembledBounds?: Record<AnimalPartType | "animal", Bounds>;
-  groundY: number;
-  connections: BlueprintConnectionProfile[];
-  limbPlan?: Partial<Record<"frontLegs" | "backLegs", ExpectedLimbSet>>;
-  landmarks: {
-    noseTip: { x: number; y: number };
-    eye: { x: number; y: number };
-    neckBase: { x: number; y: number };
-    shoulder: { x: number; y: number };
-    hip: { x: number; y: number };
-    pawBottoms: Array<{ x: number; y: number; raised?: boolean }>;
-    heels: Array<{ x: number; y: number }>;
-    toeTips: Array<{ x: number; y: number }>;
-  };
 }
 
 export interface GeneratedLayoutMetadata {

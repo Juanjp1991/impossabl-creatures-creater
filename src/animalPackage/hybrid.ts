@@ -1,6 +1,7 @@
 import { ANATOMY_TEMPLATES } from "./templates";
 import type { AnatomicalCategory, AnimalPackageV1, AnimalPartV1, AnimalSocketV1, AnatomyTemplateId, PackagePoint } from "./schema";
 import { assertPublishableAnimalPackageV1 } from "./validation";
+import { applyRamp, resolveRamp } from "../generation/palette";
 
 export const HYBRID_RECIPE_FORMAT_VERSION = "1.0.0" as const;
 
@@ -134,7 +135,9 @@ export function resolveHybridRecipe(recipe: HybridRecipeV1, library: AnimalPacka
 }
 
 const escapeAttribute = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-const colourize = (svg: string, primary: string, accent: string) => svg.replace(/(["'])primary\1/gi, `"${escapeAttribute(primary)}"`).replace(/(["'])accent\1/gi, `"${escapeAttribute(accent)}"`);
+// A hybrid keeps the single recipe palette (§5.2): one primary/accent drives the whole ramp
+// for every donor part, which is what makes a five-species frankenstein read as one creature.
+const colourize = (svg: string, primary: string, accent: string) => applyRamp(svg, resolveRamp(primary, accent));
 
 function groupFragment(svg: string, id: string, includeDefs = false) {
   const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); const start = new RegExp(`<g\\b[^>]*\\bid=["']${escaped}["'][^>]*>`, "i").exec(svg);
