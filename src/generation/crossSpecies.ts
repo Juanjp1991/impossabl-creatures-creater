@@ -22,9 +22,10 @@ const SVG_FIELD = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg",
 // Adjacent parts across a seam — a density or stroke jump here is what reads as whiplash.
 const ADJACENT: Array<[AnimalPartType, AnimalPartType]> = [["head", "body"], ["body", "frontLegs"], ["body", "backLegs"], ["body", "tail"]];
 
-// A part is only interchangeable if it names itself with the shared root id; a source whose
-// slot art is missing that root cannot donate that slot.
-const ROOT_ID: Record<AnimalPartType, string> = { head: "head-root", body: "body-root", frontLegs: "frontLegs-root", backLegs: "backLegs-root", tail: "tail-root" };
+// A part can donate its slot as long as it actually has art there. Every sample of every
+// species targets the same fixed local view and anchor for a slot, so any non-empty slot SVG
+// is interchangeable — we do not require the shared root id, so built-in and legacy library
+// animals (whose art predates the root-id convention) are eligible donors too.
 
 export interface RosterEntry { id: string; draft: AnimalDraft; }
 
@@ -64,7 +65,7 @@ function donorsFor(slot: AnimalPartType, roster: RosterEntry[]): RosterEntry[] {
   const field = SVG_FIELD[slot];
   return roster.filter((entry) => {
     const svg = entry.draft[field];
-    return typeof svg === "string" && new RegExp(`id=["']${ROOT_ID[slot]}["']`).test(svg);
+    return typeof svg === "string" && svg.trim().length > 0;
   });
 }
 

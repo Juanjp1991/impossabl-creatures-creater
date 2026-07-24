@@ -11,6 +11,7 @@ import { parseSvgToReact } from "./utils/svgParser";
 import { Eye, HelpCircle, Layers, Settings, Sparkles, Wand2, Info, Heart, Activity } from "lucide-react";
 
 const AnimalPackagePanel = React.lazy(() => import("./components/AnimalPackagePanel").then((module) => ({ default: module.AnimalPackagePanel })));
+const CrossSpeciesPanel = React.lazy(() => import("./components/CrossSpeciesPanel").then((module) => ({ default: module.CrossSpeciesPanel })));
 const AddAnimalDialog = React.lazy(() => import("./components/AddAnimalDialog").then((module) => ({ default: module.AddAnimalDialog })));
 
 const INITIAL_CREATURE: CreatureState = {
@@ -590,6 +591,10 @@ export default function App() {
               selectedAnimalId={creature.body}
               onImport={handleAddAnimal}
             />
+          </React.Suspense>
+
+          <React.Suspense fallback={<div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 text-[10px] font-mono text-zinc-500">Loading cross-species QA…</div>}>
+            <CrossSpeciesPanel animals={animalsList} />
           </React.Suspense>
           
           <PartSelector
