@@ -79,6 +79,15 @@ export function normalizeGeneratedSvgSyntax(input: AnimalDraft): { animal: Anima
       }
       if (animal.layoutMetadata?.depthGroups) animal.layoutMetadata.depthGroups[part] = expected;
     }
+    // Guarantee the required root group id (§5.1 deterministic enforcement). Some models wrap a
+    // part in a differently-named group ("head-group") or, for legs, emit only the far/near depth
+    // groups with no root wrapper — both trip the validator's required-group gate. Wrapping when
+    // the canonical id is absent is always safe: nesting under it preserves every inner id
+    // (including far/near) and leaves all geometry untouched.
+    const rootId = `${part}-root`;
+    if (!new RegExp(`id\\s*=\\s*["']${escaped(rootId)}["']`).test(svg)) {
+      svg = `<g id="${rootId}">${svg}</g>`;
+    }
     if (svg !== animal[field]) { animal[field] = svg; changedParts.push(part); }
   }
   return { animal, changedParts };

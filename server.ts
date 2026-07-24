@@ -141,8 +141,13 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
             body.response_format = { type: "json_object" };
             // CLIProxyAPI does not hard-enforce json_object for Claude, so compliance rides
             // on the instruction being the LAST thing the model sees — a trailing user turn
-            // overrides any conversational framing in the system/user prompt above it.
-            messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else. No prose, no explanation, no markdown code fences, no leading or trailing text. The object must conform exactly to this JSON Schema, populating every required property: ${JSON.stringify(schema)}` });
+            // overrides any conversational framing in the system/user prompt above it. It must
+            // reassert that the earlier content rules STILL apply: a bare "conform to this
+            // schema" pulls attention to field shapes and lets stronger models (e.g. Opus 5)
+            // satisfy the schema while dropping the system prompt's in-string requirements
+            // (required element IDs/groups, allowed palette values). The schema constrains
+            // shape; the system instructions constrain content; both apply in full.
+            messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. JSON Schema: ${JSON.stringify(schema)}` });
           } else {
             body.response_format = schema
               ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
