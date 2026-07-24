@@ -8,6 +8,21 @@ export const REQUEST_TIMEOUTS: Record<string, number> = {
   "/api/modify-animal": 135_000,
 };
 
+export interface ModelOption { id: string; label: string; provider: "gemini" | "proxy"; }
+export interface ModelsResponse { models: ModelOption[]; defaultModelId: string; }
+
+/** The models the server offers for selection, plus today's default. Never throws hard —
+ *  a failure returns an empty list so the UI simply falls back to the server default. */
+export async function fetchModels(): Promise<ModelsResponse> {
+  try {
+    const response = await fetch("/api/models");
+    if (!response.ok) return { models: [], defaultModelId: "" };
+    return (await response.json()) as ModelsResponse;
+  } catch {
+    return { models: [], defaultModelId: "" };
+  }
+}
+
 export async function postJson(path: string, body: unknown, timeoutMs = REQUEST_TIMEOUTS[path] ?? 135_000) {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);

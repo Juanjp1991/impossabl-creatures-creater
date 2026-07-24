@@ -42,50 +42,69 @@ interface AiClient {
   models: { generateContent(options: { model: string; contents: any; config?: any }): Promise<GenerateResult> };
 }
 
-// Initialize the AI client. Two mutually exclusive paths:
-//  - AI_PROXY_URL set  -> OpenAI-compatible proxy (CLIProxyAPI), preserves JSON schema.
-//  - otherwise         -> Google Gemini directly, using GEMINI_API_KEY (unchanged).
-let isKeyValid = false;
+// AI providers (§7 in-app model selector). Both the CLIProxyAPI path and the direct Google
+// Gemini path can be live at once; each contributes its models to a small registry, and
+// resolveModel() maps a per-request modelId to the right client + model. The default is
+// today's behaviour: proxy when configured, else Gemini.
+interface ModelEntry { id: string; label: string; provider: "gemini" | "proxy"; model: string; }
+const parseModelList = (value: string | undefined) => (value || "").split(",").map((entry) => entry.trim()).filter(Boolean);
+
+let geminiClient: AiClient | null = null;
+let proxyClient: AiClient | null = null;
 let keyValidationError = "";
-let ai: AiClient | null = null;
+const MODEL_REGISTRY: ModelEntry[] = [];
 
+// Proxy path. AI_PROXY_MODELS lists the served model ids; for back-compat it falls back to
+// GEMINI_MODEL, which in proxy mode is just the routed id (e.g. gpt-5.6-sol).
 if (AI_PROXY_URL) {
-  ai = createOpenAiProxyClient(AI_PROXY_URL, AI_PROXY_KEY);
-  isKeyValid = true;
-  console.log(`AI routed through OpenAI-compatible proxy ${AI_PROXY_URL} using model "${GEMINI_MODEL}".`);
-} else {
-  let rawApiKey = process.env.GEMINI_API_KEY;
-  let apiKey = "";
+  proxyClient = createOpenAiProxyClient(AI_PROXY_URL, AI_PROXY_KEY);
+  const configured = parseModelList(process.env.AI_PROXY_MODELS);
+  for (const model of configured.length ? configured : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `proxy:${model}`, label: `${model} · proxy`, provider: "proxy", model });
+  console.log(`AI proxy ${AI_PROXY_URL} serving: ${MODEL_REGISTRY.filter((entry) => entry.provider === "proxy").map((entry) => entry.model).join(", ")}`);
+}
 
+// Direct Gemini path, using GEMINI_API_KEY. GEMINI_MODELS lists the direct models; for
+// back-compat it falls back to GEMINI_MODEL ONLY when not in proxy mode (in proxy mode
+// GEMINI_MODEL is the proxy's routed id, which is not a valid direct-Gemini model).
+{
+  const rawApiKey = process.env.GEMINI_API_KEY;
   if (rawApiKey) {
-    apiKey = rawApiKey.trim().replace(/^["']|["']$/g, "");
+    const apiKey = rawApiKey.trim().replace(/^["']|["']$/g, "");
     if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey === "YOUR_GEMINI_API_KEY" || apiKey === "undefined" || apiKey === "null") {
       keyValidationError = "The Gemini API key is configured with a placeholder value or is empty. Please configure a real API key in Settings > Secrets.";
     } else if (!apiKey.startsWith("AIzaSy") && !apiKey.startsWith("AQ.")) {
       keyValidationError = "The Gemini API key configured in Settings > Secrets does not appear to be a valid Google API key (valid keys start with 'AIzaSy' or 'AQ.'). Please ensure you have pasted the correct key.";
     } else {
-      isKeyValid = true;
+      geminiClient = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: { "User-Agent": "aistudio-build" },
+          timeout: 120000, // 2 minutes timeout to prevent HeadersTimeoutError on complex SVG generations
+          // generateContentWithRetry owns the retry policy so requests stay predictably bounded.
+          retryOptions: { attempts: 1 },
+        },
+      }) as unknown as AiClient;
     }
-  } else {
+  } else if (!AI_PROXY_URL) {
     keyValidationError = "GEMINI_API_KEY environment variable is not defined. Please configure it in Settings > Secrets.";
   }
-
-  if (isKeyValid && apiKey) {
-    ai = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-        timeout: 120000, // 2 minutes timeout to prevent HeadersTimeoutError on complex SVG generations
-        // The SDK otherwise retries up to five times internally. Retry policy is
-        // handled by generateContentWithRetry so requests remain predictably bounded.
-        retryOptions: { attempts: 1 },
-      },
-    }) as unknown as AiClient;
-  } else {
-    console.warn("Gemini AI client initialization skipped: " + keyValidationError);
+  if (geminiClient) {
+    const configured = parseModelList(process.env.GEMINI_MODELS);
+    for (const model of configured.length ? configured : AI_PROXY_URL ? [] : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `gemini:${model}`, label: `${model} · Gemini`, provider: "gemini", model });
   }
+}
+
+const DEFAULT_MODEL_ID = (MODEL_REGISTRY.find((entry) => entry.provider === "proxy") ?? MODEL_REGISTRY[0])?.id ?? "";
+if (!MODEL_REGISTRY.length) console.warn("No AI model configured: " + (keyValidationError || "set AI_PROXY_URL (+ AI_PROXY_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS)."));
+const noModelError = () => keyValidationError || "No AI model is configured. Set AI_PROXY_URL (+ AI_PROXY_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS).";
+
+// Resolve a per-request modelId to its client + model, falling back to the default. Returns
+// null when nothing is configured (endpoints answer 503).
+function resolveModel(modelId: unknown): { client: AiClient; model: string; entry: ModelEntry } | null {
+  const entry = MODEL_REGISTRY.find((candidate) => candidate.id === modelId) ?? MODEL_REGISTRY.find((candidate) => candidate.id === DEFAULT_MODEL_ID);
+  if (!entry) return null;
+  const client = entry.provider === "proxy" ? proxyClient : geminiClient;
+  return client ? { client, model: entry.model, entry } : null;
 }
 
 // --- OpenAI-compatible proxy adapter -----------------------------------------
@@ -359,25 +378,31 @@ const guidedBriefSchema = {
   required: ["animalName", "preset", "sexOrVariant", "age", "bodyBuild", "style", "detailLevel", "pose", "expression", "mainColour", "markings", "definingAnatomy", "advancedInstructions", "summary", "mode"],
 };
 
+// The models the UI may choose from, and today's default. A plain list — no plugin framework.
+app.get("/api/models", (_req, res) => {
+  res.json({ models: MODEL_REGISTRY.map(({ id, label, provider }) => ({ id, label, provider })), defaultModelId: DEFAULT_MODEL_ID });
+});
+
 app.post("/api/populate-brief", async (req, res) => {
   try {
-    if (!ai) return res.status(503).json({ error: keyValidationError });
+    const resolved = resolveModel(req.body?.modelId);
+    if (!resolved) return res.status(503).json({ error: noModelError() });
     const current = (req.body?.currentBrief || {}) as Partial<GuidedAnimalBrief>;
     const reference = imagePartFromDataUrl(req.body?.image);
     if (!current.animalName?.trim() && !reference) return res.status(400).json({ error: "An animal name or reference image is required to auto-fill details." });
     const referenceMode = requestedReferenceMode(req.body?.referenceMode);
     const referenceRules = referenceDirective(Boolean(reference), referenceMode);
     const prompt = `Populate every editable guided SVG-generation field for: ${current.animalName || "the animal in image 1"}. Reference mode: ${referenceMode}. Existing form values are generic placeholders, not user decisions; replace them with the best species/reference-specific choices. Preserve only the non-empty animal name and quality mode. Existing form: ${JSON.stringify(current)}.`;
-    const response = await generateContentWithRetry(ai, {
-      model: GEMINI_MODEL,
+    const response = await generateContentWithRetry(resolved.client, {
+      model: resolved.model,
       contents: reference ? { role: "user", parts: [reference, { text: prompt }] } : prompt,
       config: {
-        systemInstruction: `You prepare practical prompt fields for a structured five-part animal SVG generator. ${referenceRules} Choose only the supplied enum values. Treat incoming form values as replaceable defaults; do not echo generic values such as friendly cartoon, soft and balanced, medium detail or relaxed pose unless they genuinely are the best match. Prefer detailed-game-asset, high detail, species-accurate anatomy and the reference's actual pose for a normal close-match request. Describe the real palette, markings, silhouette, pose, head features, shoulder/chest, hip, limb bends, paws/toes and tail. In advancedInstructions, demand continuous shoulder-to-paw and hip-to-paw silhouettes, near/far depth separation, grounded feet, and broad upper-limb collars that extend 10-18px into the torso so seams are hidden. Request layered meaningful vector shapes rather than simple ellipses or disconnected fragments. Keep the result specific and editable, not conversational. The expanded summary must combine every important choice. Model ${GEMINI_MODEL}.`,
+        systemInstruction: `You prepare practical prompt fields for a structured five-part animal SVG generator. ${referenceRules} Choose only the supplied enum values. Treat incoming form values as replaceable defaults; do not echo generic values such as friendly cartoon, soft and balanced, medium detail or relaxed pose unless they genuinely are the best match. Prefer detailed-game-asset, high detail, species-accurate anatomy and the reference's actual pose for a normal close-match request. Describe the real palette, markings, silhouette, pose, head features, shoulder/chest, hip, limb bends, paws/toes and tail. In advancedInstructions, demand continuous shoulder-to-paw and hip-to-paw silhouettes, near/far depth separation, grounded feet, and broad upper-limb collars that extend 10-18px into the torso so seams are hidden. Request layered meaningful vector shapes rather than simple ellipses or disconnected fragments. Keep the result specific and editable, not conversational. The expanded summary must combine every important choice. Model ${resolved.model}.`,
         responseMimeType: "application/json",
         responseSchema: guidedBriefSchema,
       },
     });
-    if (!response.text) throw new Error("Gemini returned an empty guided brief.");
+    if (!response.text) throw new Error("The model returned an empty guided brief.");
     const generated = JSON.parse(response.text) as GuidedAnimalBrief;
     const brief: GuidedAnimalBrief = {
       ...generated,
@@ -385,7 +410,7 @@ app.post("/api/populate-brief", async (req, res) => {
       mode: current.mode === "draft" ? "draft" : "high-quality",
     };
     assertBrief(brief);
-    return res.json({ brief, model: GEMINI_MODEL });
+    return res.json({ brief, model: resolved.model });
   } catch (error: any) {
     console.error("Error auto-filling guided animal brief:", error);
     return res.status(500).json({ error: "Failed to auto-fill prompt details. Details: " + getFriendlyErrorMessage(error) });
@@ -424,14 +449,15 @@ function quadrupedPlan(brief: GuidedAnimalBrief): AnatomyStylePlan {
 
 app.post("/api/generate-animal", async (req, res) => {
   try {
-    if (!ai) return res.status(503).json({ error: keyValidationError });
+    const resolved = resolveModel(req.body?.modelId);
+    if (!resolved) return res.status(503).json({ error: noModelError() });
     const brief = assertBrief(req.body?.brief);
     const originalRequest = typeof req.body?.prompt === "string" && req.body.prompt.trim() ? req.body.prompt.trim() : brief.animalName;
     const reference = imagePartFromDataUrl(req.body?.image);
     const referenceMode = requestedReferenceMode(req.body?.referenceMode);
     const referenceRules = referenceDirective(Boolean(reference), referenceMode);
-    const generationResponse = await generateContentWithRetry(ai, {
-      model: GEMINI_MODEL,
+    const generationResponse = await generateContentWithRetry(resolved.client, {
+      model: resolved.model,
       contents: reference
         ? { role: "user", parts: [reference, { text: `Draw a faithful five-part vector decomposition of image 1. Reference mode: ${referenceMode}. Guided brief: ${JSON.stringify(brief)}` }] }
         : `Design and draw this animal from the guided brief: ${JSON.stringify(brief)}`,
@@ -441,14 +467,15 @@ app.post("/api/generate-animal", async (req, res) => {
         maxOutputTokens: 16384,
       },
     });
-    if (!generationResponse.text) throw new Error("Gemini returned an empty SVG response.");
+    if (!generationResponse.text) throw new Error("The model returned an empty SVG response.");
     const rawAnimal = JSON.parse(generationResponse.text) as AnimalDraft;
     const plan = quadrupedPlan(brief);
     const syntaxNormalization = normalizeGeneratedSvgSyntax(rawAnimal);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
     const animal = snapAttachedPartsToAnchors(normalization.animal);
     const validation = validateAnimalDraft(animal);
-    return res.json({ animal, plan, validation, originalRequest, brief, models: MODEL_VERSIONS, promptVersions: PROMPT_VERSIONS, deterministicNormalization: { coordinates: normalization.normalizedParts, syntaxAndPalette: syntaxNormalization.changedParts } });
+    const models = { ...MODEL_VERSIONS, planner: resolved.model, generator: resolved.model };
+    return res.json({ animal, plan, validation, originalRequest, brief, models, promptVersions: PROMPT_VERSIONS, modelId: resolved.entry.id, deterministicNormalization: { coordinates: normalization.normalizedParts, syntaxAndPalette: syntaxNormalization.changedParts } });
   } catch (error: any) {
     console.error("Error generating custom animal via AI:", error);
     const status = /guided animal brief|required/i.test(error?.message || "") ? 400 : 500;
@@ -470,11 +497,8 @@ app.post("/api/modify-animal", async (req, res) => {
       return res.status(400).json({ error: "Current animal data is required for iterative modification." });
     }
 
-    if (!ai) {
-      return res.status(503).json({
-        error: keyValidationError || "Gemini API key is missing. Please configure GEMINI_API_KEY in Settings > Secrets.",
-      });
-    }
+    const resolved = resolveModel(req.body?.modelId);
+    if (!resolved) return res.status(503).json({ error: noModelError() });
 
     let imagePart: any = null;
     if (image && typeof image === "string" && image.trim()) {
@@ -563,8 +587,8 @@ Apply the requested modification: "${prompt || "Modify creature using the provid
       ? { [targetField]: { type: Type.STRING, description: `Required changed inner SVG markup for ${modificationTarget}; preserve its existing required group IDs and local attachment contract.` }, ...(modificationTarget === "body" ? { bodyConnections: animalDraftSchema.properties.bodyConnections } : {}) }
       : allModificationProperties;
 
-    const response = await generateContentWithRetry(ai, {
-      model: GEMINI_MODEL,
+    const response = await generateContentWithRetry(resolved.client, {
+      model: resolved.model,
       contents: contents,
       config: {
         systemInstruction: systemInstruction,

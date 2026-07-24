@@ -8,6 +8,7 @@ import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBri
 import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
 import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
+import { fetchModels, type ModelOption } from "../generation/apiClient";
 import { ContactSheetSelector } from "./ContactSheetSelector";
 import { SvgLayersPanel } from "./SvgLayersPanel";
 import { RigEditorPanel } from "./RigEditorPanel";
@@ -213,6 +214,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [samples, setSamples] = useState<GeneratedSample[] | null>(null);
   const [sampleCount, setSampleCount] = useState(DEFAULT_SAMPLE_COUNT);
   const [sampleProgress, setSampleProgress] = useState<{ done: number; total: number } | null>(null);
+  // §7 in-app model selector — the chosen model threads through every AI call.
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelId, setModelId] = useState<string>("");
   const displayedValidation = generationMetadata
     ? generationMetadata.validationHistory[generationMetadata.bestAttempt ?? generationMetadata.validationHistory.length - 1] ?? generationMetadata.validationHistory.at(-1)
     : undefined;
@@ -408,6 +412,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   }, [isOpen, editingAnimal]);
 
+  // Load the available models once the dialog opens; keep any prior explicit choice.
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    fetchModels().then((result) => {
+      if (cancelled) return;
+      setModels(result.models);
+      setModelId((current) => (current && result.models.some((model) => model.id === current)) ? current : result.defaultModelId);
+    });
+    return () => { cancelled = true; };
+  }, [isOpen]);
+
   // Keep the pipeline previews synchronized with palette, connection and SVG
   // edits. This also re-colourizes older generated drafts that used CSS
   // variable placeholders before the preview renderer supported them.
@@ -447,7 +463,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setErrorMsg("");
     setGenerationStep("Gemini 3.6 Flash is preparing the guided prompt details...");
     try {
-      const brief = await populateGuidedBrief({ currentBrief: { ...guidedBrief, animalName }, image: uploadedImage, referenceMode });
+      const brief = await populateGuidedBrief({ currentBrief: { ...guidedBrief, animalName }, image: uploadedImage, referenceMode, modelId });
       setGuidedBrief(brief);
       setAiPrompt(brief.animalName);
       setGenerationStep("Prompt details populated. Review or edit them before generating.");
@@ -480,6 +496,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         image: uploadedImage,
         referenceMode,
         brief,
+        modelId,
         sampleCount,
         concurrency: DEFAULT_SAMPLE_CONCURRENCY,
         onProgress: (done, total) => setSampleProgress({ done, total }),
@@ -566,6 +583,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           targetPart: refinePart,
           image: uploadedImage,
           referenceMode,
+          modelId,
           currentAnimal: {
             name,
             color,
@@ -1342,9 +1360,24 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               )}
             </div>
 
+            {/* Model selector — the chosen model drives every AI call (auto-fill, generation, refine) */}
+            {models.length > 1 && (
+              <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+                <span className="text-[10px] font-mono uppercase font-bold text-amber-500/90">Model</span>
+                <select
+                  value={modelId}
+                  disabled={isGenerating || isAutoFillingBrief}
+                  onChange={(event) => setModelId(event.target.value)}
+                  className="flex-1 text-[11px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-200"
+                >
+                  {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                </select>
+              </div>
+            )}
+
             {/* Main Interactive Row */}
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-stretch">
-              
+
               {/* Left Column: Optional Visual Reference */}
               <div className="md:col-span-4 flex flex-col justify-between">
                 <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold mb-1.5 block">

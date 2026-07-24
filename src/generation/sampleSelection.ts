@@ -106,6 +106,7 @@ export interface SampleGenerationInput {
   image: string | null;
   referenceMode: ReferenceMode;
   brief: GuidedAnimalBrief;
+  modelId?: string;
   sampleCount?: number;
   concurrency?: number;
   onProgress?: (done: number, total: number) => void;
@@ -129,6 +130,7 @@ export async function runSampleGeneration(input: SampleGenerationInput): Promise
         image: input.image,
         referenceMode: input.referenceMode,
         brief: briefForSample(input.brief, index),
+        modelId: input.modelId,
       });
       const animal = result.animal as AnimalDraft;
       return { index, emphasis, animal, plan: result.plan, validation: result.validation as ValidationResult, geometry: safeGeometry(animal), models: result.models, promptVersions: result.promptVersions };

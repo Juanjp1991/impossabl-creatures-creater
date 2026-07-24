@@ -5,7 +5,7 @@
 import type { GuidedAnimalBrief, ReferenceMode } from "./contracts";
 import { postJson } from "./apiClient";
 
-export async function populateGuidedBrief(input: { currentBrief: GuidedAnimalBrief; image: string | null; referenceMode: ReferenceMode }): Promise<GuidedAnimalBrief> {
+export async function populateGuidedBrief(input: { currentBrief: GuidedAnimalBrief; image: string | null; referenceMode: ReferenceMode; modelId?: string }): Promise<GuidedAnimalBrief> {
   const result = await postJson("/api/populate-brief", input);
   return result.brief as GuidedAnimalBrief;
 }
