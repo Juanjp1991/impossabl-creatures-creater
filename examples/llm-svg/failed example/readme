@@ -1,0 +1,71 @@
+Model: gpt-5.6-sol
+
+Detected reference: Inferred calm left-facing side view with a level body, slightly lowered head and all four feet grounded. Near and far limb pairs are modestly offset for clarity. · tail visible
+
+Prompts: p1-plan-3.0.0 · p1-svg-3.0.0 · p1-review-3.0.0 · p1-repair-3.0.0
+
+Automatic repairs: 2/4
+
+Validation runs: 3 · Reviews: 3
+
+Best attempt: 0 · Stop: technical-failure · Rescue: used
+
+Attempt 1 · full-rescue · rejected: Rejected: technical errors increased from 19 to 20.
+Attempt 2 · technical · rejected: Rejected: technical errors increased from 19 to 38.
+Final rating:
+1
+2
+3
+4
+5
+head: head has no visible geometry within 32px of 'neck' anchor (120, 110).
+frontLegs: frontLegs has no foot geometry near the expected baseline.
+backLegs: backLegs has no foot geometry near the expected baseline.
+frontLegs: frontLegs limb plan must describe one or two visible limbs whose grounded and raised counts add up.
+backLegs: backLegs limb plan must describe one or two visible limbs whose grounded and raised counts add up.
+head: head occupied bounds differ from the locked blueprint by 39%.
+head: head assembled placement differs from the locked blueprint by 35%.
+body: body occupied bounds differ from the locked blueprint by 66%.
+body: body assembled placement differs from the locked blueprint by 30%.
+frontLegs: frontLegs occupied bounds differ from the locked blueprint by 44%.
+frontLegs: frontLegs assembled placement differs from the locked blueprint by 71%.
+backLegs: backLegs occupied bounds differ from the locked blueprint by 52%.
+backLegs: backLegs assembled placement differs from the locked blueprint by 80%.
+tail: tail occupied bounds differ from the locked blueprint by 75%.
+tail: tail assembled placement differs from the locked blueprint by 211%.
+animal: Assembled animal silhouette bounds differ from the locked blueprint by 39%.
+head: head/body seam must contain both opaque masks and at least 40 overlapping pixels inside the 18px joint zone (found 0).
+frontLegs: frontLegs/body seam must contain both opaque masks and at least 40 overlapping pixels inside the 18px joint zone (found 7).
+backLegs: backLegs/body seam must contain both opaque masks and at least 40 overlapping pixels inside the 18px joint zone (found 2).
+backLegs: backLegs/body intended overlap covers 55% of the smaller part; keep it at or below 25%.
+tail: tail/body seam must contain both opaque masks and at least 40 overlapping pixels inside the 18px joint zone (found 0).
+Best review: referenceFidelity 2 · speciesRecognizability 5 · anatomicalPlausibility 1 · overallSilhouette 2 · proportionConsistency 3 · jointContinuity 1 · limbLayering 1 · stylePaletteConsistency 7 · groundAlignment 3 · clippingOverlaps 2 · mobileReadability 3 · shapeAccuracy 2 · featurePlacementAndDetail 3
+
+[critical] head, body, frontLegs, backLegs, tail: The animal is split into disconnected islands: the head floats well left of the torso, the legs appear as tiny detached vertical fragments, and no readable tail is attached to the rump. It does not form one quadruped silhouette. Correction: Reassemble all five required parts into one continuous animal: overlap the head/neck into the front shoulder, embed every upper leg broadly into the torso, and insert the tail base into the rump. No white gap should remain between any anatomical attachment and the torso.
+[critical] head, body: The head is not connected to a thick neck or chest, so the requested natural left-facing standing pose is replaced by a floating head beside an isolated torso. Correction: Move and scale the head into a level or slightly lowered left-facing position directly at the torso's front. Build a thick neck transition whose dorsal and throat contours overlap the shoulder by at least one clear contour band.
+[critical] body, frontLegs, backLegs: Four supporting legs are not visibly constructed. Only a few narrow detached marks are present near the torso, with no continuous shoulders, hips, elbows, wrists, stifles, hocks, paws or weight-bearing feet. Correction: Construct two forelegs and two hind legs from broad torso-rooted collars to flattened soles. Each leg must remain visibly continuous, approximately comparable in thickness to a substantial portion of the chest depth, and include restrained joint bends rather than straight detached strokes.
+[critical] frontLegs, backLegs: There are no readable four-toed feet, and the small limb fragments do not convincingly support the torso on the ground line. Correction: Place all four flattened soles on one shared baseline and show four splayed blunt toes with pale rounded nails on every visible foot. Keep the feet attached to short, thick lower legs and avoid claw-like points.
+[critical] body, tail: The required short tapered external tail and flattened tuft are absent from the visible rump silhouette. Correction: Add a short tail projecting clearly behind the rear body, with its thick base embedded into the rump and a small flattened terminal tuft remaining readable at thumbnail size.
+[major] head, body, frontLegs, backLegs, tail: The torso has some barrel-like mass, but the complete silhouette does not communicate a massive standing hippo because the head-to-body spacing, missing neck, absent pillar legs and absent tail destroy the intended proportions. Correction: Create one compact silhouette with the broad head directly adjoining the chest, the belly held above the shared foot baseline, four short thick legs beneath the mass, and a small tail behind the rounded rump. The torso should remain the dominant mass without reading as an isolated rounded block.
+[major] frontLegs, backLegs: Near and far limb pairs cannot be distinguished. The isolated marks provide neither anatomical overlap nor controlled value separation. Correction: Offset each far leg enough to expose part of its foot and lower leg, place far limbs behind the torso and near limbs in front, and use a modest value difference while retaining continuous roots for all four legs.
+[major] head: The head includes an eye, ears, nostril area and mouth bands, but it reads as an overly compact cartoon head. The muzzle is rounded and layered rather than exceptionally broad, deep and squared, and the sensory features are crowded. Correction: Widen and deepen the muzzle so it dominates the head, flatten the front contour into a broad squared form, retain tiny rounded ears, and align the raised nostrils and small eye clearly along the upper head plane.
+[major] body, frontLegs, backLegs: The torso is a rounded capsule-like block with internal patches and vertical seam marks. It lacks a convincing deep chest, shoulder-to-neck rise, hanging belly, hip transition and meaningful skin folds tied to anatomy. Correction: Refine the outer contour into a high heavy shoulder, deep chest, low belly and rounded hindquarter. Replace arbitrary patch divisions with folds following the throat, shoulder, belly, hip and limb joints, while keeping mottling subordinate.
+[major] head, body, frontLegs, backLegs, tail: At mobile size the separated head and torso remain visible, but the leg fragments, feet and any possible tail detail collapse into indistinct marks. The thumbnail reads as two unrelated objects rather than one hippo. Correction: Prioritize a single connected outer silhouette and enlarge the minimum thickness of legs, feet and tail so each remains identifiable at the supplied mobile thumbnail scale. Reduce small internal marks that compete with the anatomy.
+[minor] head, body: The slate brown, mauve and dusty pink palette broadly follows the brief, but the tonal regions are segmented into patch-like panels rather than natural hide transitions. Correction: Keep the existing palette but soften boundaries into irregular low-contrast mottling and anatomical shading. Reserve dusty pink-gray for the muzzle, thin-skin areas, lower folds and feet rather than broad panel divisions.
+[major] head, body, frontLegs, backLegs, tail: referenceFidelity scored 2, below the required 8. Correction: Improve referenceFidelity while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: speciesRecognizability scored 5, below the required 8. Correction: Improve speciesRecognizability while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: anatomicalPlausibility scored 1, below the required 8. Correction: Improve anatomicalPlausibility while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: overallSilhouette scored 2, below the required 8. Correction: Improve overallSilhouette while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: proportionConsistency scored 3, below the required 8. Correction: Improve proportionConsistency while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: jointContinuity scored 1, below the required 8. Correction: Improve jointContinuity while preserving already accepted geometry.
+[major] body, frontLegs, backLegs: limbLayering scored 1, below the required 7. Correction: Improve limbLayering while preserving already accepted geometry.
+[major] frontLegs, backLegs: groundAlignment scored 3, below the required 7. Correction: Improve groundAlignment while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: clippingOverlaps scored 2, below the required 7. Correction: Improve clippingOverlaps while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: mobileReadability scored 3, below the required 7. Correction: Improve mobileReadability while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: shapeAccuracy scored 2, below the required 8. Correction: Improve shapeAccuracy while preserving already accepted geometry.
+[major] head, body, frontLegs, backLegs, tail: featurePlacementAndDetail scored 3, below the required 8. Correction: Improve featurePlacementAndDetail while preserving already accepted geometry.
+Resolved: 0 · Persistent: 0 · New: 0
+
+First-pass geometry: repair needed · 537568ms
+
+Remaining warnings are visible; use part-only refinement or the SVG editors below.
