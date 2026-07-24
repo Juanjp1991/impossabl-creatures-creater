@@ -107,6 +107,12 @@ function resolveModel(modelId: unknown): { client: AiClient; model: string; entr
   return client ? { client, model: entry.model, entry } : null;
 }
 
+// True for proxied models whose upstream honours OpenAI response_format:json_schema —
+// i.e. the OpenAI/Codex family (gpt-*, o1/o3-*, codex-*). Everything else served by the
+// proxy (claude-*, kimi-*, …) ignores json_schema and needs the json_object + schema-in-
+// prompt fallback below.
+const proxyModelHonorsJsonSchema = (model: string) => /^(gpt-|o\d|codex-)/i.test(model) || /codex/i.test(model);
+
 // --- OpenAI-compatible proxy adapter -----------------------------------------
 // Translates the app's Gemini-shaped request ({model, contents, config}) into an
 // OpenAI Chat Completions call and back, so a ChatGPT/Codex subscription served via
@@ -125,9 +131,23 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
         const body: any = { model, messages };
         if (AI_PROXY_REASONING) body.reasoning_effort = AI_PROXY_REASONING;
         if (config?.responseMimeType === "application/json") {
-          body.response_format = config?.responseSchema
-            ? { type: "json_schema", json_schema: { name: "response", strict: false, schema: geminiSchemaToJsonSchema(config.responseSchema) } }
-            : { type: "json_object" };
+          const schema = config?.responseSchema ? geminiSchemaToJsonSchema(config.responseSchema) : null;
+          if (schema && !proxyModelHonorsJsonSchema(model)) {
+            // CLIProxyAPI only translates response_format:json_schema for its OpenAI/Codex
+            // upstream; Claude (and other non-GPT proxied models) ignore it and answer in
+            // prose. Fall back to json_object mode and hand the model the schema as text —
+            // the deterministic validator still discards any malformed sample, so the only
+            // cost is an occasional dropped candidate in the N-sample pipeline.
+            body.response_format = { type: "json_object" };
+            // CLIProxyAPI does not hard-enforce json_object for Claude, so compliance rides
+            // on the instruction being the LAST thing the model sees — a trailing user turn
+            // overrides any conversational framing in the system/user prompt above it.
+            messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else. No prose, no explanation, no markdown code fences, no leading or trailing text. The object must conform exactly to this JSON Schema, populating every required property: ${JSON.stringify(schema)}` });
+          } else {
+            body.response_format = schema
+              ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
+              : { type: "json_object" };
+          }
         }
 
         // Reasoning models can be slow on large generations; default to 5 min unless
