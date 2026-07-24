@@ -45,11 +45,21 @@ export function isNearWhite(hex: string): boolean {
   return rgb ? Math.min(rgb.r, rgb.g, rgb.b) >= 224 : false;
 }
 
+// When a creature's stored primary/accent is not a real hex — e.g. a legacy draft that saved the
+// literal token "primary"/"accent" into the palette field — fall back to the same neutral grey the
+// derived steps already assume (mixToward's internal fallback). Coercing here keeps the base token
+// consistent with its own light/dark variants instead of leaving bare `primary` to render as an
+// invalid colour (solid black) while `primary-dark` renders grey.
+export const RAMP_FALLBACK_HEX = "#888888";
+const asHex = (value: string) => (parseHex(value) ? value : RAMP_FALLBACK_HEX);
+
 /** Resolve the full ramp to concrete hex values from a creature's primary/accent. */
 export function resolveRamp(primary: string, accent: string): Record<RampToken, string> {
+  const primaryHex = asHex(primary);
+  const accentHex = asHex(accent);
   return {
-    primary, accent,
-    "primary-light": lighten(primary), "primary-dark": darken(primary), "accent-dark": darken(accent),
+    primary: primaryHex, accent: accentHex,
+    "primary-light": lighten(primaryHex), "primary-dark": darken(primaryHex), "accent-dark": darken(accentHex),
     outline: OUTLINE_HEX, highlight: HIGHLIGHT_HEX,
   };
 }

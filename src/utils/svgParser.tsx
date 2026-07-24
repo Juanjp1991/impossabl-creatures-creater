@@ -1,4 +1,5 @@
 import React from "react";
+import { resolveRamp, type RampToken } from "../generation/palette";
 
 const ALLOWED_TAGS = new Set([
   "svg",
@@ -160,6 +161,19 @@ export function parseSvgToReact(
 
   let shapeCounter = 0;
 
+  // Resolve the full §5.2 canonical ramp once for this call, so every ramp token a part
+  // paints with — primary/accent AND the derived primary-light/primary-dark/accent-dark and
+  // the fixed outline/highlight neutrals — maps to a concrete hex, exactly as applyRamp does
+  // for the generation-side previews. Without this the derived tokens reach the DOM as literal
+  // fill="primary-dark" strings, which the browser treats as invalid and paints solid black.
+  const ramp = colors ? resolveRamp(colors.color || "#cccccc", colors.accentColor || "#ffaa00") : null;
+  const resolveRampValue = (valueLower: string): string | undefined => {
+    if (!ramp) return undefined;
+    if (valueLower in ramp) return ramp[valueLower as RampToken];
+    const variable = /^var\(\s*--([a-z-]+)\s*(?:,[^)]*)?\)$/.exec(valueLower);
+    return variable && variable[1] in ramp ? ramp[variable[1] as RampToken] : undefined;
+  };
+
   try {
     const parser = new DOMParser();
     // Wrap in a group to make sure it's valid XML even if it's a bare fragment
@@ -197,13 +211,12 @@ export function parseSvgToReact(
       
       // Dynamic color replacement
       if (colors) {
-        // Case-insensitive checks for keywords or exact hex match
+        // Case-insensitive checks for ramp tokens (incl. var(--token) forms) or exact hex match
         const valLower = value.toLowerCase();
-        
-        if (valLower === "primary" || valLower === "var(--primary)") {
-          value = colors.color || "#cccccc";
-        } else if (valLower === "accent" || valLower === "var(--accent)") {
-          value = colors.accentColor || "#ffaa00";
+        const rampHex = resolveRampValue(valLower);
+
+        if (rampHex !== undefined) {
+          value = rampHex;
         } else {
           // Replace matching hex colors with dynamic colors
           if (originalColor && valLower === originalColor.toLowerCase()) {
@@ -217,7 +230,17 @@ export function parseSvgToReact(
 
       const reactAttrName = camelCaseAttribute(attr.name);
       if (reactAttrName === "style") {
-        props.style = parseStyleString(value);
+        const style = parseStyleString(value);
+        if (colors) {
+          for (const key of ["fill", "stroke", "stopColor"]) {
+            const styled = style[key];
+            if (typeof styled === "string") {
+              const rampHex = resolveRampValue(styled.toLowerCase());
+              if (rampHex !== undefined) style[key] = rampHex;
+            }
+          }
+        }
+        props.style = style;
       } else {
         props[reactAttrName] = value;
       }
