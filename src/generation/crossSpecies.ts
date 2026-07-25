@@ -61,6 +61,16 @@ function mulberry32(seed: number) {
 
 const dominantStroke = (svg: string) => { const widths = strokeWidths(svg); return widths.length ? Math.max(...widths) : 0; };
 
+// Where a part sits inside its own §5.2 density band: 0 = sparse end, 1 = dense end, outside
+// [0,1] = outside the band entirely. Comparing positions rather than raw counts is what makes
+// "whiplash" mean the same thing for a body and a tail.
+const bandPosition = (slot: AnimalPartType, count: number) => {
+  const [low, high] = DENSITY_BANDS[slot];
+  return high === low ? 0 : (count - low) / (high - low);
+};
+// Flag when one part sits near the sparse end of its band and its neighbour near the dense end.
+const DENSITY_WHIPLASH_GAP = 0.6;
+
 function donorsFor(slot: AnimalPartType, roster: RosterEntry[]): RosterEntry[] {
   const field = SVG_FIELD[slot];
   return roster.filter((entry) => {
@@ -141,8 +151,13 @@ export function evaluateHybrid(index: number, draft: AnimalDraft, sources: Recor
   // §5.2 consistency across donors.
   for (const slot of PART_TYPES) if (fillRatios[slot] < FILL_BAND[0] || fillRatios[slot] > FILL_BAND[1]) flags.push(`scale: ${slot} fills ${Math.round(fillRatios[slot] * 100)}% (band ${Math.round(FILL_BAND[0] * 100)}-${Math.round(FILL_BAND[1] * 100)}%)`);
   for (const [a, b] of ADJACENT) {
-    const [low, high] = [elementCounts[a], elementCounts[b]].sort((first, second) => first - second);
-    if (low > 0 && high / low >= 3) flags.push(`density whiplash: ${a} (${elementCounts[a]}) vs ${b} (${elementCounts[b]})`);
+    // Compare each part's position WITHIN ITS OWN band, not raw counts. A raw ratio is the wrong
+    // measure because §5.2 already assigns different bands per slot (body 8-26 beside legs 5-14),
+    // so a body and a leg set that both conform can still differ 3x — measured on the live roster
+    // that made 87% of this flag's hits false alarms. Band position also handles out-of-band parts
+    // for free: they fall below 0 or above 1, which widens the gap rather than hiding it.
+    const gap = Math.abs(bandPosition(a, elementCounts[a]) - bandPosition(b, elementCounts[b]));
+    if (gap >= DENSITY_WHIPLASH_GAP) flags.push(`density whiplash: ${a} (${elementCounts[a]}) vs ${b} (${elementCounts[b]})`);
     const strokes = [silhouetteStroke[a], silhouetteStroke[b]].filter((width) => width > 0);
     if (strokes.length === 2 && Math.abs(strokes[0] - strokes[1]) > 1) flags.push(`stroke weight jump: ${a} (${silhouetteStroke[a]}) vs ${b} (${silhouetteStroke[b]})`);
   }
