@@ -1,7 +1,17 @@
-import React, { useMemo } from "react";
-import { Animal, CreatureState, AdjustmentsState, AnimalPartType } from "../types";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Animal, CreatureState, AdjustmentsState, AnimalPartType, PartAdjustment } from "../types";
 import { parseSvgToReact } from "../utils/svgParser";
 import { motion } from "motion/react";
+import { toSvgTransform, type GizmoBounds, type Point } from "../editor/transform";
+import {
+  adjustmentToTransform,
+  rectToStageBounds,
+  splitPartTransform,
+  transformToAdjustment,
+} from "../editor/partAdjustment";
+import { createGizmoDragHandler } from "../editor/useGizmo";
+import { GizmoOverlay } from "./GizmoOverlay";
+import { PartPreview } from "./PartPreview";
 
 interface CreaturePreviewProps {
   creatureState: CreatureState;
@@ -23,6 +33,10 @@ interface CreaturePreviewProps {
   isAnimating?: boolean;
   animationType?: string;
   animationSpeed?: number;
+  /** Live edit from the on-canvas gizmo. Omit to render the canvas read-only. */
+  onAdjustPart?: (part: AnimalPartType, adjustment: PartAdjustment) => void;
+  /** Corner handles stretch one axis at a time instead of scaling proportionally. */
+  nonUniformScale?: boolean;
 }
 
 export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
@@ -39,6 +53,8 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
   isAnimating = true,
   animationType = "breathing",
   animationSpeed = 1,
+  onAdjustPart,
+  nonUniformScale = false,
 }) => {
   // Find the source animal for each part
   const headAnimal = useMemo(() => animals.find(a => a.id === creatureState.head) || animals[0], [animals, creatureState.head]);
@@ -124,6 +140,91 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
     x: backLegsTarget.x - backLegsLocalBody.x + backLegsAdjust.offsetX,
     y: backLegsTarget.y - backLegsLocalBody.y + backLegsAdjust.offsetY
   };
+
+  const bodyJoint = { x: bodyTranslate.x + bodyCenter.x, y: bodyTranslate.y + bodyCenter.y };
+
+  /**
+   * Placement (translate + rotate) and sizing (scale + flip) as separate attribute strings,
+   * so the idle-animation group can keep sitting between them.
+   */
+  const partTransforms = {
+    head: splitPartTransform(headAdjust, neckTarget),
+    body: splitPartTransform(bodyAdjust, bodyJoint),
+    frontLegs: splitPartTransform(frontLegsAdjust, frontLegsTarget),
+    backLegs: splitPartTransform(backLegsAdjust, backLegsTarget),
+    tail: splitPartTransform(tailAdjust, tailTarget),
+  };
+
+  const sizingTransform = (part: AnimalPartType, local: { x: number; y: number }) =>
+    [toSvgTransform(partTransforms[part].sizing), `translate(${-local.x}, ${-local.y})`]
+      .filter(Boolean)
+      .join(" ");
+
+  // --- On-canvas gizmo -----------------------------------------------------------------
+  // Chrome renders into a sibling overlay <svg>, never into #full-creature-svg, because the
+  // export pipeline in App.tsx serialises that element's outerHTML — anything drawn inside
+  // it would land in the user's downloaded file.
+  const stageRef = useRef<SVGSVGElement | null>(null);
+  const overlayRef = useRef<SVGSVGElement | null>(null);
+  const [gizmoBounds, setGizmoBounds] = useState<GizmoBounds | null>(null);
+
+  /** Joint each part pivots and scales about, in stage coordinates. */
+  const jointFor = useCallback(
+    (part: AnimalPartType): Point =>
+      part === "head" ? neckTarget
+      : part === "tail" ? tailTarget
+      : part === "frontLegs" ? frontLegsTarget
+      : part === "backLegs" ? backLegsTarget
+      : bodyJoint,
+    [neckTarget, tailTarget, frontLegsTarget, backLegsTarget, bodyJoint.x, bodyJoint.y],
+  );
+
+  const toStage = useCallback((clientX: number, clientY: number): Point => {
+    const stage = stageRef.current;
+    const matrix = stage?.getScreenCTM();
+    if (!stage || !matrix) return { x: clientX, y: clientY };
+    const point = stage.createSVGPoint();
+    point.x = clientX;
+    point.y = clientY;
+    const local = point.matrixTransform(matrix.inverse());
+    return { x: local.x, y: local.y };
+  }, []);
+
+  // Measure after paint: the box has to reflect the transform React just committed.
+  useEffect(() => {
+    if (!activePart || !onAdjustPart) {
+      setGizmoBounds(null);
+      return;
+    }
+    // Measured synchronously rather than inside requestAnimationFrame: rAF never fires in a
+    // hidden tab, so a canvas opened in a background tab would come forward with no gizmo.
+    // Effects run after commit, and getBoundingClientRect flushes pending layout, so the
+    // rect is already accurate here.
+    const group = stageRef.current?.querySelector(`[data-editor-part="${activePart}"]`);
+    setGizmoBounds(group ? rectToStageBounds(group.getBoundingClientRect(), toStage) : null);
+  }, [activePart, adjustments, creatureState, onAdjustPart, toStage]);
+
+  const handleGizmoPointer = createGizmoDragHandler({
+    stageRef: overlayRef,
+    proportional: !nonUniformScale,
+    // Parts stay welded to their joint, so scaling pins the joint rather than the handle's
+    // opposite corner the way free-floating layers do.
+    anchorPivot: activePart ? jointFor(activePart) : null,
+    resolveTarget: () => {
+      if (!activePart || !gizmoBounds || !overlayRef.current) return null;
+      return {
+        group: overlayRef.current,
+        bounds: gizmoBounds,
+        transform: adjustmentToTransform(adjustments[activePart], jointFor(activePart)),
+      };
+    },
+    onPreview: (next) => {
+      if (!activePart) return;
+      onAdjustPart?.(activePart, transformToAdjustment(next, adjustments[activePart]));
+    },
+    // Preview already wrote through to App state; nothing further to settle on release.
+    onCommit: () => {},
+  });
 
   // Sub-shape specific adjustments
   const shapeAdjustments = adjustments.shapeAdjustments;
@@ -299,6 +400,7 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
 
         {/* The SVG Container */}
         <svg
+          ref={stageRef}
           id="full-creature-svg"
           viewBox="0 0 600 500"
           className="w-full h-full"
@@ -321,37 +423,24 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Tail group placement */}
-            <g transform={`translate(${tailTarget.x + tailAdjust.offsetX}, ${tailTarget.y + tailAdjust.offsetY})`}>
+            <g data-editor-part="tail" transform={toSvgTransform(partTransforms.tail.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.tail : { rotate: 0, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${tailAdjust.scale}) translate(${-tailLocalBody.x}, ${-tailLocalBody.y})`}>
-                  {parseSvgToReact(
-                    tailPart.rawContent,
-                    { color: tailColor, accentColor: tailAnimal.accentColor },
-                    tailAnimal.color,
-                    tailAnimal.accentColor,
-                    tailShapeTransforms,
-                    tailHighlight
-                  )}
+                <g transform={sizingTransform("tail", tailLocalBody)}>
+                  <PartPreview
+                    svg={tailPart.rawContent}
+                    color={tailColor}
+                    accentColor={tailAnimal.accentColor}
+                    originalColor={tailAnimal.color}
+                    originalAccentColor={tailAnimal.accentColor}
+                    shapeTransforms={tailShapeTransforms}
+                    highlightId={tailHighlight}
+                  />
                 </g>
               </motion.g>
             </g>
-            {/* Selected Outline */}
-            {activePart === "tail" && (
-              <rect
-                x={tailTranslate.x - 5}
-                y={tailTranslate.y - 5}
-                width={80 * tailAdjust.scale}
-                height={80 * tailAdjust.scale}
-                fill="none"
-                stroke="#f59e0b"
-                strokeWidth="1.5"
-                strokeDasharray="4,4"
-                className="animate-[spin_40s_linear_infinite]"
-              />
-            )}
           </g>
 
           {/* BACK LEGS LAYER (Renders behind body for 3D depth) */}
@@ -363,36 +452,24 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Back Legs placement */}
-            <g transform={`translate(${backLegsTarget.x + backLegsAdjust.offsetX}, ${backLegsTarget.y + backLegsAdjust.offsetY})`}>
+            <g data-editor-part="backLegs" transform={toSvgTransform(partTransforms.backLegs.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.backLegs : { scaleY: 1, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${backLegsAdjust.scale}) translate(${-backLegsLocalBody.x}, ${-backLegsLocalBody.y})`}>
-                  {parseSvgToReact(
-                    backLegsPart.rawContent,
-                    { color: backLegsColor, accentColor: backLegsAnimal.accentColor },
-                    backLegsAnimal.color,
-                    backLegsAnimal.accentColor,
-                    backLegsShapeTransforms,
-                    backLegsHighlight
-                  )}
+                <g transform={sizingTransform("backLegs", backLegsLocalBody)}>
+                  <PartPreview
+                    svg={backLegsPart.rawContent}
+                    color={backLegsColor}
+                    accentColor={backLegsAnimal.accentColor}
+                    originalColor={backLegsAnimal.color}
+                    originalAccentColor={backLegsAnimal.accentColor}
+                    shapeTransforms={backLegsShapeTransforms}
+                    highlightId={backLegsHighlight}
+                  />
                 </g>
               </motion.g>
             </g>
-            {/* Selected Outline */}
-            {activePart === "backLegs" && (
-              <rect
-                x={backLegsTranslate.x - 5}
-                y={backLegsTranslate.y - 5}
-                width={120 * backLegsAdjust.scale}
-                height={160 * backLegsAdjust.scale}
-                fill="none"
-                stroke="#f59e0b"
-                strokeWidth="1.5"
-                strokeDasharray="4,4"
-              />
-            )}
           </g>
 
           {/* BODY LAYER */}
@@ -404,36 +481,24 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Body placement */}
-            <g transform={`translate(${bodyTranslate.x + bodyAdjust.offsetX + bodyCenter.x}, ${bodyTranslate.y + bodyAdjust.offsetY + bodyCenter.y})`}>
+            <g data-editor-part="body" transform={toSvgTransform(partTransforms.body.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.body : { scaleY: 1, scaleX: 1, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${bScale}) translate(${-bodyCenter.x}, ${-bodyCenter.y})`}>
-                  {parseSvgToReact(
-                    bodyPart.rawContent,
-                    { color: bodyColor, accentColor: bodyAnimal.accentColor },
-                    bodyAnimal.color,
-                    bodyAnimal.accentColor,
-                    bodyShapeTransforms,
-                    bodyHighlight
-                  )}
+                <g transform={sizingTransform("body", bodyCenter)}>
+                  <PartPreview
+                    svg={bodyPart.rawContent}
+                    color={bodyColor}
+                    accentColor={bodyAnimal.accentColor}
+                    originalColor={bodyAnimal.color}
+                    originalAccentColor={bodyAnimal.accentColor}
+                    shapeTransforms={bodyShapeTransforms}
+                    highlightId={bodyHighlight}
+                  />
                 </g>
               </motion.g>
             </g>
-            {/* Selected Outline */}
-            {activePart === "body" && (
-              <rect
-                x={bodyTranslate.x + bodyAdjust.offsetX - 5}
-                y={bodyTranslate.y + bodyAdjust.offsetY - 5}
-                width={300 * bScale}
-                height={220 * bScale}
-                fill="none"
-                stroke="#f59e0b"
-                strokeWidth="1.5"
-                strokeDasharray="4,4"
-              />
-            )}
           </g>
 
           {/* FRONT LEGS LAYER (Renders in front of body) */}
@@ -445,36 +510,24 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Front Legs placement */}
-            <g transform={`translate(${frontLegsTarget.x + frontLegsAdjust.offsetX}, ${frontLegsTarget.y + frontLegsAdjust.offsetY})`}>
+            <g data-editor-part="frontLegs" transform={toSvgTransform(partTransforms.frontLegs.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.frontLegs : { scaleY: 1, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${frontLegsAdjust.scale}) translate(${-frontLegsLocalBody.x}, ${-frontLegsLocalBody.y})`}>
-                  {parseSvgToReact(
-                    frontLegsPart.rawContent,
-                    { color: frontLegsColor, accentColor: frontLegsAnimal.accentColor },
-                    frontLegsAnimal.color,
-                    frontLegsAnimal.accentColor,
-                    frontLegsShapeTransforms,
-                    frontLegsHighlight
-                  )}
+                <g transform={sizingTransform("frontLegs", frontLegsLocalBody)}>
+                  <PartPreview
+                    svg={frontLegsPart.rawContent}
+                    color={frontLegsColor}
+                    accentColor={frontLegsAnimal.accentColor}
+                    originalColor={frontLegsAnimal.color}
+                    originalAccentColor={frontLegsAnimal.accentColor}
+                    shapeTransforms={frontLegsShapeTransforms}
+                    highlightId={frontLegsHighlight}
+                  />
                 </g>
               </motion.g>
             </g>
-            {/* Selected Outline */}
-            {activePart === "frontLegs" && (
-              <rect
-                x={frontLegsTranslate.x - 5}
-                y={frontLegsTranslate.y - 5}
-                width={120 * frontLegsAdjust.scale}
-                height={160 * frontLegsAdjust.scale}
-                fill="none"
-                stroke="#f59e0b"
-                strokeWidth="1.5"
-                strokeDasharray="4,4"
-              />
-            )}
           </g>
 
           {/* HEAD LAYER (In front of body and legs) */}
@@ -486,36 +539,24 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Head placement */}
-            <g transform={`translate(${neckTarget.x + headAdjust.offsetX}, ${neckTarget.y + headAdjust.offsetY})`}>
+            <g data-editor-part="head" transform={toSvgTransform(partTransforms.head.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.head : { rotate: 0, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
-                <g transform={`scale(${headAdjust.scale}) translate(${-headLocalNeck.x}, ${-headLocalNeck.y})`}>
-                  {parseSvgToReact(
-                    headPart.rawContent,
-                    { color: headColor, accentColor: headAnimal.accentColor },
-                    headAnimal.color,
-                    headAnimal.accentColor,
-                    headShapeTransforms,
-                    headHighlight
-                  )}
+                <g transform={sizingTransform("head", headLocalNeck)}>
+                  <PartPreview
+                    svg={headPart.rawContent}
+                    color={headColor}
+                    accentColor={headAnimal.accentColor}
+                    originalColor={headAnimal.color}
+                    originalAccentColor={headAnimal.accentColor}
+                    shapeTransforms={headShapeTransforms}
+                    highlightId={headHighlight}
+                  />
                 </g>
               </motion.g>
             </g>
-            {/* Selected Outline */}
-            {activePart === "head" && (
-              <rect
-                x={headTranslate.x - 5}
-                y={headTranslate.y - 5}
-                width={130 * headAdjust.scale}
-                height={130 * headAdjust.scale}
-                fill="none"
-                stroke="#f59e0b"
-                strokeWidth="1.5"
-                strokeDasharray="4,4"
-              />
-            )}
           </g>
 
           {/* SKELETON LAYER (Bone connection guide lines) */}
@@ -603,6 +644,22 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             </g>
           )}
         </svg>
+
+        {/* Gizmo overlay — a separate <svg> sharing the stage viewBox. Kept out of
+            #full-creature-svg so handle markup can never reach the exported file. */}
+        {onAdjustPart && gizmoBounds && activePart && (
+          <svg
+            ref={overlayRef}
+            viewBox="0 0 600 500"
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ touchAction: "none" }}
+            aria-hidden="true"
+          >
+            <g className="pointer-events-auto">
+              <GizmoOverlay bounds={gizmoBounds} onPointerAction={handleGizmoPointer} />
+            </g>
+          </svg>
+        )}
 
         {/* Hover/Tap Hint Overlay */}
         <div className="absolute top-3 left-[50%] translate-x-[-50%] bg-zinc-900/80 backdrop-blur-md px-3 py-1 rounded-full border border-zinc-800 text-[10px] text-zinc-400 select-none pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-center gap-1.5 font-mono">

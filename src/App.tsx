@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { ANIMALS } from "./animalsData";
-import { CreatureState, AdjustmentsState, AnimalPartType, Animal } from "./types";
+import { CreatureState, AdjustmentsState, AnimalPartType, Animal, PartAdjustment } from "./types";
 import { CreaturePreview } from "./components/CreaturePreview";
 import { IsolatedPartPreview } from "./components/IsolatedPartPreview";
 import { AdjustmentControls } from "./components/AdjustmentControls";
 import { SvgCodeViewer } from "./components/SvgCodeViewer";
+import { sanitizeForSave } from "./editor/sanitize";
 import { AnimalLibrary } from "./components/AnimalLibrary";
 import { PartSelector } from "./components/PartSelector";
 import { parseSvgToReact } from "./utils/svgParser";
@@ -210,6 +211,7 @@ export default function App() {
   const [adjustments, setAdjustments] = useState<AdjustmentsState>(INITIAL_ADJUSTMENTS);
   const [activePart, setActivePart] = useState<AnimalPartType | null>("head");
   const [activeShapeIndex, setActiveShapeIndex] = useState<number | null>(null);
+  const [nonUniformScale, setNonUniformScale] = useState(false);
   const [isAnimating, setIsAnimating] = useState<boolean>(true);
   const [animationType, setAnimationType] = useState<string>("breathing");
   const [animationSpeed, setAnimationSpeed] = useState<number>(1);
@@ -315,7 +317,7 @@ export default function App() {
       // 1. Get full creature SVG
       const fullEl = document.getElementById("full-creature-svg");
       if (fullEl) {
-        let rawHtml = fullEl.outerHTML;
+        let rawHtml = sanitizeForSave(fullEl.outerHTML);
         // Ensure standard namespace resides inside output
         if (!rawHtml.includes("xmlns=")) {
           rawHtml = rawHtml.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
@@ -326,7 +328,7 @@ export default function App() {
       // 2. Get isolated part SVG
       const isoEl = document.getElementById("isolated-part-svg");
       if (isoEl) {
-        let rawHtml = isoEl.outerHTML;
+        let rawHtml = sanitizeForSave(isoEl.outerHTML);
         if (!rawHtml.includes("xmlns=")) {
           rawHtml = rawHtml.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
         }
@@ -406,11 +408,20 @@ export default function App() {
     setActiveShapeIndex(null);
   };
 
-  const handleActiveAdjustmentChange = (newAdj: typeof INITIAL_ADJUSTMENT) => {
+  const handleActiveAdjustmentChange = (newAdj: PartAdjustment) => {
     if (!activePart) return;
+    handlePartAdjustmentChange(activePart, newAdj);
+  };
+
+  /**
+   * Single write path for a part's transform. The sidebar sliders and the on-canvas gizmo
+   * both land here, which is what keeps them in sync — they share one source of truth
+   * rather than mirroring events at each other.
+   */
+  const handlePartAdjustmentChange = (part: AnimalPartType, newAdj: PartAdjustment) => {
     setAdjustments((prev) => ({
       ...prev,
-      [activePart]: newAdj,
+      [part]: newAdj,
     }));
   };
 
@@ -634,6 +645,8 @@ export default function App() {
               isAnimating={isAnimating}
               animationType={animationType}
               animationSpeed={animationSpeed}
+              onAdjustPart={handlePartAdjustmentChange}
+              nonUniformScale={nonUniformScale}
             />
 
             {/* Anim/Life Engine Controller Panel */}
@@ -755,6 +768,8 @@ export default function App() {
             onChange={handleActiveAdjustmentChange}
             onResetActive={handleResetActiveAdjustment}
             onResetAll={handleResetAllAdjustments}
+            nonUniformScale={nonUniformScale}
+            onNonUniformScaleChange={setNonUniformScale}
           />
         </div>
 

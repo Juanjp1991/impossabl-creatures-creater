@@ -1,6 +1,7 @@
 import React from "react";
 import { PartAdjustment, AnimalPartType } from "../types";
-import { Move, Maximize2, RotateCcw } from "lucide-react";
+import { Move, Maximize2, RotateCcw, RotateCw, FlipHorizontal, FlipVertical } from "lucide-react";
+import { flipTransform } from "../editor/transform";
 
 interface AdjustmentControlsProps {
   activePart: AnimalPartType | null;
@@ -8,6 +9,9 @@ interface AdjustmentControlsProps {
   onChange: (adjustment: PartAdjustment) => void;
   onResetActive: () => void;
   onResetAll: () => void;
+  /** Corner handles stretch each axis independently instead of scaling proportionally. */
+  nonUniformScale: boolean;
+  onNonUniformScaleChange: (value: boolean) => void;
 }
 
 export const AdjustmentControls: React.FC<AdjustmentControlsProps> = ({
@@ -16,6 +20,8 @@ export const AdjustmentControls: React.FC<AdjustmentControlsProps> = ({
   onChange,
   onResetActive,
   onResetAll,
+  nonUniformScale,
+  onNonUniformScaleChange,
 }) => {
   if (!activePart) {
     return (
@@ -32,6 +38,42 @@ export const AdjustmentControls: React.FC<AdjustmentControlsProps> = ({
       [key]: value,
     });
   };
+
+  // Reuse the gizmo's flip so a sidebar flip and an on-canvas flip are the same operation.
+  const handleFlip = (axis: "x" | "y") => {
+    const flipped = flipTransform(
+      { translateX: 0, translateY: 0, rotate: 0, scale: 1, flipX: adjustment.flipX, flipY: adjustment.flipY },
+      axis,
+    );
+    const next: PartAdjustment = { ...adjustment };
+    if (flipped.flipX) next.flipX = true; else delete next.flipX;
+    if (flipped.flipY) next.flipY = true; else delete next.flipY;
+    onChange(next);
+  };
+
+  const scaleX = adjustment.scaleX ?? adjustment.scale;
+  const scaleY = adjustment.scaleY ?? adjustment.scale;
+
+  const setAxisScale = (axis: "x" | "y", value: number) => {
+    onChange({
+      ...adjustment,
+      scaleX: axis === "x" ? value : scaleX,
+      scaleY: axis === "y" ? value : scaleY,
+    });
+  };
+
+  // Leaving stretch mode collapses back onto the uniform scale the layout maths reads.
+  const handleUniformToggle = (value: boolean) => {
+    onNonUniformScaleChange(value);
+    if (value) return;
+    const next: PartAdjustment = { ...adjustment, scale: (scaleX + scaleY) / 2 };
+    delete next.scaleX;
+    delete next.scaleY;
+    onChange(next);
+  };
+
+  const sliderClass =
+    "w-full h-1 bg-zinc-950 rounded-lg appearance-none cursor-pointer accent-amber-500";
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-sm">
@@ -57,29 +99,114 @@ export const AdjustmentControls: React.FC<AdjustmentControlsProps> = ({
       </div>
 
       <div className="flex flex-col gap-5">
-        {/* Scale Slider */}
+        {/* Mirror + stretch mode */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => handleFlip("x")}
+              title="Mirror horizontally (turns a left limb into a right one)"
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-mono transition-colors ${
+                adjustment.flipX ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              <FlipHorizontal size={11} /> Flip H
+            </button>
+            <button
+              onClick={() => handleFlip("y")}
+              title="Mirror vertically"
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-mono transition-colors ${
+                adjustment.flipY ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              <FlipVertical size={11} /> Flip V
+            </button>
+          </div>
+          <label className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={nonUniformScale}
+              onChange={(e) => handleUniformToggle(e.target.checked)}
+              className="accent-amber-500"
+            />
+            Stretch
+          </label>
+        </div>
+
+        {/* Scale — one uniform slider, or one per axis in stretch mode */}
+        {nonUniformScale ? (
+          <div className="flex flex-col gap-4">
+            {(["x", "y"] as const).map((axis) => (
+              <div key={axis} className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1.5">
+                    <Maximize2 size={11} className="text-zinc-500" /> Stretch {axis.toUpperCase()}
+                  </span>
+                  <span className="text-xs font-mono text-amber-500 font-bold bg-zinc-950 px-2 py-0.5 rounded">
+                    {(axis === "x" ? scaleX : scaleY).toFixed(2)}x
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="2.0"
+                  step="0.05"
+                  value={axis === "x" ? scaleX : scaleY}
+                  onChange={(e) => setAxisScale(axis, parseFloat(e.target.value))}
+                  className={sliderClass}
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1.5">
+                <Maximize2 size={11} className="text-zinc-500" /> Scale Size
+              </span>
+              <span className="text-xs font-mono text-amber-500 font-bold bg-zinc-950 px-2 py-0.5 rounded">
+                {adjustment.scale.toFixed(2)}x
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0.5"
+              max="2.0"
+              step="0.05"
+              value={adjustment.scale}
+              onChange={(e) => handleSliderChange("scale", parseFloat(e.target.value))}
+              className={sliderClass}
+            />
+            <div className="flex items-center justify-between text-[9px] font-mono text-zinc-600">
+              <span>0.5x (Mini)</span>
+              <span>1.0x (Original)</span>
+              <span>2.0x (Giant)</span>
+            </div>
+          </div>
+        )}
+
+        {/* Rotation — about the part's own joint, so a head swings on its neck */}
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1.5">
-              <Maximize2 size={11} className="text-zinc-500" /> Scale Size
+              <RotateCw size={11} className="text-zinc-500" /> Rotation
             </span>
             <span className="text-xs font-mono text-amber-500 font-bold bg-zinc-950 px-2 py-0.5 rounded">
-              {adjustment.scale.toFixed(2)}x
+              {Math.round(adjustment.rotation ?? 0)}&deg;
             </span>
           </div>
           <input
             type="range"
-            min="0.5"
-            max="2.0"
-            step="0.05"
-            value={adjustment.scale}
-            onChange={(e) => handleSliderChange("scale", parseFloat(e.target.value))}
-            className="w-full h-1 bg-zinc-950 rounded-lg appearance-none cursor-pointer accent-amber-500"
+            min="-180"
+            max="180"
+            step="1"
+            value={adjustment.rotation ?? 0}
+            onChange={(e) => handleSliderChange("rotation", parseFloat(e.target.value))}
+            className={sliderClass}
           />
           <div className="flex items-center justify-between text-[9px] font-mono text-zinc-600">
-            <span>0.5x (Mini)</span>
-            <span>1.0x (Original)</span>
-            <span>2.0x (Giant)</span>
+            <span>-180&deg;</span>
+            <span>0&deg; (Neutral)</span>
+            <span>+180&deg;</span>
           </div>
         </div>
 

@@ -2,7 +2,7 @@ import type { AnimalPartType } from "../types";
 import type { AnimalDraft, ValidationIssue } from "./contracts";
 import { mapPoint, readCoordinateNormalization } from "./normalize";
 
-const VIEW = {
+export const VIEW = {
   head: { width: 160, height: 160, anchor: { x: 120, y: 110 } },
   body: { width: 300, height: 220, anchor: null },
   frontLegs: { width: 260, height: 180, anchor: { x: 75, y: 15 } },

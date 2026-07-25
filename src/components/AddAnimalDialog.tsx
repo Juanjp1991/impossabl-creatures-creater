@@ -1,18 +1,43 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2 } from "lucide-react";
-import { Animal } from "../types";
+import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2, FlipHorizontal, FlipVertical, Copy, GitBranch, Spline, Palette, ShieldAlert } from "lucide-react";
+import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
 import { populateGuidedBrief } from "../generation/clientPipeline";
-import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode } from "../generation/contracts";
+import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
 import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
+import { normalizeGeneratedSvgSyntax } from "../generation/normalize";
+import { errorSignature, newErrorsSince } from "../editor/validationGate";
 import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
 import { fetchModels, type ModelOption } from "../generation/apiClient";
 import { ContactSheetSelector } from "./ContactSheetSelector";
 import { SvgLayersPanel } from "./SvgLayersPanel";
 import { RigEditorPanel } from "./RigEditorPanel";
-import { ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
+import { densityAfterDuplication, deleteSvgLayer, duplicateSvgLayer, extendChain, isProtectedLayer, ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
+import { createGizmoDragHandler } from "../editor/useGizmo";
+import { toSvgTransform, type GizmoBounds, type PartTransform } from "../editor/transform";
+
+/**
+ * Mirror and stretch only. Deliberately narrower than `PartTransform`: these values are
+ * spread over the transform built from the sliders, so if the record could also carry
+ * translate/rotate/scale it would silently reset them back to their defaults.
+ */
+type PartExtras = Pick<PartTransform, "flipX" | "flipY" | "scaleX" | "scaleY">;
+import { rectToStageBounds } from "../editor/partAdjustment";
+import { applyMarquee, idsInside, toggleSelection, isMarqueeMeaningful, marqueeFromPoints, unionBounds, type MarqueeCandidate } from "../editor/marquee";
+import { bendPartSvg } from "../editor/deform";
+import { hasBend, type SpinePoint } from "../editor/pathWarp";
+import { PATTERN_KINDS, type PatternKind } from "../editor/patterns";
+import { applyPatternToShape, removePatternFromShape, setShapeToken } from "../editor/patternsDom";
+import { RAMP_TOKENS, resolveRamp, type RampToken } from "../generation/palette";
+import { VIEW } from "../generation/geometry";
+import { sanitizeForSave } from "../editor/sanitize";
+import { GizmoOverlay } from "./GizmoOverlay";
+import { PartPreview } from "./PartPreview";
+import { BendHandles } from "./BendHandles";
+import { AnchorHandles } from "./AnchorHandles";
+import { resolveAnchorDrag, type AnchorPart } from "../editor/anchors";
 import type { RigDefinition } from "../rig/contracts";
 import { computeForwardKinematics, computeLocalJointMatrices, rigMatrixToSvg } from "../rig/engine";
 
@@ -188,12 +213,63 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     tail: {},
   });
   const [activeShapeIndex, setActiveShapeIndex] = useState<string | null>(null);
+  /**
+   * Every selected shape. `activeShapeIndex` stays the primary one, so the panels that
+   * describe a single layer (rename, pattern, transform readouts) keep working unchanged
+   * while move, duplicate and delete act on the whole set.
+   */
+  const [selection, setSelection] = useState<string[]>([]);
+  const [marquee, setMarquee] = useState<GizmoBounds | null>(null);
   const [svgUndo, setSvgUndo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
   const [svgRedo, setSvgRedo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
-  const [keepLayerAnchorFixed, setKeepLayerAnchorFixed] = useState(true);
+  /**
+   * Off by default: scaling an individual shape about the *part's* attachment anchor is
+   * geometrically valid but a poor default. The anchor is usually far from a small detail,
+   * so scaling about it flings the shape across the canvas, and when the anchor happens to
+   * sit a few units away on one axis the scale factor swings wildly for a tiny drag. A
+   * sub-shape scales about its own bounding box; the anchor mode stays available for the
+   * cases where welding a whole limb layer to the joint is what you want.
+   */
+  const [keepLayerAnchorFixed, setKeepLayerAnchorFixed] = useState(false);
   const [proportionalLayerScaling, setProportionalLayerScaling] = useState(true);
   const previewStageRef = useRef<SVGSVGElement>(null);
   const [selectedLayerBounds, setSelectedLayerBounds] = useState<{ x: number; y: number; width: number; height: number; transform: string } | null>(null);
+  const [draggingAnchor, setDraggingAnchor] = useState<AnchorPart | null>(null);
+  /**
+   * Mirror and per-axis stretch per part. Held as one record rather than four more useState
+   * pairs per part, which would add twenty hooks to a component that already has thirty.
+   */
+  const [partExtras, setPartExtras] = useState<Record<EditablePart, PartExtras>>({
+    head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {},
+  });
+  const [partStretchMode, setPartStretchMode] = useState(false);
+  /**
+   * Live spine bend for the active part. Held apart from the part SVG so the sliders stay
+   * scrubbable — baking on every change would push fifty entries onto the undo stack and
+   * compound rounding. Committed once, on Apply.
+   */
+  const [bend, setBend] = useState<{ points: SpinePoint[]; axis: "x" | "y" }>({
+    points: [{ t: 0, offset: 0 }, { t: 0.5, offset: 0 }, { t: 1, offset: 0 }],
+    axis: "x",
+  });
+  const [bendSelection, setBendSelection] = useState<number | null>(null);
+  const [pattern, setPattern] = useState<{ kind: PatternKind; scale: number; density: number; token: RampToken }>({
+    kind: "spots", scale: 1, density: 0.5, token: "primary-dark",
+  });
+  const [patternNote, setPatternNote] = useState("");
+  /** On-canvas spine handles. Off by default so the stage stays uncluttered. */
+  const [bendMode, setBendMode] = useState(false);
+  const [liveIssues, setLiveIssues] = useState<ValidationIssue[]>([]);
+  const [saveBlocked, setSaveBlocked] = useState<ValidationIssue[]>([]);
+  /**
+   * Error signatures the part already had when the dialog opened.
+   *
+   * The two legacy built-ins fail the modern standard badly — the Grizzly Bear alone opens
+   * with 16 errors from gradients and missing root groups. Blocking on those would make the
+   * editor useless for exactly the parts that most need repairing, so the gate is "your edit
+   * must not make it worse" rather than "the part must be perfect".
+   */
+  const baselineErrors = useRef<Map<string, number>>(new Map());
   const [rigDefinition, setRigDefinition] = useState<RigDefinition | undefined>();
   const [rigPoseRotations, setRigPoseRotations] = useState<Record<string, number>>({});
 
@@ -372,7 +448,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         
         // Reset sub-shape adjustments
         setShapeAdjustments({ head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} });
-        setActiveShapeIndex(null);
+        selectShapes([]);
         setActiveTweakPart("head");
         setErrorMsg("");
       } else {
@@ -405,7 +481,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
         setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
         setShapeAdjustments({ head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} });
-        setActiveShapeIndex(null);
+        selectShapes([]);
         setActiveTweakPart("head");
         setErrorMsg("");
       }
@@ -740,13 +816,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
 
     // Helper to bake the custom transformations into the raw SVG strings via group wraps
-    const wrapWithTransform = (svg: string, tx: number, ty: number, rot: number, scale: number, px: number, py: number) => {
+    // Built through the shared serialiser so mirror and stretch are baked in too. Composing
+    // the string by hand here silently dropped anything not in its fixed parameter list.
+    const wrapWithTransform = (svg: string, part: EditablePart, tx: number, ty: number, rot: number, scale: number, px: number, py: number) => {
       const trimmed = svg.trim();
       if (!trimmed) return "";
-      if (tx === 0 && ty === 0 && rot === 0 && scale === 1) {
-        return trimmed;
-      }
-      const transformAttr = `translate(${tx}, ${ty}) translate(${px}, ${py}) scale(${scale}) translate(${-px}, ${-py}) rotate(${rot}, ${px}, ${py})`;
+      const transformAttr = toSvgTransform({
+        translateX: tx,
+        translateY: ty,
+        rotate: rot,
+        scale,
+        pivotX: px,
+        pivotY: py,
+        ...partExtras[part],
+      });
+      if (!transformAttr) return trimmed;
       return `<g transform="${transformAttr}">${trimmed}</g>`;
     };
 
@@ -818,17 +902,64 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       }
     };
 
-    const bakedHeadSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(headSvg, "head"), shapeAdjustments.head);
-    const bakedBodySvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(bodySvg, "body"), shapeAdjustments.body);
-    const bakedFrontLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(frontLegsSvg, "frontLegs"), shapeAdjustments.frontLegs);
-    const bakedBackLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(backLegsSvg, "backLegs"), shapeAdjustments.backLegs);
-    const bakedTailSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(tailSvg, "tail"), shapeAdjustments.tail);
+    // sanitizeForSave strips the editor's own bookkeeping attributes. They are not in the
+    // validator's ALLOWED_ATTRS, so without this every hand-edited part saves with markup
+    // that raises svg.attribute errors.
+    const bakePart = (svg: string, part: EditablePart) =>
+      sanitizeForSave(applyShapeTransformsToSvg(ensureStableSvgLayerIds(svg, part), shapeAdjustments[part]));
 
-    const finalHeadSvg = wrapWithTransform(bakedHeadSvg, headTx, headTy, headRot, headScale, headPivotX, headPivotY);
-    const finalBodySvg = wrapWithTransform(bakedBodySvg, bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
-    const finalFrontLegsSvg = wrapWithTransform(bakedFrontLegsSvg, frontLegsTx, frontLegsTy, frontLegsRot, frontLegsScale, frontLegsPivotX, frontLegsPivotY);
-    const finalBackLegsSvg = wrapWithTransform(bakedBackLegsSvg, backLegsTx, backLegsTy, backLegsRot, backLegsScale, backLegsPivotX, backLegsPivotY);
-    const finalTailSvg = wrapWithTransform(bakedTailSvg, tailTx, tailTy, tailRot, tailScale, tailPivotX, tailPivotY);
+    const bakedHeadSvg = bakePart(headSvg, "head");
+    const bakedBodySvg = bakePart(bodySvg, "body");
+    const bakedFrontLegsSvg = bakePart(frontLegsSvg, "frontLegs");
+    const bakedBackLegsSvg = bakePart(backLegsSvg, "backLegs");
+    const bakedTailSvg = bakePart(tailSvg, "tail");
+
+    const wrappedHeadSvg = wrapWithTransform(bakedHeadSvg, "head", headTx, headTy, headRot, headScale, headPivotX, headPivotY);
+    const wrappedBodySvg = wrapWithTransform(bakedBodySvg, "body", bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
+    const wrappedFrontLegsSvg = wrapWithTransform(bakedFrontLegsSvg, "frontLegs", frontLegsTx, frontLegsTy, frontLegsRot, frontLegsScale, frontLegsPivotX, frontLegsPivotY);
+    const wrappedBackLegsSvg = wrapWithTransform(bakedBackLegsSvg, "backLegs", backLegsTx, backLegsTy, backLegsRot, backLegsScale, backLegsPivotX, backLegsPivotY);
+    const wrappedTailSvg = wrapWithTransform(bakedTailSvg, "tail", tailTx, tailTy, tailRot, tailScale, tailPivotX, tailPivotY);
+
+    /**
+     * Save through the deterministic layer rather than around it, as
+     * docs/svg-editor-handover.md recommends. normalizeGeneratedSvgSyntax folds any stray
+     * raw hex onto the nearest ramp token, snaps stroke widths to the §5.2 standard and
+     * guarantees the `-root` wrapper — free correctness for hand-edited markup.
+     *
+     * Then validate, and refuse to save on errors. Warnings (density, fill band) pass: they
+     * describe a part that is unusual, not one that is broken.
+     */
+    const editedDraft = currentDraft({
+      headSvg: wrappedHeadSvg, bodySvg: wrappedBodySvg, frontLegsSvg: wrappedFrontLegsSvg,
+      backLegsSvg: wrappedBackLegsSvg, tailSvg: wrappedTailSvg,
+    });
+
+    let normalized = editedDraft;
+    try {
+      normalized = normalizeGeneratedSvgSyntax(editedDraft).animal;
+    } catch {
+      // Normalisation is an improvement pass, never a gate; fall back to the edited draft.
+    }
+
+    let blocking: ValidationIssue[] = [];
+    try {
+      blocking = newErrorsSince(baselineErrors.current, validateAnimalDraft(normalized).issues);
+    } catch {
+      blocking = [];
+    }
+
+    if (blocking.length) {
+      setSaveBlocked(blocking);
+      setErrorMsg(`This edit introduced ${blocking.length} new problem${blocking.length > 1 ? "s" : ""}. Fix ${blocking.length > 1 ? "them" : "it"} or undo before saving.`);
+      return;
+    }
+    setSaveBlocked([]);
+
+    const finalHeadSvg = normalized.headSvg;
+    const finalBodySvg = normalized.bodySvg;
+    const finalFrontLegsSvg = normalized.frontLegsSvg;
+    const finalBackLegsSvg = normalized.backLegsSvg;
+    const finalTailSvg = normalized.tailSvg;
 
     const animalId = editingAnimal && editingAnimal.id.startsWith("custom-")
       ? editingAnimal.id
@@ -1064,119 +1195,428 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   }, [rigDefinition, rigPoseRotations, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
 
   const updateLayer = (operation: (svg: string) => string) => commitActiveSvg(operation(activePartSvgCode));
+
+  /**
+   * Bend is measured against the part's fixed local view rather than a measured bounding
+   * box, so the same slider setting arches any species' torso the same way — which is what
+   * keeps parts interchangeable across species.
+   */
+  const partBounds = (part: EditablePart) => ({
+    x: 0,
+    y: 0,
+    width: VIEW[part as AnimalPartType].width,
+    height: VIEW[part as AnimalPartType].height,
+  });
+
+  /** Preview only; the part SVG itself is untouched until Apply. */
+  const bentActiveSvg = useMemo(
+    () => bendPartSvg(activePartSvgCode, partBounds(activeTweakPart), bend),
+    [activePartSvgCode, activeTweakPart, bend],
+  );
+
+  /**
+   * Palette presets are just a primary/accent pair. They work at all only because parts
+   * paint with ramp tokens rather than literal colours — every token-painted shape re-tints
+   * from these two values.
+   */
+  const PALETTE_PRESETS: Array<{ name: string; primary: string; accent: string }> = [
+    { name: "Fire", primary: "#b23a1b", accent: "#f0a830" },
+    { name: "Aquatic", primary: "#1f6f8b", accent: "#7fd6d1" },
+    { name: "Shadow", primary: "#2f2f38", accent: "#6d5f9c" },
+    { name: "Albino", primary: "#ece7e1", accent: "#d9a7a7" },
+    { name: "Forest", primary: "#3f6b3a", accent: "#c8b273" },
+  ];
+
+  const applyPattern = () => {
+    if (!activeShapeIndex) return;
+    const budget = densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType, 0);
+    const { svg, markCount } = applyPatternToShape(activePartSvgCode, activeShapeIndex, {
+      ...pattern,
+      // Seeded from the host id so re-applying the same settings is reproducible, and two
+      // shapes in one part do not get identical coats.
+      seed: [...activeShapeIndex].reduce((hash, char) => (hash * 31 + char.charCodeAt(0)) | 0, 7),
+      maxMarks: Math.max(4, budget.max - budget.count),
+    });
+    if (!markCount) { setPatternNote("No marks fitted inside that shape — try a smaller scale."); return; }
+    commitActiveSvg(svg);
+    setPatternNote(`${markCount} marks added (${activeTweakPart} band ${budget.min}–${budget.max}).`);
+  };
+
+  const clearPattern = () => {
+    if (!activeShapeIndex) return;
+    commitActiveSvg(removePatternFromShape(activePartSvgCode, activeShapeIndex));
+    setPatternNote("");
+  };
+
+  const paintActiveShape = (token: RampToken, channel: "fill" | "stroke") => {
+    if (!activeShapeIndex) return;
+    commitActiveSvg(setShapeToken(activePartSvgCode, activeShapeIndex, token, channel));
+  };
+
+  /** The draft as it currently stands, for validation. */
+  const currentDraft = (over?: Partial<AnimalDraft>): AnimalDraft => ({
+    name: name || "Untitled",
+    color,
+    accentColor,
+    description: description || name || "Untitled",
+    bodyConnections: {
+      neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY },
+      frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY },
+    },
+    headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg,
+    ...over,
+  });
+
+  /**
+   * Live validation feedback — the gap the handover doc calls out: until now a hand-edited
+   * part was silently degraded rather than loudly broken.
+   *
+   * Debounced and keyed only on the values validation actually reads. `validateAnimalDraft`
+   * rasterises every part to a pixel mask (`analyzeDraftGeometry`) to measure seams, so
+   * running it per render — this dialog re-renders on every keystroke — would stall typing.
+   */
+  /**
+   * Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z (plus Ctrl+Y) drive the same per-part history as the
+   * toolbar buttons. Skipped while a text field has focus, so the browser's own text undo
+   * keeps working where you would expect it.
+   */
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key !== "z" && key !== "y") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      event.preventDefault();
+      if (key === "y" || event.shiftKey) redoSvg();
+      else undoSvg();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isOpen, activeTweakPart, activePartSvgCode, svgUndo, svgRedo]);
+
+  // Delete / Backspace removes the selected shape, unless focus is in a text field — the
+  // dialog is full of inputs and stealing Backspace from them would be maddening.
+  useEffect(() => {
+    if (!isOpen || !activeShapeIndex) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      event.preventDefault();
+      deleteActiveLayer();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isOpen, activeShapeIndex, activePartSvgCode, activeTweakPart]);
+
+  // A new subject means a new baseline; otherwise one animal's debt would excuse another's.
+  useEffect(() => { baselineErrors.current = new Map(); setSaveBlocked([]); }, [isOpen, editingAnimal?.id]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (![headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg].every((svg) => svg.trim())) {
+      setLiveIssues([]);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        const issues = validateAnimalDraft(currentDraft()).issues;
+        setLiveIssues(issues);
+        // The first successful run for this animal establishes what was already wrong.
+        if (!baselineErrors.current.size) baselineErrors.current = errorSignature(issues);
+      } catch {
+        // A half-typed SVG is not yet parseable; the next keystroke will re-run this.
+        setLiveIssues([]);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [isOpen, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg, neckX, neckY, tailX, tailY, frontLegsX, frontLegsY, backLegsX, backLegsY, color, accentColor]);
+
+  const applyBend = () => {
+    if (!hasBend(bend)) return;
+    commitActiveSvg(bentActiveSvg);
+    // Keep the point positions, drop the displacement: the shape is now baked in.
+    setBend((current) => ({ ...current, points: current.points.map((point) => ({ ...point, offset: 0 })) }));
+  };
+
+  const clearBend = () =>
+    setBend((current) => ({ ...current, points: current.points.map((point) => ({ ...point, offset: 0 })) }));
+
+  // A pending bend belongs to the part it was dialled for; carrying it to the next part
+  // would silently deform something the user never looked at.
+  useEffect(() => {
+    setBend((current) => ({ ...current, points: current.points.map((point) => ({ ...point, offset: 0 })) }));
+    setBendSelection(null);
+  }, [activeTweakPart]);
+
+  /** Element count the active part would reach if one more shape were added. */
+  const duplicationDensity = () =>
+    densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType);
+
+  const duplicateActiveLayer = () => {
+    if (!selection.length) return;
+    let svg = activePartSvgCode;
+    const copies: string[] = [];
+    for (const id of selection) {
+      const result = duplicateSvgLayer(svg, id);
+      svg = result.svg;
+      if (result.newId !== id) copies.push(result.newId);
+    }
+    commitActiveSvg(svg);
+    // Select the copies, so the obvious next move — dragging them aside — just works.
+    selectShapes(copies);
+  };
+
+  const extendActiveChain = () => {
+    if (!activeShapeIndex) return;
+    // extendChain needs a measured box; getBBox only works on the live node, so read it here
+    // and hand the numbers to the pure function.
+    const partGroup = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+    const element = partGroup
+      ? [...partGroup.querySelectorAll("[id]")].find((candidate) => candidate.id === activeShapeIndex) as SVGGraphicsElement | undefined
+      : undefined;
+    if (!element || typeof element.getBBox !== "function") return;
+    const box = element.getBBox();
+    const { svg, newId } = extendChain(activePartSvgCode, activeShapeIndex, box);
+    commitActiveSvg(svg);
+    setActiveShapeIndex(newId);
+  };
   const moveLayer = (id: string, direction: LayerMove) => updateLayer((svg) => moveSvgLayer(svg, id, direction));
 
   useEffect(() => {
-    if (!activeShapeIndex || !previewStageRef.current) { setSelectedLayerBounds(null); return; }
-    const frame = requestAnimationFrame(() => {
-      const partGroup = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
-      const element = partGroup ? [...partGroup.querySelectorAll("[id]")].find((candidate) => candidate.id === activeShapeIndex) as SVGGraphicsElement | undefined : undefined;
-      if (!element || typeof element.getBBox !== "function") { setSelectedLayerBounds(null); return; }
-      try {
-        const box = element.getBBox();
-        setSelectedLayerBounds({ x: box.x, y: box.y, width: Math.max(box.width, 1), height: Math.max(box.height, 1), transform: element.getAttribute("transform") || "" });
-      } catch { setSelectedLayerBounds(null); }
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeShapeIndex, activePartSvgCode, activeTweakPart]);
+    if (!selection.length || !previewStageRef.current) { setSelectedLayerBounds(null); return; }
+    const partGroup = previewStageRef.current.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+    if (!partGroup) { setSelectedLayerBounds(null); return; }
+    const boxes = selection
+      .map((id) => [...partGroup.querySelectorAll("[id]")].find((candidate) => candidate.id === id))
+      .flatMap((element) => {
+        const bounds = element ? layerBounds(element as SVGGraphicsElement) : null;
+        return bounds ? [bounds] : [];
+      });
+    const union = unionBounds(boxes);
+    // Bounds already include each shape's own transform, so the overlay needs none of its
+    // own — which is what lets one box wrap several independently-moved shapes.
+    setSelectedLayerBounds(union ? { ...union, transform: "" } : null);
+  }, [selection, activePartSvgCode, activeTweakPart]);
 
-  type PointerAction = "move" | "rotate" | "scale-n" | "scale-ne" | "scale-e" | "scale-se" | "scale-s" | "scale-sw" | "scale-w" | "scale-nw";
+  /**
+   * Single write path for the body sockets, shared by the canvas handles and the number
+   * inputs, so the two can never disagree.
+   *
+   * Canvas drags arrive already resolved by `resolveAnchorDrag`. Typed input is stored raw
+   * and only clamped on blur — clamping each keystroke makes a value like 250 impossible to
+   * type, because the leading "2" snaps to the minimum first.
+   */
+  const handleAnchorChange = (part: AnchorPart, point: { x: number; y: number }) => {
+    if (part === "neck") { setNeckX(point.x); setNeckY(point.y); }
+    else if (part === "tail") { setTailX(point.x); setTailY(point.y); }
+    else if (part === "frontLegs") { setFrontLegsX(point.x); setFrontLegsY(point.y); }
+    else { setBackLegsX(point.x); setBackLegsY(point.y); }
+  };
+
+  const commitAnchor = (part: AnchorPart) => {
+    const current = {
+      neck: { x: neckX, y: neckY },
+      tail: { x: tailX, y: tailY },
+      frontLegs: { x: frontLegsX, y: frontLegsY },
+      backLegs: { x: backLegsX, y: backLegsY },
+    };
+    handleAnchorChange(part, resolveAnchorDrag(part, current[part], current));
+  };
+
   const attachmentPivot = () => activeTweakPart === "head" ? { x: 120, y: 110 }
     : activeTweakPart === "frontLegs" ? { x: 75, y: 15 }
     : activeTweakPart === "backLegs" ? { x: 195, y: 15 }
     : activeTweakPart === "tail" ? { x: 15, y: 15 }
     : { x: neckX, y: neckY };
 
-  const startLayerPointerAction = (action: PointerAction, event: React.PointerEvent<SVGElement>) => {
-    if (!activeShapeIndex || !selectedLayerBounds || !previewStageRef.current) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const part = activeTweakPart;
-    const layerId = activeShapeIndex;
-    const originalSvg = activePartSvgCode;
-    const originalTransform = getSvgLayerTransform(originalSvg, layerId);
-    const partGroup = previewStageRef.current.querySelector(`[data-editor-part="${part}"]`) as SVGGElement | null;
-    const matrix = partGroup?.getScreenCTM();
-    if (!partGroup || !matrix) return;
-    const toLocal = (clientX: number, clientY: number) => {
-      const point = previewStageRef.current!.createSVGPoint();
-      point.x = clientX; point.y = clientY;
-      return point.matrixTransform(matrix.inverse());
-    };
-    const start = toLocal(event.clientX, event.clientY);
-    const bounds = selectedLayerBounds;
-    const startScaleX = originalTransform.scaleX ?? originalTransform.scale ?? 1;
-    const startScaleY = originalTransform.scaleY ?? originalTransform.scale ?? 1;
-    const fixed = attachmentPivot();
-    const oppositePivot = {
-      x: action.includes("w") ? bounds.x + bounds.width : action.includes("e") ? bounds.x : bounds.x + bounds.width / 2,
-      y: action.includes("n") ? bounds.y + bounds.height : action.includes("s") ? bounds.y : bounds.y + bounds.height / 2,
-    };
-    const pivot = keepLayerAnchorFixed && action.startsWith("scale") ? fixed : {
-      x: originalTransform.pivotX ?? oppositePivot.x,
-      y: originalTransform.pivotY ?? oppositePivot.y,
-    };
-    const startAngle = Math.atan2(start.y - pivot.y, start.x - pivot.x);
-    let latestSvg = originalSvg;
+  /**
+   * Double-click a shape on the canvas to select that shape alone.
+   *
+   * Single click still picks the whole part; the second click drills in, which is the
+   * convention every vector editor uses for entering a group.
+   *
+   * Hit-testing goes through elementsFromPoint rather than the event target because the
+   * selection box and anchor handles sit above the artwork and would otherwise swallow
+   * every click. Walking the stack lets the first non-chrome shape underneath win.
+   */
+  const handleStageDoubleClick = (event: React.MouseEvent<SVGSVGElement>) => {
+    const stack = document.elementsFromPoint(event.clientX, event.clientY);
+    for (const element of stack) {
+      if (element.closest("[data-editor-chrome]")) continue;
+      const partGroup = element.closest("[data-editor-part]");
+      if (!partGroup || !previewStageRef.current?.contains(partGroup)) continue;
+      const shape = element.closest("[id]");
+      if (!shape || !partGroup.contains(shape)) continue;
+      // Depth groups are suffixed (frontLegs-far); the editor works on the base part.
+      const part = (partGroup.getAttribute("data-editor-part") ?? "").split("-")[0] as EditablePart;
+      if (part) setActiveTweakPart(part);
+      selectShapes(event.shiftKey ? toggleSelection(selection, shape.id) : [shape.id]);
+      return;
+    }
+  };
+
+  const deleteActiveLayer = () => {
+    const removable = selection.filter((id) => !isProtectedLayer(id));
+    if (!removable.length) return;
+    commitActiveSvg(removable.reduce((svg, id) => deleteSvgLayer(svg, id), activePartSvgCode));
+    selectShapes([]);
+  };
+
+  /** Single write path for selection, so the primary id and the set never disagree. */
+  const selectShapes = (ids: string[]) => {
+    setSelection(ids);
+    setActiveShapeIndex(ids[0] ?? null);
+  };
+
+  /**
+   * A layer's bounds in the part's coordinate space.
+   *
+   * `getBBox` ignores the element's own transform, so an already-moved shape would report a
+   * stale box. Folding its matrix in keeps every selected shape comparable, which is what
+   * lets several of them share one gizmo.
+   */
+  const layerBounds = (element: SVGGraphicsElement): GizmoBounds | null => {
+    if (typeof element.getBBox !== "function") return null;
+    try {
+      const box = element.getBBox();
+      const matrix = element.transform?.baseVal?.consolidate()?.matrix;
+      if (!matrix) return { x: box.x, y: box.y, width: Math.max(box.width, 1), height: Math.max(box.height, 1) };
+      const corners = [
+        { x: box.x, y: box.y },
+        { x: box.x + box.width, y: box.y },
+        { x: box.x, y: box.y + box.height },
+        { x: box.x + box.width, y: box.y + box.height },
+      ].map((point) => ({
+        x: matrix.a * point.x + matrix.c * point.y + matrix.e,
+        y: matrix.b * point.x + matrix.d * point.y + matrix.f,
+      }));
+      const xs = corners.map((c) => c.x);
+      const ys = corners.map((c) => c.y);
+      return {
+        x: Math.min(...xs), y: Math.min(...ys),
+        width: Math.max(Math.max(...xs) - Math.min(...xs), 1),
+        height: Math.max(Math.max(...ys) - Math.min(...ys), 1),
+      };
+    } catch { return null; }
+  };
+
+  /** Every selectable shape in the active part, with its bounds and lock state. */
+  const marqueeCandidates = (): MarqueeCandidate[] => {
+    const group = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+    if (!group) return [];
+    return [...group.querySelectorAll("[id]")].flatMap((element) => {
+      const bounds = layerBounds(element as SVGGraphicsElement);
+      if (!bounds || !element.id) return [];
+      return [{ id: element.id, bounds, locked: element.getAttribute("data-locked") === "true" }];
+    });
+  };
+
+  /** Local-space point for the part currently being edited. */
+  const partPoint = (clientX: number, clientY: number) => {
+    const group = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`) as SVGGraphicsElement | null;
+    const matrix = group?.getScreenCTM();
+    if (!group || !matrix || !previewStageRef.current) return { x: clientX, y: clientY };
+    const point = previewStageRef.current.createSVGPoint();
+    point.x = clientX; point.y = clientY;
+    const local = point.matrixTransform(matrix.inverse());
+    return { x: local.x, y: local.y };
+  };
+
+  /**
+   * Rubber-band selection.
+   *
+   * Starts anywhere except on gizmo chrome — handles, anchors and spine points own their own
+   * drags. Artwork is fair game: parts cover most of the canvas, so requiring empty space
+   * would make the gesture almost impossible to start, and dragging a shape does nothing
+   * else today. Selecting a single shape is what double-click is for.
+   */
+  const startMarquee = (event: React.PointerEvent<SVGSVGElement>) => {
+    const target = event.target as Element;
+    if (target.closest("[data-editor-chrome]")) return;
+    const origin = partPoint(event.clientX, event.clientY);
+    const subtract = event.shiftKey;
+    const before = selection;
 
     const move = (pointer: PointerEvent) => {
-      const current = toLocal(pointer.clientX, pointer.clientY);
-      const dx = current.x - start.x;
-      const dy = current.y - start.y;
-      let next: ShapeTransform = { ...originalTransform };
-      if (action === "move") {
-        next = { ...next, translateX: (originalTransform.translateX || 0) + dx, translateY: (originalTransform.translateY || 0) + dy };
-      } else if (action === "rotate") {
-        const angle = Math.atan2(current.y - pivot.y, current.x - pivot.x);
-        next = { ...next, rotate: (originalTransform.rotate || 0) + (angle - startAngle) * 180 / Math.PI, pivotX: pivot.x, pivotY: pivot.y };
-      } else {
-        let factorX = action.includes("e") ? 1 + dx / bounds.width : action.includes("w") ? 1 - dx / bounds.width : 1;
-        let factorY = action.includes("s") ? 1 + dy / bounds.height : action.includes("n") ? 1 - dy / bounds.height : 1;
-        factorX = Math.max(.1, factorX); factorY = Math.max(.1, factorY);
-        if (proportionalLayerScaling) {
-          const factors = [action.includes("e") || action.includes("w") ? factorX : undefined, action.includes("n") || action.includes("s") ? factorY : undefined].filter((value): value is number => value !== undefined);
-          const factor = factors.reduce((sum, value) => sum + value, 0) / factors.length;
-          factorX = factorY = factor;
-        }
-        next = { ...next, scale: 1, scaleX: startScaleX * factorX, scaleY: startScaleY * factorY, pivotX: pivot.x, pivotY: pivot.y };
-      }
-      latestSvg = setSvgLayerTransform(originalSvg, layerId, next);
-      setPartSvg(part, latestSvg);
+      setMarquee(marqueeFromPoints(origin, partPoint(pointer.clientX, pointer.clientY)));
     };
-    const finish = () => {
+    const finish = (pointer: PointerEvent) => {
       window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", finish);
-      if (latestSvg !== originalSvg) {
-        setSvgUndo((history) => ({ ...history, [part]: [...history[part].slice(-49), originalSvg] }));
-        setSvgRedo((history) => ({ ...history, [part]: [] }));
-      }
+      setMarquee(null);
+      const box = marqueeFromPoints(origin, partPoint(pointer.clientX, pointer.clientY));
+      // A click that drifted a pixel clears the selection rather than boxing nothing.
+      if (!isMarqueeMeaningful(box)) { if (!subtract) selectShapes([]); return; }
+      selectShapes(applyMarquee(before, idsInside(box, marqueeCandidates()), subtract ? "subtract" : "replace"));
     };
+
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", finish, { once: true });
+    window.addEventListener("pointercancel", finish, { once: true });
   };
+
+  /** Live DOM nodes for every selected shape, for direct writes during a drag. */
+  const liveSelectedElements = (): SVGGraphicsElement[] => {
+    if (!selection.length || !previewStageRef.current) return [];
+    const group = previewStageRef.current.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+    if (!group) return [];
+    const byId = new Map([...group.querySelectorAll("[id]")].map((element) => [element.id, element as SVGGraphicsElement]));
+    return selection.flatMap((id) => { const element = byId.get(id); return element ? [element] : []; });
+  };
+
+  const startLayerPointerAction = createGizmoDragHandler({
+    stageRef: previewStageRef,
+    proportional: proportionalLayerScaling,
+    anchorPivot: keepLayerAnchorFixed ? attachmentPivot() : null,
+    resolveTarget: () => {
+      if (!activeShapeIndex || !selectedLayerBounds || !previewStageRef.current) return null;
+      const group = previewStageRef.current.querySelector(`[data-editor-part="${activeTweakPart}"]`) as SVGGElement | null;
+      if (!group) return null;
+      return { group, bounds: selectedLayerBounds, transform: getSvgLayerTransform(activePartSvgCode, activeShapeIndex) };
+    },
+    /**
+     * Write the transform straight to the live node during the drag.
+     *
+     * The previous version called setSvgLayerTransform on every pointermove — a full
+     * DOMParser + XMLSerializer round-trip plus a React re-render per frame, measured at
+     * ~11ms even in a production build, which is most of a 60fps budget before the old
+     * Android target is even considered. Touching the one attribute costs nothing and, by
+     * not setting state, avoids the re-render that would overwrite it.
+     */
+    onPreview: (next) => {
+      // The same editor transform is written to every selected shape. Each keeps its own
+      // base transform, so applying one shared transform on top moves them as a unit.
+      for (const element of liveSelectedElements()) {
+        const base = element.getAttribute("data-base-transform") ?? element.getAttribute("transform") ?? "";
+        const combined = [base, toSvgTransform(next)].filter(Boolean).join(" ");
+        if (combined) element.setAttribute("transform", combined);
+        else element.removeAttribute("transform");
+      }
+    },
+    // The authoritative write happens once, on release. commitActiveSvg pushes undo itself.
+    onCommit: (next) => {
+      if (!selection.length) return;
+      commitActiveSvg(selection.reduce((svg, id) => setSvgLayerTransform(svg, id, next), activePartSvgCode));
+    },
+  });
 
   const renderLayerSelection = (part: EditablePart) => {
     if (part !== activeTweakPart || !activeShapeIndex || !selectedLayerBounds) return null;
-    const { x, y, width, height, transform } = selectedLayerBounds;
-    const middleX = x + width / 2;
-    const middleY = y + height / 2;
-    const handles: Array<{ action: PointerAction; x: number; y: number; cursor: string }> = [
-      { action: "scale-nw", x, y, cursor: "nwse-resize" }, { action: "scale-n", x: middleX, y, cursor: "ns-resize" },
-      { action: "scale-ne", x: x + width, y, cursor: "nesw-resize" }, { action: "scale-e", x: x + width, y: middleY, cursor: "ew-resize" },
-      { action: "scale-se", x: x + width, y: y + height, cursor: "nwse-resize" }, { action: "scale-s", x: middleX, y: y + height, cursor: "ns-resize" },
-      { action: "scale-sw", x, y: y + height, cursor: "nesw-resize" }, { action: "scale-w", x, y: middleY, cursor: "ew-resize" },
-    ];
-    return <g transform={transform} data-testid="layer-selection-overlay">
-      <rect x={x} y={y} width={width} height={height} fill="rgba(245,158,11,.04)" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4 3" style={{ cursor: "move" }} onPointerDown={(event) => startLayerPointerAction("move", event)} />
-      <line x1={middleX} y1={y} x2={middleX} y2={y - 24} stroke="#f59e0b" strokeWidth="1" />
-      <circle cx={middleX} cy={y - 28} r="5" fill="#18181b" stroke="#f59e0b" strokeWidth="2" style={{ cursor: "grab" }} onPointerDown={(event) => startLayerPointerAction("rotate", event)} />
-      {handles.map((handle) => <rect key={handle.action} x={handle.x - 4} y={handle.y - 4} width="8" height="8" rx="1" fill="#f59e0b" stroke="#18181b" strokeWidth="1" style={{ cursor: handle.cursor }} onPointerDown={(event) => startLayerPointerAction(handle.action, event)} />)}
-    </g>;
+    return (
+      <GizmoOverlay
+        bounds={selectedLayerBounds}
+        transform={selectedLayerBounds.transform}
+        onPointerAction={startLayerPointerAction}
+      />
+    );
   };
 
   const activeT = getActiveTransform();
 
   const handleResetPart = () => {
+    setPartExtras((extras) => ({ ...extras, [activeTweakPart]: {} }));
     if (activeTweakPart === "head") {
       setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
     } else if (activeTweakPart === "body") {
@@ -1202,9 +1642,19 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         </g>
       );
     }
-    const partTransforms = shapeAdjustments[partType];
     const highlightIdx = activeTweakPart === partType && activeShapeIndex !== null ? activeShapeIndex : undefined;
-    return parseSvgToReact(svgContent, { color, accentColor }, undefined, undefined, partTransforms, highlightIdx, rigTransformsByPart[partType]);
+    // Show the pending bend live on the active part, without committing it.
+    const shown = partType === activeTweakPart && hasBend(bend) ? bentActiveSvg : svgContent;
+    return (
+      <PartPreview
+        svg={shown}
+        color={color}
+        accentColor={accentColor}
+        shapeTransforms={shapeAdjustments[partType]}
+        highlightId={highlightIdx}
+        rigTransforms={rigTransformsByPart[partType]}
+      />
+    );
   };
 
   // Base translation of body in preview
@@ -1254,11 +1704,130 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   };
 
   // Transform strings for groups
-  const headTransformStr = `translate(${headTranslate.x + headTx}, ${headTranslate.y + headTy}) translate(${headPivotX}, ${headPivotY}) scale(${headScale}) translate(${-headPivotX}, ${-headPivotY}) rotate(${headRot}, ${headPivotX}, ${headPivotY})`;
-  const bodyTransformStr = `translate(${bodyTranslate.x + bodyTx}, ${bodyTranslate.y + bodyTy}) translate(${bodyPivotX}, ${bodyPivotY}) scale(${bodyScale}) translate(${-bodyPivotX}, ${-bodyPivotY}) rotate(${bodyRot}, ${bodyPivotX}, ${bodyPivotY})`;
-  const frontLegsTransformStr = `translate(${frontLegsTranslate.x + frontLegsTx}, ${frontLegsTranslate.y + frontLegsTy}) translate(${frontLegsPivotX}, ${frontLegsPivotY}) scale(${frontLegsScale}) translate(${-frontLegsPivotX}, ${-frontLegsPivotY}) rotate(${frontLegsRot}, ${frontLegsPivotX}, ${frontLegsPivotY})`;
-  const backLegsTransformStr = `translate(${backLegsTranslate.x + backLegsTx}, ${backLegsTranslate.y + backLegsTy}) translate(${backLegsPivotX}, ${backLegsPivotY}) scale(${backLegsScale}) translate(${-backLegsPivotX}, ${-backLegsPivotY}) rotate(${backLegsRot}, ${backLegsPivotX}, ${backLegsPivotY})`;
-  const tailTransformStr = `translate(${tailTranslate.x + tailTx}, ${tailTranslate.y + tailTy}) translate(${tailPivotX}, ${tailPivotY}) scale(${tailScale}) translate(${-tailPivotX}, ${-tailPivotY}) rotate(${tailRot}, ${tailPivotX}, ${tailPivotY})`;
+  /**
+   * Whole-part transform, built through the shared serialiser so the dialog, the main
+   * canvas and the layer editor all emit the same shape. The previous inline string put
+   * scale before rotate; with a uniform scale about the same pivot the two commute, so
+   * existing parts are unaffected, and a stretch now follows the same rotate-then-scale
+   * convention as everywhere else.
+   */
+  const partTransformStr = (part: EditablePart, base: { x: number; y: number }, tx: number, ty: number, rot: number, scale: number, px: number, py: number) =>
+    toSvgTransform({
+      translateX: base.x + tx,
+      translateY: base.y + ty,
+      rotate: rot,
+      scale,
+      pivotX: px,
+      pivotY: py,
+      ...partExtras[part],
+    });
+
+  const headTransformStr = partTransformStr("head", headTranslate, headTx, headTy, headRot, headScale, headPivotX, headPivotY);
+  const bodyTransformStr = partTransformStr("body", bodyTranslate, bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
+  const frontLegsTransformStr = partTransformStr("frontLegs", frontLegsTranslate, frontLegsTx, frontLegsTy, frontLegsRot, frontLegsScale, frontLegsPivotX, frontLegsPivotY);
+  const backLegsTransformStr = partTransformStr("backLegs", backLegsTranslate, backLegsTx, backLegsTy, backLegsRot, backLegsScale, backLegsPivotX, backLegsPivotY);
+  const tailTransformStr = partTransformStr("tail", tailTranslate, tailTx, tailTy, tailRot, tailScale, tailPivotX, tailPivotY);
+
+  // --- Whole-part gizmo ------------------------------------------------------------------
+  // Shown only while no sub-layer is selected, so the part box and the layer box never
+  // overlap and it is always unambiguous which one a handle belongs to.
+  const [partGizmoBounds, setPartGizmoBounds] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  // Suppressed while the spine handles are up, so two overlapping control sets on the
+  // same part cannot compete for the same drag.
+  const showPartGizmo = activeShapeIndex === null && !bendMode;
+
+  const stagePoint = (clientX: number, clientY: number) => {
+    const stage = previewStageRef.current;
+    const matrix = stage?.getScreenCTM();
+    if (!stage || !matrix) return { x: clientX, y: clientY };
+    const point = stage.createSVGPoint();
+    point.x = clientX; point.y = clientY;
+    const local = point.matrixTransform(matrix.inverse());
+    return { x: local.x, y: local.y };
+  };
+
+  useEffect(() => {
+    if (!showPartGizmo) { setPartGizmoBounds(null); return; }
+    // Measured synchronously, not in requestAnimationFrame — rAF never fires in a hidden
+    // tab, which would leave the dialog with no part gizmo until something else nudged it.
+    const group = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+    setPartGizmoBounds(group ? rectToStageBounds(group.getBoundingClientRect(), stagePoint) : null);
+    // `isOpen` matters as much as the transform values: while the dialog is shut the
+    // component still runs its hooks but renders null, so the first measurement happens
+    // with no stage attached. Without this dep a freshly opened dialog whose part SVGs are
+    // unchanged (a blank draft) would never re-measure and would show no gizmo at all.
+  }, [isOpen, showPartGizmo, activeTweakPart, headTransformStr, bodyTransformStr, frontLegsTransformStr, backLegsTransformStr, tailTransformStr, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
+
+  const activeBaseTranslate = () => activeTweakPart === "head" ? headTranslate
+    : activeTweakPart === "body" ? bodyTranslate
+    : activeTweakPart === "frontLegs" ? frontLegsTranslate
+    : activeTweakPart === "backLegs" ? backLegsTranslate
+    : tailTranslate;
+
+  const startPartPointerAction = createGizmoDragHandler({
+    stageRef: previewStageRef,
+    proportional: !partStretchMode,
+    // The part's own pivot, lifted into stage space — rotation and scale turn about the
+    // same point the sliders use, not about a bounding-box corner.
+    anchorPivot: (() => {
+      const t = getActiveTransform();
+      const base = activeBaseTranslate();
+      return { x: base.x + t.tx + t.px, y: base.y + t.ty + t.py };
+    })(),
+    resolveTarget: () => {
+      if (!partGizmoBounds || !previewStageRef.current) return null;
+      const t = getActiveTransform();
+      const base = activeBaseTranslate();
+      return {
+        group: previewStageRef.current,
+        bounds: partGizmoBounds,
+        transform: {
+          translateX: base.x + t.tx,
+          translateY: base.y + t.ty,
+          rotate: t.rot,
+          scale: t.scale,
+          pivotX: base.x + t.tx + t.px,
+          pivotY: base.y + t.ty + t.py,
+          ...partExtras[activeTweakPart],
+        },
+      };
+    },
+    onPreview: (next) => {
+      const t = getActiveTransform();
+      const base = activeBaseTranslate();
+      t.setTx(Math.round(next.translateX - base.x));
+      t.setTy(Math.round(next.translateY - base.y));
+      t.setRot(Math.round(next.rotate));
+      const scaleX = next.scaleX ?? next.scale;
+      const scaleY = next.scaleY ?? next.scale;
+      if (Math.abs(scaleX - scaleY) < 1e-9) {
+        t.setScale(scaleX);
+        setPartExtras((extras) => ({ ...extras, [activeTweakPart]: { ...extras[activeTweakPart], scaleX: undefined, scaleY: undefined } }));
+      } else {
+        setPartExtras((extras) => ({ ...extras, [activeTweakPart]: { ...extras[activeTweakPart], scaleX, scaleY } }));
+      }
+    },
+    onCommit: () => {},
+  });
+
+  const flipActivePart = (axis: "x" | "y") =>
+    setPartExtras((extras) => {
+      const key = axis === "x" ? "flipX" : "flipY";
+      const next: PartExtras = { ...extras[activeTweakPart] };
+      // Toggling off drops the key rather than storing false, so flipping twice returns the
+      // part to exactly its previous state.
+      if (next[key]) delete next[key];
+      else next[key] = true;
+      return { ...extras, [activeTweakPart]: next };
+    });
+
+  // Rendered at stage level, not inside the part group: its bounds are already in stage
+  // coordinates, so nesting it under the part's own transform would apply that twice.
+  const renderPartSelection = () =>
+    showPartGizmo && partGizmoBounds
+      ? <GizmoOverlay bounds={partGizmoBounds} onPointerAction={startPartPointerAction} />
+      : null;
+
   const frontPreviewDepthLayers = splitSvgDepthLayers(frontLegsSvg, generationMetadata?.generatedLayout?.depthGroups.frontLegs);
   const backPreviewDepthLayers = splitSvgDepthLayers(backLegsSvg, generationMetadata?.generatedLayout?.depthGroups.backLegs);
 
@@ -1266,7 +1835,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fade-in overflow-y-auto">
-      <div className="bg-[#18181b] border border-zinc-800 rounded-2xl w-full max-w-6xl lg:max-w-7xl max-h-[95vh] overflow-hidden flex flex-col shadow-2xl my-auto">
+      <div className="bg-[#18181b] border border-zinc-800 rounded-2xl w-full max-w-6xl lg:max-w-[110rem] max-h-[95vh] overflow-hidden flex flex-col shadow-2xl my-auto">
         
         {/* Modal Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 bg-zinc-900/60 select-none">
@@ -1286,6 +1855,1093 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
         {/* Modal Form */}
         <form onSubmit={validateAndSubmit} className="flex-1 overflow-y-auto p-6 space-y-6">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            
+            {/* COLUMN 1: Live Interactive Preview & Fine-Tuning Hub */}
+            <div className="lg:col-span-7 bg-zinc-900/30 border border-zinc-800 p-4 rounded-2xl space-y-3 font-sans lg:h-[74vh] flex flex-col">
+              <div className="flex items-center justify-between pb-1.5 border-b border-zinc-800">
+                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest block font-mono">
+                  Studio Live Preview
+                </span>
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    title="Toggle Alignment Grid"
+                    onClick={() => setShowPreviewGrid(!showPreviewGrid)}
+                    className={`p-1 rounded transition-colors ${showPreviewGrid ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
+                  >
+                    <Grid size={13} />
+                  </button>
+                  {/* Undo/redo live here as well as in the layers panel: the panel sits far
+                      below the preview, and these are needed exactly while looking at it. */}
+                  <button
+                    type="button"
+                    title="Undo layer edit (Ctrl+Z)"
+                    disabled={!svgUndo[activeTweakPart].length}
+                    onClick={undoSvg}
+                    className="p-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200 disabled:opacity-25 transition-colors"
+                  >
+                    <Undo2 size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    title="Redo layer edit (Ctrl+Shift+Z)"
+                    disabled={!svgRedo[activeTweakPart].length}
+                    onClick={redoSvg}
+                    className="p-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200 disabled:opacity-25 transition-colors"
+                  >
+                    <Redo2 size={13} />
+                  </button>
+                  <span className="w-px h-4 bg-zinc-800" />
+                  <button
+                    type="button"
+                    title="Spine bend handles — drag the middle dot up for a hump, down for a saddle"
+                    onClick={() => setBendMode(!bendMode)}
+                    className={`p-1 rounded transition-colors ${bendMode ? "bg-sky-500/20 text-sky-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
+                  >
+                    <Spline size={13} />
+                  </button>
+                  {/* Axis lives beside the spine toggle, not only in the panel far below:
+                      it is a decision you make while looking at the creature. */}
+                  {bendMode && (["x", "y"] as const).map((axis) => (
+                    <button
+                      key={axis}
+                      type="button"
+                      title={axis === "x" ? "Bend along a horizontal spine (back to tail)" : "Bend along a vertical spine (upright neck or hanging tail)"}
+                      onClick={() => setBend((current) => ({ ...current, axis }))}
+                      className={`px-1.5 py-1 rounded text-[9px] font-mono transition-colors ${bend.axis === axis ? "bg-sky-500/20 text-sky-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
+                    >
+                      {axis === "x" ? "H" : "V"}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    title="Toggle Skeleton Joints"
+                    onClick={() => setShowPreviewSkeleton(!showPreviewSkeleton)}
+                    className={`p-1 rounded transition-colors ${showPreviewSkeleton ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
+                  >
+                    <Layers size={13} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Interactive Vector Stage */}
+              <div className="relative w-full flex-1 min-h-[320px] bg-zinc-950 border border-zinc-850 rounded-xl overflow-hidden shadow-inner group">
+                <svg
+                  ref={previewStageRef}
+                  viewBox="0 0 600 500"
+                  className="w-full h-full select-none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  onDoubleClick={handleStageDoubleClick}
+                  onPointerDown={startMarquee}
+                >
+                  {/* Grid background */}
+                  {showPreviewGrid && (
+                    <g opacity="0.3">
+                      <line x1="0" y1="250" x2="600" y2="250" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
+                      <line x1="300" y1="0" x2="300" y2="500" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
+                      <line x1="0" y1="350" x2="600" y2="350" stroke="#f59e0b" strokeWidth="1.5" strokeOpacity="0.4" />
+                    </g>
+                  )}
+
+                  {/* Ground floor shadow */}
+                  <ellipse 
+                    cx="300" 
+                    cy="352" 
+                    rx={140 * bodyScale} 
+                    ry="8" 
+                    fill="#000" 
+                    opacity="0.3" 
+                    className="blur-sm"
+                  />
+
+                  {/* 1. TAIL LAYER (Behind body) */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "tail" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("tail")}
+                  >
+                    <g data-editor-part="tail" transform={tailTransformStr}>
+                      {renderPartPreview("tail", tailSvg)}
+                      {renderLayerSelection("tail")}
+                    </g>
+                    {activeTweakPart === "tail" && (
+                      <rect
+                        x={tailTranslate.x + tailTx - 3}
+                        y={tailTranslate.y + tailTy - 3}
+                        width={166 * tailScale}
+                        height={166 * tailScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* 2. FAR HIND LIMB (or complete legacy hind-limb part) */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("backLegs")}
+                  >
+                    <g data-editor-part="backLegs" transform={backLegsTransformStr}>
+                      {renderPartPreview("backLegs", backPreviewDepthLayers?.far ?? backLegsSvg)}
+                      {!backPreviewDepthLayers && renderLayerSelection("backLegs")}
+                    </g>
+                    {activeTweakPart === "backLegs" && (
+                      <rect
+                        x={backLegsTranslate.x + backLegsTx - 3}
+                        y={backLegsTranslate.y + backLegsTy - 3}
+                        width={266 * backLegsScale}
+                        height={186 * backLegsScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* 3. FAR FORELIMB (semantic generated parts only) */}
+                  {frontPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("frontLegs")}
+                    >
+                      <g data-editor-part="frontLegs-far" transform={frontLegsTransformStr}>
+                        {renderPartPreview("frontLegs", frontPreviewDepthLayers.far)}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 4. BODY LAYER */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("body")}
+                  >
+                    <g data-editor-part="body" transform={bodyTransformStr}>
+                      {renderPartPreview("body", bodySvg)}
+                      {renderLayerSelection("body")}
+                    </g>
+                    {activeTweakPart === "body" && (
+                      <rect
+                        x={bodyTranslate.x + bodyTx - 3}
+                        y={bodyTranslate.y + bodyTy - 3}
+                        width={306 * bodyScale}
+                        height={226 * bodyScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* 5. NEAR HIND LIMB (semantic generated parts only) */}
+                  {backPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("backLegs")}
+                    >
+                      <g data-editor-part="backLegs-near" transform={backLegsTransformStr}>
+                        {renderPartPreview("backLegs", backPreviewDepthLayers.near)}
+                        {renderLayerSelection("backLegs")}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 6. NEAR FORELIMB (or complete legacy forelimb part) */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("frontLegs")}
+                  >
+                    <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
+                      {renderPartPreview("frontLegs", frontPreviewDepthLayers?.near ?? frontLegsSvg)}
+                      {renderLayerSelection("frontLegs")}
+                    </g>
+                    {activeTweakPart === "frontLegs" && (
+                      <rect
+                        x={frontLegsTranslate.x + frontLegsTx - 3}
+                        y={frontLegsTranslate.y + frontLegsTy - 3}
+                        width={266 * frontLegsScale}
+                        height={186 * frontLegsScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* 7. HEAD LAYER (In front of body) */}
+                  <g 
+                    className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                    onClick={() => setActiveTweakPart("head")}
+                  >
+                    <g data-editor-part="head" transform={headTransformStr}>
+                      {renderPartPreview("head", headSvg)}
+                      {renderLayerSelection("head")}
+                    </g>
+                    {activeTweakPart === "head" && (
+                      <rect
+                        x={headTranslate.x + headTx - 3}
+                        y={headTranslate.y + headTy - 3}
+                        width={166 * headScale}
+                        height={166 * headScale}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4,4"
+                      />
+                    )}
+                  </g>
+
+                  {/* SKELETON LAYER */}
+                  {showPreviewSkeleton && (
+                    <g opacity="0.95" pointerEvents="none">
+                      {/* Neck link */}
+                      <line 
+                        x1={neckTarget.x} 
+                        y1={neckTarget.y} 
+                        x2={headTranslate.x + headTx + headLocalNeck.x} 
+                        y2={headTranslate.y + headTy + headLocalNeck.y} 
+                        stroke="#ec4899" 
+                        strokeWidth="2" 
+                        strokeDasharray="2,2" 
+                      />
+                      <circle cx={headTranslate.x + headTx + headLocalNeck.x} cy={headTranslate.y + headTy + headLocalNeck.y} r="3" fill="#ffffff" />
+
+                      {/* Tail link */}
+                      <line 
+                        x1={tailTarget.x} 
+                        y1={tailTarget.y} 
+                        x2={tailTranslate.x + tailTx + tailLocalBody.x} 
+                        y2={tailTranslate.y + tailTy + tailLocalBody.y} 
+                        stroke="#3b82f6" 
+                        strokeWidth="2" 
+                        strokeDasharray="2,2" 
+                      />
+                      <circle cx={tailTranslate.x + tailTx + tailLocalBody.x} cy={tailTranslate.y + tailTy + tailLocalBody.y} r="3" fill="#ffffff" />
+
+                      {/* Front Legs link */}
+                      <line 
+                        x1={frontLegsTarget.x} 
+                        y1={frontLegsTarget.y} 
+                        x2={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} 
+                        y2={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} 
+                        stroke="#eab308" 
+                        strokeWidth="2" 
+                        strokeDasharray="2,2" 
+                      />
+                      <circle cx={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} cy={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} r="3" fill="#ffffff" />
+
+                      {/* Back Legs link */}
+                      <line 
+                        x1={backLegsTarget.x} 
+                        y1={backLegsTarget.y} 
+                        x2={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} 
+                        y2={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} 
+                        stroke="#10b981" 
+                        strokeWidth="2" 
+                        strokeDasharray="2,2" 
+                      />
+                      <circle cx={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} cy={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} r="3" fill="#ffffff" />
+                    </g>
+                  )}
+
+                  {/* Draggable body sockets. Outside the pointerEvents="none" skeleton group
+                      above, which draws the links but must not swallow the drags. */}
+                  {showPreviewSkeleton && (
+                    <AnchorHandles
+                      stageRef={previewStageRef}
+                      anchors={{
+                        neck: { x: neckX, y: neckY },
+                        tail: { x: tailX, y: tailY },
+                        frontLegs: { x: frontLegsX, y: frontLegsY },
+                        backLegs: { x: backLegsX, y: backLegsY },
+                      }}
+                      bodyOrigin={{ x: bodyTranslate.x + bodyTx, y: bodyTranslate.y + bodyTy }}
+                      onChange={handleAnchorChange}
+                      activePart={draggingAnchor}
+                      onActivePartChange={setDraggingAnchor}
+                    />
+                  )}
+
+                  {marquee && (
+                    <rect
+                      data-editor-chrome="true"
+                      data-testid="marquee"
+                      transform={`translate(${activeBaseTranslate().x + getActiveTransform().tx}, ${activeBaseTranslate().y + getActiveTransform().ty})`}
+                      x={marquee.x} y={marquee.y} width={marquee.width} height={marquee.height}
+                      fill="rgba(56,189,248,.08)" stroke="#38bdf8" strokeWidth="1" strokeDasharray="4 2"
+                      pointerEvents="none"
+                    />
+                  )}
+
+                  {renderPartSelection()}
+
+                  {/* Bend handles last, so they sit above every part. Positioned by the
+                      active part's translation only — inheriting its scale or flip would
+                      mirror the controls along with the artwork. */}
+                  {bendMode && (() => {
+                    const base = activeBaseTranslate();
+                    const t = getActiveTransform();
+                    return (
+                      <BendHandles
+                        stageRef={previewStageRef}
+                        placement={`translate(${base.x + t.tx}, ${base.y + t.ty})`}
+                        width={VIEW[activeTweakPart as AnimalPartType].width}
+                        height={VIEW[activeTweakPart as AnimalPartType].height}
+                        axis={bend.axis}
+                        points={bend.points}
+                        selectedIndex={bendSelection}
+                        onChange={(points) => setBend((current) => ({ ...current, points }))}
+                        onSelect={setBendSelection}
+                      />
+                    );
+                  })()}
+
+                  {/* Active Pivot Overlay Crosshair */}
+                  {(() => {
+                    let px = 0;
+                    let py = 0;
+                    if (activeTweakPart === "head") {
+                      px = headTranslate.x + headTx + headPivotX;
+                      py = headTranslate.y + headTy + headPivotY;
+                    } else if (activeTweakPart === "body") {
+                      px = bodyTranslate.x + bodyTx + bodyPivotX;
+                      py = bodyTranslate.y + bodyTy + bodyPivotY;
+                    } else if (activeTweakPart === "frontLegs") {
+                      px = frontLegsTranslate.x + frontLegsTx + frontLegsPivotX;
+                      py = frontLegsTranslate.y + frontLegsTy + frontLegsPivotY;
+                    } else if (activeTweakPart === "backLegs") {
+                      px = backLegsTranslate.x + backLegsTx + backLegsPivotX;
+                      py = backLegsTranslate.y + backLegsTy + backLegsPivotY;
+                    } else if (activeTweakPart === "tail") {
+                      px = tailTranslate.x + tailTx + tailPivotX;
+                      py = tailTranslate.y + tailTy + tailPivotY;
+                    }
+
+                    return (
+                      <g>
+                        <circle cx={px} cy={py} r="10" fill="none" stroke="#f59e0b" strokeWidth="1.5" className="animate-pulse" />
+                        <circle cx={px} cy={py} r="4" fill="#f59e0b" stroke="#18181b" strokeWidth="1" />
+                        <line x1={px - 14} y1={py} x2={px + 14} y2={py} stroke="#f59e0b" strokeWidth="1.2" />
+                        <line x1={px} y1={py - 14} x2={px} y2={py + 14} stroke="#f59e0b" strokeWidth="1.2" />
+                        <text x={px + 12} y={py - 6} fill="#f59e0b" className="text-[9px] font-mono font-bold bg-zinc-950 px-1.5 py-0.5 rounded border border-zinc-800 shadow-lg">
+                          {activeTweakPart.toUpperCase()} PIVOT
+                        </text>
+                      </g>
+                    );
+                  })()}
+                </svg>
+
+                <div className="absolute bottom-2.5 left-2.5 bg-black/80 backdrop-blur-md px-2 py-1 rounded text-[9px] font-mono text-zinc-400 border border-zinc-800 shadow-md">
+                  Click on parts inside preview to switch focus
+                </div>
+              </div>
+            </div>
+
+            {/* CONTROLS — beside the preview, matched in height and scrolling on
+                their own, so a slider is never more than a glance from the shape
+                it changes. */}
+            <div className="lg:col-span-5 bg-zinc-900/30 border border-zinc-800 p-4 rounded-2xl space-y-4 font-sans lg:h-[74vh] lg:overflow-y-auto">
+
+              {/* Part Selector Buttons */}
+              <div className="space-y-1.5 font-mono">
+                <span className="text-[9px] text-zinc-500 uppercase block tracking-wider font-mono">
+                  Active Part to Fine-Tune:
+                </span>
+                <div className="grid grid-cols-5 gap-1 font-mono">
+                  {(["head", "body", "frontLegs", "backLegs", "tail"] as const).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => setActiveTweakPart(p)}
+                      className={`py-1.5 px-0.5 rounded-lg text-[9px] font-bold border transition-all text-center uppercase ${
+                        activeTweakPart === p
+                          ? "bg-amber-500/20 text-amber-400 border-amber-500/50 shadow-md"
+                          : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-850 hover:text-zinc-200"
+                      }`}
+                    >
+                      {p === "frontLegs" ? "F-Legs" : p === "backLegs" ? "B-Legs" : p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Adjustments Panel */}
+              <div className="p-3 bg-zinc-950/60 rounded-xl border border-zinc-900 space-y-3 font-mono">
+                <div className="flex items-center justify-between pb-1 border-b border-zinc-900">
+                  <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest flex items-center gap-1">
+                    <SlidersHorizontal size={10} />
+                    {activeTweakPart} Transform
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleResetPart}
+                    className="text-[9px] font-mono text-zinc-500 hover:text-zinc-300 hover:underline flex items-center gap-1"
+                  >
+                    <RefreshCw size={8} /> RESET
+                  </button>
+                </div>
+
+                {/* Mirror + stretch, matching the main canvas controls */}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => flipActivePart("x")}
+                      title="Mirror this part horizontally"
+                      className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] transition-colors ${partExtras[activeTweakPart].flipX ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}
+                    >
+                      <FlipHorizontal size={10} /> Flip H
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => flipActivePart("y")}
+                      title="Mirror this part vertically"
+                      className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] transition-colors ${partExtras[activeTweakPart].flipY ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}
+                    >
+                      <FlipVertical size={10} /> Flip V
+                    </button>
+                  </div>
+                  <label className="flex items-center gap-1.5 text-[9px] text-zinc-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={partStretchMode}
+                      onChange={(e) => {
+                        setPartStretchMode(e.target.checked);
+                        // Leaving stretch mode folds the axes back onto the uniform scale.
+                        if (!e.target.checked) {
+                          const extras = partExtras[activeTweakPart];
+                          const sx = extras.scaleX ?? activeT.scale;
+                          const sy = extras.scaleY ?? activeT.scale;
+                          activeT.setScale((sx + sy) / 2);
+                          setPartExtras((all) => ({ ...all, [activeTweakPart]: { ...all[activeTweakPart], scaleX: undefined, scaleY: undefined } }));
+                        }
+                      }}
+                      className="accent-amber-500"
+                    />
+                    Stretch
+                  </label>
+                </div>
+
+                {partExtras[activeTweakPart].flipX && activeTweakPart !== "frontLegs" && activeTweakPart !== "backLegs" && (
+                  <p className="text-[9px] text-amber-500/80 leading-tight">
+                    Mirrored {activeTweakPart}: the library is authored left-facing, so this part
+                    may be rejected when combined across species.
+                  </p>
+                )}
+
+                <div className="space-y-2.5">
+                  {/* Translate X */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] font-mono">
+                      <span className="text-zinc-400">Translate X</span>
+                      <span className="text-amber-500 font-bold">{activeT.tx}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-120"
+                      max="120"
+                      step="1"
+                      value={activeT.tx}
+                      onChange={(e) => activeT.setTx(parseInt(e.target.value) || 0)}
+                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Translate Y */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] font-mono">
+                      <span className="text-zinc-400">Translate Y</span>
+                      <span className="text-amber-500 font-bold">{activeT.ty}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-120"
+                      max="120"
+                      step="1"
+                      value={activeT.ty}
+                      onChange={(e) => activeT.setTy(parseInt(e.target.value) || 0)}
+                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Rotate */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] font-mono">
+                      <span className="text-zinc-400">Rotate Angle</span>
+                      <span className="text-amber-500 font-bold">{activeT.rot}°</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-180"
+                      max="180"
+                      step="1"
+                      value={activeT.rot}
+                      onChange={(e) => activeT.setRot(parseInt(e.target.value) || 0)}
+                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Scale — uniform, or one slider per axis while stretching */}
+                  {partStretchMode ? (
+                    (["x", "y"] as const).map((axis) => {
+                      const key = axis === "x" ? "scaleX" : "scaleY";
+                      const value = partExtras[activeTweakPart][key] ?? activeT.scale;
+                      return (
+                        <div key={axis} className="space-y-1">
+                          <div className="flex justify-between text-[10px] font-mono">
+                            <span className="text-zinc-400">Stretch {axis.toUpperCase()}</span>
+                            <span className="text-amber-500 font-bold">x{value.toFixed(2)}</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="0.3"
+                            max="2.5"
+                            step="0.05"
+                            value={value}
+                            onChange={(e) => {
+                              const next = parseFloat(e.target.value) || 1.0;
+                              // Seed the untouched axis from the uniform scale, so moving one
+                              // slider stretches rather than silently resetting the other.
+                              setPartExtras((all) => ({
+                                ...all,
+                                [activeTweakPart]: {
+                                  ...all[activeTweakPart],
+                                  scaleX: axis === "x" ? next : all[activeTweakPart].scaleX ?? activeT.scale,
+                                  scaleY: axis === "y" ? next : all[activeTweakPart].scaleY ?? activeT.scale,
+                                },
+                              }));
+                            }}
+                            className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                          />
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] font-mono">
+                        <span className="text-zinc-400">Scale Factor</span>
+                        <span className="text-amber-500 font-bold">x{activeT.scale.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0.3"
+                        max="2.5"
+                        step="0.05"
+                        value={activeT.scale}
+                        onChange={(e) => {
+                          activeT.setScale(parseFloat(e.target.value) || 1.0);
+                          // Per-axis values are spread over this one, so a leftover stretch
+                          // would make the uniform slider look dead. Reaching for it means
+                          // the user wants uniform scaling again.
+                          setPartExtras((all) => ({ ...all, [activeTweakPart]: { ...all[activeTweakPart], scaleX: undefined, scaleY: undefined } }));
+                        }}
+                        className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+                  )}
+
+                  {/* Pivot X */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] font-mono">
+                      <span className="text-zinc-400">Rotation Pivot X</span>
+                      <span className="text-amber-500 font-bold">{activeT.px}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max={activeT.viewBoxMaxX}
+                      step="1"
+                      value={activeT.px}
+                      onChange={(e) => activeT.setPx(parseInt(e.target.value) || 0)}
+                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Pivot Y */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] font-mono">
+                      <span className="text-zinc-400">Rotation Pivot Y</span>
+                      <span className="text-amber-500 font-bold">{activeT.py}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max={activeT.viewBoxMaxY}
+                      step="1"
+                      value={activeT.py}
+                      onChange={(e) => activeT.setPy(parseInt(e.target.value) || 0)}
+                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+                </div>
+
+                {/* Live validation — errors block the save, warnings do not */}
+                {(() => {
+                  const shown = saveBlocked.length ? saveBlocked : liveIssues;
+                  if (!shown.length) return null;
+                  const errors = shown.filter((i) => i.severity === "error");
+                  const warnings = shown.filter((i) => i.severity !== "error");
+                  return (
+                    <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-2 font-mono">
+                      <span className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-1.5 text-zinc-400">
+                        <ShieldAlert size={11} className={errors.length ? "text-red-400" : "text-amber-500"} />
+                        Standard Check
+                        <span className={errors.length ? "text-red-400" : "text-amber-500"}>
+                          {errors.length} error{errors.length === 1 ? "" : "s"} · {warnings.length} warning{warnings.length === 1 ? "" : "s"}
+                        </span>
+                      </span>
+                      <div className="max-h-32 overflow-y-auto space-y-1">
+                        {[...errors, ...warnings].slice(0, 12).map((issue, index) => (
+                          <div
+                            key={`${issue.code}-${issue.part}-${index}`}
+                            className={`text-[9px] leading-tight px-1.5 py-1 rounded border ${
+                              issue.severity === "error"
+                                ? "border-red-900/60 bg-red-950/30 text-red-300"
+                                : "border-amber-900/50 bg-amber-950/20 text-amber-300/90"
+                            }`}
+                          >
+                            <span className="opacity-60">{issue.part} · {issue.code}</span>
+                            <br />
+                            {issue.message}
+                          </div>
+                        ))}
+                      </div>
+                      <p className="text-[9px] text-zinc-500 leading-tight">
+                        {saveBlocked.length
+                          ? "These were introduced by this edit and block saving."
+                          : errors.length > 0
+                            ? "Pre-existing faults in this animal — they do not block saving, but this edit must not add more."
+                            : "Warnings describe an unusual part, not a broken one; they save fine."}
+                      </p>
+                    </div>
+                  );
+                })()}
+
+                {/* Palette presets — retint every token-painted shape at once */}
+                <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-2 font-mono">
+                  <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest flex items-center gap-1.5">
+                    <Palette size={11} /> Palette Presets
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {PALETTE_PRESETS.map((preset) => (
+                      <button
+                        key={preset.name}
+                        type="button"
+                        onClick={() => { setColor(preset.primary); setAccentColor(preset.accent); }}
+                        className="flex items-center gap-1.5 px-1.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[9px] text-zinc-300"
+                      >
+                        <span className="flex">
+                          <span className="w-2.5 h-2.5 rounded-l" style={{ background: preset.primary }} />
+                          <span className="w-2.5 h-2.5 rounded-r" style={{ background: preset.accent }} />
+                        </span>
+                        {preset.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Coat pattern, clipped to the selected shape */}
+                <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-2.5 font-mono">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest flex items-center gap-1.5">
+                      <Grid size={11} /> Coat Pattern
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button type="button" disabled={!activeShapeIndex} onClick={clearPattern} className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25">CLEAR</button>
+                      <button type="button" disabled={!activeShapeIndex} onClick={applyPattern} className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 disabled:opacity-25">APPLY</button>
+                    </div>
+                  </div>
+
+                  {!activeShapeIndex ? (
+                    <p className="text-[9px] text-zinc-500 italic">Select a layer below to stencil a pattern onto it.</p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap gap-1">
+                        {PATTERN_KINDS.map((kind) => (
+                          <button
+                            key={kind}
+                            type="button"
+                            onClick={() => setPattern((p) => ({ ...p, kind }))}
+                            className={`px-1.5 py-0.5 rounded text-[9px] capitalize ${pattern.kind === kind ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-300"}`}
+                          >
+                            {kind}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Seven ramp tokens, not an RGB picker: a literal hex would make the
+                          part permanently un-recolourable inside a hybrid. */}
+                      <div className="space-y-1">
+                        <span className="text-[9px] text-zinc-400">Mark colour</span>
+                        <div className="flex flex-wrap gap-1">
+                          {RAMP_TOKENS.map((token) => (
+                            <button
+                              key={token}
+                              type="button"
+                              title={token}
+                              onClick={() => setPattern((p) => ({ ...p, token }))}
+                              className={`w-5 h-5 rounded border ${pattern.token === token ? "border-amber-400" : "border-zinc-700"}`}
+                              style={{ background: resolveRamp(color, accentColor)[token] }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      {([["scale", "Mark scale", 0.2, 2.5, 0.05], ["density", "Density", 0.05, 1, 0.05]] as const).map(([key, label, min, max, step]) => (
+                        <div key={key} className="space-y-1">
+                          <div className="flex justify-between text-[9px]">
+                            <span className="text-zinc-400">{label}</span>
+                            <span className="text-amber-500 font-bold">{pattern[key].toFixed(2)}</span>
+                          </div>
+                          <input
+                            type="range" min={min} max={max} step={step} value={pattern[key]}
+                            onChange={(e) => setPattern((p) => ({ ...p, [key]: parseFloat(e.target.value) }))}
+                            className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                          />
+                        </div>
+                      ))}
+
+                      <div className="space-y-1">
+                        <span className="text-[9px] text-zinc-400">Repaint this layer</span>
+                        <div className="flex flex-wrap gap-1">
+                          {RAMP_TOKENS.map((token) => (
+                            <button
+                              key={token}
+                              type="button"
+                              title={`Fill with ${token} (shift-click for stroke)`}
+                              onClick={(e) => paintActiveShape(token, e.shiftKey ? "stroke" : "fill")}
+                              className="w-5 h-5 rounded border border-zinc-700 hover:border-zinc-400"
+                              style={{ background: resolveRamp(color, accentColor)[token] }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      {patternNote && <p className="text-[9px] text-zinc-500 leading-tight">{patternNote}</p>}
+                    </>
+                  )}
+                </div>
+
+                {/* Spine bend — arch a back, sink a saddle, raise a hump */}
+                <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-2.5 font-mono">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest flex items-center gap-1.5">
+                      <Spline size={11} /> Spine Bend ({activeTweakPart})
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={!hasBend(bend)}
+                        onClick={clearBend}
+                        className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"
+                      >
+                        CLEAR
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!hasBend(bend)}
+                        onClick={applyBend}
+                        className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 disabled:opacity-25"
+                      >
+                        APPLY
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1">
+                      {(["x", "y"] as const).map((axis) => (
+                        <button
+                          key={axis}
+                          type="button"
+                          onClick={() => setBend((current) => ({ ...current, axis }))}
+                          className={`px-1.5 py-0.5 rounded text-[9px] ${bend.axis === axis ? "bg-sky-500/20 text-sky-300" : "bg-zinc-800 text-zinc-300"}`}
+                        >
+                          {axis === "x" ? "Horizontal" : "Vertical"}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="text-[9px] text-zinc-500">{bend.points.length} points</span>
+                  </div>
+
+                  {/* Fine control for whichever handle is selected; the canvas does the
+                      coarse shaping. */}
+                  {bendSelection !== null && bend.points[bendSelection] ? (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[9px]">
+                        <span className="text-zinc-400">
+                          Point {bendSelection + 1} lift {bend.points[bendSelection].offset >= 0 ? "(hump)" : "(saddle)"}
+                        </span>
+                        <span className="text-amber-500 font-bold">{bend.points[bendSelection].offset}px</span>
+                      </div>
+                      <input
+                        type="range" min="-60" max="60" step="1"
+                        value={bend.points[bendSelection].offset}
+                        onChange={(e) => {
+                          const offset = parseInt(e.target.value) || 0;
+                          setBend((current) => ({
+                            ...current,
+                            points: current.points.map((point, index) => index === bendSelection ? { ...point, offset } : point),
+                          }));
+                        }}
+                        className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                      />
+                    </div>
+                  ) : (
+                    <p className="text-[9px] text-zinc-500 italic leading-tight">
+                      Turn on the spine tool above the preview, then drag a dot. Double-click the
+                      guide line to add a point, alt-click a dot to remove it.
+                    </p>
+                  )}
+                </div>
+
+                {/* SUB-SHAPE ADJUSTER INTEGRATION */}
+                <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-3 font-sans">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-500 uppercase tracking-widest font-mono">
+                      <SlidersHorizontal size={12} />
+                      Sub-Shape Adjuster ({activeTweakPart})
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button type="button" title="Undo layer edit" disabled={!svgUndo[activeTweakPart].length} onClick={undoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Undo2 size={10}/></button>
+                      <button type="button" title="Redo layer edit" disabled={!svgRedo[activeTweakPart].length} onClick={redoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Redo2 size={10}/></button>
+                    {activeShapeIndex !== null && (
+                      <>
+                        <button
+                          type="button"
+                          title="Duplicate this layer"
+                          onClick={duplicateActiveLayer}
+                          className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                        >
+                          <Copy size={10} />
+                        </button>
+                        <button
+                          type="button"
+                          title="Append a tapered copy at this segment's tip (tails, tentacles, necks)"
+                          onClick={extendActiveChain}
+                          className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                        >
+                          <GitBranch size={10} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isProtectedLayer(activeShapeIndex)}
+                          title={isProtectedLayer(activeShapeIndex)
+                            ? "This group is required by the pipeline and cannot be deleted"
+                            : "Delete this shape (Del)"}
+                          onClick={deleteActiveLayer}
+                          className="p-1 rounded bg-zinc-800 hover:bg-red-900/60 text-zinc-300 disabled:opacity-25 disabled:hover:bg-zinc-800"
+                        >
+                          <Trash2 size={10} />
+                        </button>
+                      </>
+                    )}
+                    {activeShapeIndex !== null && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          commitActiveSvg(selection.reduce((svg, id) => resetSvgLayerTransform(svg, id), activePartSvgCode));
+                          selectShapes([]);
+                        }}
+                        className="text-[9px] font-mono font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white px-1.5 py-0.5 rounded transition-colors"
+                      >
+                        RESET SHAPE
+                      </button>
+                    )}
+                    </div>
+                  </div>
+
+                  {shapes.length === 0 ? (
+                    <div className="text-[10px] text-zinc-500 font-mono italic p-3 bg-zinc-950/40 rounded-lg border border-zinc-900/60 text-center">
+                      No vector shapes detected for {activeTweakPart}
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {activeShapeIndex !== null && (() => {
+                        const density = duplicationDensity();
+                        return (
+                          <p className={`text-[9px] font-mono leading-tight ${density.withinBand ? "text-zinc-500" : "text-amber-500/90"}`}>
+                            Duplicating puts {activeTweakPart} at {density.count} elements
+                            {density.withinBand
+                              ? ` (band ${density.min}–${density.max}).`
+                              : `, outside the ${density.min}–${density.max} band — still saves, but flags density.count.`}
+                          </p>
+                        );
+                      })()}
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <label className="text-[9px] text-zinc-400 font-mono block">Stable SVG Layers</label>
+                          {selection.length > 1 && <span className="text-[9px] font-mono text-sky-400">{selection.length} selected</span>}
+                        </div>
+                        <SvgLayersPanel
+                          layers={layerTree}
+                          selectedId={activeShapeIndex}
+                          onSelect={(id, additive) => selectShapes(additive ? toggleSelection(selection, id) : [id])}
+                          selectedIds={selection}
+                          onRename={(id, value) => updateLayer((svg) => renameSvgLayer(svg, id, value))}
+                          onVisibility={(id, visible) => updateLayer((svg) => setSvgLayerVisibility(svg, id, visible))}
+                          onLock={(id, locked) => {
+                            updateLayer((svg) => setSvgLayerLocked(svg, id, locked));
+                            if (locked && selection.includes(id)) selectShapes(selection.filter((entry) => entry !== id));
+                          }}
+                          onMove={moveLayer}
+                        />
+                      </div>
+
+                      {activeShapeIndex !== null && (
+                        <div className="space-y-2.5 p-2.5 bg-zinc-950/50 rounded-lg border border-zinc-900/60 animate-fade-in">
+                          {/* Sub-shape transform inputs */}
+                          {(() => {
+                            const currentTransform: ShapeTransform = getSvgLayerTransform(activePartSvgCode, activeShapeIndex);
+
+                            const updateTransform = (fields: Partial<ShapeTransform>) => {
+                              const fixedPivot = activeTweakPart === "head" ? { pivotX: 120, pivotY: 110 }
+                                : activeTweakPart === "frontLegs" ? { pivotX: 75, pivotY: 15 }
+                                : activeTweakPart === "backLegs" ? { pivotX: 195, pivotY: 15 }
+                                : activeTweakPart === "tail" ? { pivotX: 15, pivotY: 15 }
+                                : { pivotX: neckX, pivotY: neckY };
+                              const next = { ...currentTransform, ...(keepLayerAnchorFixed && fields.scale !== undefined ? fixedPivot : {}), ...fields };
+                              commitActiveSvg(setSvgLayerTransform(activePartSvgCode, activeShapeIndex, next));
+                            };
+
+                            return (
+                              <div className="space-y-2.5 font-mono">
+                                {/* Translate X */}
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[9px]">
+                                    <span className="text-zinc-400">Shape Move X</span>
+                                    <span className="text-amber-500 font-bold">{currentTransform.translateX || 0}px</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="-100"
+                                    max="100"
+                                    step="1"
+                                    value={currentTransform.translateX || 0}
+                                    onChange={(e) => updateTransform({ translateX: parseInt(e.target.value) || 0 })}
+                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                                  />
+                                </div>
+
+                                {/* Translate Y */}
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[9px]">
+                                    <span className="text-zinc-400">Shape Move Y</span>
+                                    <span className="text-amber-500 font-bold">{currentTransform.translateY || 0}px</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="-100"
+                                    max="100"
+                                    step="1"
+                                    value={currentTransform.translateY || 0}
+                                    onChange={(e) => updateTransform({ translateY: parseInt(e.target.value) || 0 })}
+                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                                  />
+                                </div>
+
+                                {/* Rotate */}
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[9px]">
+                                    <span className="text-zinc-400">Shape Rotate</span>
+                                    <span className="text-amber-500 font-bold">{currentTransform.rotate || 0}°</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="-180"
+                                    max="180"
+                                    step="1"
+                                    value={currentTransform.rotate || 0}
+                                    onChange={(e) => updateTransform({ rotate: parseInt(e.target.value) || 0 })}
+                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                                  />
+                                </div>
+
+                                {/* Scale */}
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[9px]">
+                                    <span className="text-zinc-400">Shape Scale</span>
+                                    <span className="text-amber-500 font-bold">X {(currentTransform.scaleX ?? currentTransform.scale ?? 1).toFixed(2)} · Y {(currentTransform.scaleY ?? currentTransform.scale ?? 1).toFixed(2)}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0.2"
+                                    max="3"
+                                    step="0.05"
+                                    value={currentTransform.scale !== undefined ? currentTransform.scale : 1}
+                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0, scaleX: undefined, scaleY: undefined })}
+                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
+                                  />
+                                </div>
+
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={keepLayerAnchorFixed} onChange={(event) => setKeepLayerAnchorFixed(event.target.checked)} className="accent-amber-500" />
+                                  Keep attachment anchor fixed while scaling
+                                </label>
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={proportionalLayerScaling} onChange={(event) => setProportionalLayerScaling(event.target.checked)} className="accent-amber-500" />
+                                  Proportional corner/side resizing
+                                </label>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                  <label className="text-[9px] text-zinc-400">Pivot X<input type="number" value={currentTransform.pivotX ?? 0} onChange={(event) => updateTransform({ pivotX: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
+                                  <label className="text-[9px] text-zinc-400">Pivot Y<input type="number" value={currentTransform.pivotY ?? 0} onChange={(event) => updateTransform({ pivotY: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
+                                </div>
+
+                                {/* Fill Color override */}
+                                <div className="space-y-1 pt-1">
+                                  <span className="text-[9px] text-zinc-400 block mb-1">Color Override</span>
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      type="color"
+                                      value={currentTransform.fill || "#ffffff"}
+                                      onChange={(e) => updateTransform({ fill: e.target.value })}
+                                      className="w-7 h-7 bg-transparent border border-zinc-800 rounded cursor-pointer"
+                                    />
+                                    <input
+                                      type="text"
+                                      placeholder="HEX code or empty"
+                                      value={currentTransform.fill || ""}
+                                      onChange={(e) => updateTransform({ fill: e.target.value || undefined })}
+                                      className="flex-1 text-[11px] font-mono px-2 py-1 bg-zinc-950 border border-zinc-800 rounded text-zinc-300 focus:outline-none focus:border-amber-500"
+                                    />
+                                    {currentTransform.fill && (
+                                      <button
+                                        type="button"
+                                        onClick={() => updateTransform({ fill: undefined })}
+                                        className="text-[9px] px-1.5 py-1 bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white rounded"
+                                      >
+                                        Clear
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <RigEditorPanel
+                partId={activeTweakPart}
+                selectedGroupId={activeShapeIndex}
+                groupIds={activeLayerIds}
+                defaultPivot={attachmentPivot()}
+                rig={rigDefinition}
+                rotations={rigPoseRotations}
+                onRigChange={setRigDefinition}
+                onRotationsChange={setRigPoseRotations}
+              />
+            </div>
+          </div>
           
           {/* Quick Pre-fill Template Trigger */}
           <div className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -1688,640 +3344,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
             )}
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            
-            {/* COLUMN 1: Live Interactive Preview & Fine-Tuning Hub */}
-            <div className="lg:col-span-4 bg-zinc-900/30 border border-zinc-800 p-4 rounded-2xl space-y-4 font-sans">
-              <div className="flex items-center justify-between pb-1.5 border-b border-zinc-800">
-                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest block font-mono">
-                  Studio Live Preview
-                </span>
-                <div className="flex gap-1.5">
-                  <button
-                    type="button"
-                    title="Toggle Alignment Grid"
-                    onClick={() => setShowPreviewGrid(!showPreviewGrid)}
-                    className={`p-1 rounded transition-colors ${showPreviewGrid ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
-                  >
-                    <Grid size={13} />
-                  </button>
-                  <button
-                    type="button"
-                    title="Toggle Skeleton Joints"
-                    onClick={() => setShowPreviewSkeleton(!showPreviewSkeleton)}
-                    className={`p-1 rounded transition-colors ${showPreviewSkeleton ? "bg-amber-500/20 text-amber-400" : "bg-zinc-800 text-zinc-500 hover:text-zinc-300"}`}
-                  >
-                    <Layers size={13} />
-                  </button>
-                </div>
-              </div>
 
-              {/* Interactive Vector Stage */}
-              <div className="relative w-full aspect-square bg-zinc-950 border border-zinc-850 rounded-xl overflow-hidden shadow-inner group">
-                <svg
-                  ref={previewStageRef}
-                  viewBox="0 0 600 500"
-                  className="w-full h-full select-none"
-                  xmlns="http://www.w3.org/2000/svg"
-                >
-                  {/* Grid background */}
-                  {showPreviewGrid && (
-                    <g opacity="0.3">
-                      <line x1="0" y1="250" x2="600" y2="250" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
-                      <line x1="300" y1="0" x2="300" y2="500" stroke="#3f3f46" strokeWidth="1" strokeDasharray="3,3" />
-                      <line x1="0" y1="350" x2="600" y2="350" stroke="#f59e0b" strokeWidth="1.5" strokeOpacity="0.4" />
-                    </g>
-                  )}
+          {/* Everything read or typed rather than dragged sits below the working
+              area, where it does not compete for the same screen space. */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start mt-6">
 
-                  {/* Ground floor shadow */}
-                  <ellipse 
-                    cx="300" 
-                    cy="352" 
-                    rx={140 * bodyScale} 
-                    ry="8" 
-                    fill="#000" 
-                    opacity="0.3" 
-                    className="blur-sm"
-                  />
-
-                  {/* 1. TAIL LAYER (Behind body) */}
-                  <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "tail" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("tail")}
-                  >
-                    <g data-editor-part="tail" transform={tailTransformStr}>
-                      {renderPartPreview("tail", tailSvg)}
-                      {renderLayerSelection("tail")}
-                    </g>
-                    {activeTweakPart === "tail" && (
-                      <rect
-                        x={tailTranslate.x + tailTx - 3}
-                        y={tailTranslate.y + tailTy - 3}
-                        width={166 * tailScale}
-                        height={166 * tailScale}
-                        fill="none"
-                        stroke="#f59e0b"
-                        strokeWidth="1.5"
-                        strokeDasharray="4,4"
-                      />
-                    )}
-                  </g>
-
-                  {/* 2. FAR HIND LIMB (or complete legacy hind-limb part) */}
-                  <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("backLegs")}
-                  >
-                    <g data-editor-part="backLegs" transform={backLegsTransformStr}>
-                      {renderPartPreview("backLegs", backPreviewDepthLayers?.far ?? backLegsSvg)}
-                      {!backPreviewDepthLayers && renderLayerSelection("backLegs")}
-                    </g>
-                    {activeTweakPart === "backLegs" && (
-                      <rect
-                        x={backLegsTranslate.x + backLegsTx - 3}
-                        y={backLegsTranslate.y + backLegsTy - 3}
-                        width={266 * backLegsScale}
-                        height={186 * backLegsScale}
-                        fill="none"
-                        stroke="#f59e0b"
-                        strokeWidth="1.5"
-                        strokeDasharray="4,4"
-                      />
-                    )}
-                  </g>
-
-                  {/* 3. FAR FORELIMB (semantic generated parts only) */}
-                  {frontPreviewDepthLayers && (
-                    <g
-                      className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                      onClick={() => setActiveTweakPart("frontLegs")}
-                    >
-                      <g data-editor-part="frontLegs-far" transform={frontLegsTransformStr}>
-                        {renderPartPreview("frontLegs", frontPreviewDepthLayers.far)}
-                      </g>
-                    </g>
-                  )}
-
-                  {/* 4. BODY LAYER */}
-                  <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("body")}
-                  >
-                    <g data-editor-part="body" transform={bodyTransformStr}>
-                      {renderPartPreview("body", bodySvg)}
-                      {renderLayerSelection("body")}
-                    </g>
-                    {activeTweakPart === "body" && (
-                      <rect
-                        x={bodyTranslate.x + bodyTx - 3}
-                        y={bodyTranslate.y + bodyTy - 3}
-                        width={306 * bodyScale}
-                        height={226 * bodyScale}
-                        fill="none"
-                        stroke="#f59e0b"
-                        strokeWidth="1.5"
-                        strokeDasharray="4,4"
-                      />
-                    )}
-                  </g>
-
-                  {/* 5. NEAR HIND LIMB (semantic generated parts only) */}
-                  {backPreviewDepthLayers && (
-                    <g
-                      className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                      onClick={() => setActiveTweakPart("backLegs")}
-                    >
-                      <g data-editor-part="backLegs-near" transform={backLegsTransformStr}>
-                        {renderPartPreview("backLegs", backPreviewDepthLayers.near)}
-                        {renderLayerSelection("backLegs")}
-                      </g>
-                    </g>
-                  )}
-
-                  {/* 6. NEAR FORELIMB (or complete legacy forelimb part) */}
-                  <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("frontLegs")}
-                  >
-                    <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
-                      {renderPartPreview("frontLegs", frontPreviewDepthLayers?.near ?? frontLegsSvg)}
-                      {renderLayerSelection("frontLegs")}
-                    </g>
-                    {activeTweakPart === "frontLegs" && (
-                      <rect
-                        x={frontLegsTranslate.x + frontLegsTx - 3}
-                        y={frontLegsTranslate.y + frontLegsTy - 3}
-                        width={266 * frontLegsScale}
-                        height={186 * frontLegsScale}
-                        fill="none"
-                        stroke="#f59e0b"
-                        strokeWidth="1.5"
-                        strokeDasharray="4,4"
-                      />
-                    )}
-                  </g>
-
-                  {/* 7. HEAD LAYER (In front of body) */}
-                  <g 
-                    className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
-                    onClick={() => setActiveTweakPart("head")}
-                  >
-                    <g data-editor-part="head" transform={headTransformStr}>
-                      {renderPartPreview("head", headSvg)}
-                      {renderLayerSelection("head")}
-                    </g>
-                    {activeTweakPart === "head" && (
-                      <rect
-                        x={headTranslate.x + headTx - 3}
-                        y={headTranslate.y + headTy - 3}
-                        width={166 * headScale}
-                        height={166 * headScale}
-                        fill="none"
-                        stroke="#f59e0b"
-                        strokeWidth="1.5"
-                        strokeDasharray="4,4"
-                      />
-                    )}
-                  </g>
-
-                  {/* SKELETON LAYER */}
-                  {showPreviewSkeleton && (
-                    <g opacity="0.95" pointerEvents="none">
-                      {/* Neck link */}
-                      <line 
-                        x1={neckTarget.x} 
-                        y1={neckTarget.y} 
-                        x2={headTranslate.x + headTx + headLocalNeck.x} 
-                        y2={headTranslate.y + headTy + headLocalNeck.y} 
-                        stroke="#ec4899" 
-                        strokeWidth="2" 
-                        strokeDasharray="2,2" 
-                      />
-                      <circle cx={neckTarget.x} cy={neckTarget.y} r="5" fill="#ec4899" />
-                      <circle cx={headTranslate.x + headTx + headLocalNeck.x} cy={headTranslate.y + headTy + headLocalNeck.y} r="3" fill="#ffffff" />
-
-                      {/* Tail link */}
-                      <line 
-                        x1={tailTarget.x} 
-                        y1={tailTarget.y} 
-                        x2={tailTranslate.x + tailTx + tailLocalBody.x} 
-                        y2={tailTranslate.y + tailTy + tailLocalBody.y} 
-                        stroke="#3b82f6" 
-                        strokeWidth="2" 
-                        strokeDasharray="2,2" 
-                      />
-                      <circle cx={tailTarget.x} cy={tailTarget.y} r="5" fill="#3b82f6" />
-                      <circle cx={tailTranslate.x + tailTx + tailLocalBody.x} cy={tailTranslate.y + tailTy + tailLocalBody.y} r="3" fill="#ffffff" />
-
-                      {/* Front Legs link */}
-                      <line 
-                        x1={frontLegsTarget.x} 
-                        y1={frontLegsTarget.y} 
-                        x2={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} 
-                        y2={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} 
-                        stroke="#eab308" 
-                        strokeWidth="2" 
-                        strokeDasharray="2,2" 
-                      />
-                      <circle cx={frontLegsTarget.x} cy={frontLegsTarget.y} r="5" fill="#eab308" />
-                      <circle cx={frontLegsTranslate.x + frontLegsTx + frontLegsLocalBody.x} cy={frontLegsTranslate.y + frontLegsTy + frontLegsLocalBody.y} r="3" fill="#ffffff" />
-
-                      {/* Back Legs link */}
-                      <line 
-                        x1={backLegsTarget.x} 
-                        y1={backLegsTarget.y} 
-                        x2={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} 
-                        y2={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} 
-                        stroke="#10b981" 
-                        strokeWidth="2" 
-                        strokeDasharray="2,2" 
-                      />
-                      <circle cx={backLegsTarget.x} cy={backLegsTarget.y} r="5" fill="#10b981" />
-                      <circle cx={backLegsTranslate.x + backLegsTx + backLegsLocalBody.x} cy={backLegsTranslate.y + backLegsTy + backLegsLocalBody.y} r="3" fill="#ffffff" />
-                    </g>
-                  )}
-
-                  {/* Active Pivot Overlay Crosshair */}
-                  {(() => {
-                    let px = 0;
-                    let py = 0;
-                    if (activeTweakPart === "head") {
-                      px = headTranslate.x + headTx + headPivotX;
-                      py = headTranslate.y + headTy + headPivotY;
-                    } else if (activeTweakPart === "body") {
-                      px = bodyTranslate.x + bodyTx + bodyPivotX;
-                      py = bodyTranslate.y + bodyTy + bodyPivotY;
-                    } else if (activeTweakPart === "frontLegs") {
-                      px = frontLegsTranslate.x + frontLegsTx + frontLegsPivotX;
-                      py = frontLegsTranslate.y + frontLegsTy + frontLegsPivotY;
-                    } else if (activeTweakPart === "backLegs") {
-                      px = backLegsTranslate.x + backLegsTx + backLegsPivotX;
-                      py = backLegsTranslate.y + backLegsTy + backLegsPivotY;
-                    } else if (activeTweakPart === "tail") {
-                      px = tailTranslate.x + tailTx + tailPivotX;
-                      py = tailTranslate.y + tailTy + tailPivotY;
-                    }
-
-                    return (
-                      <g>
-                        <circle cx={px} cy={py} r="10" fill="none" stroke="#f59e0b" strokeWidth="1.5" className="animate-pulse" />
-                        <circle cx={px} cy={py} r="4" fill="#f59e0b" stroke="#18181b" strokeWidth="1" />
-                        <line x1={px - 14} y1={py} x2={px + 14} y2={py} stroke="#f59e0b" strokeWidth="1.2" />
-                        <line x1={px} y1={py - 14} x2={px} y2={py + 14} stroke="#f59e0b" strokeWidth="1.2" />
-                        <text x={px + 12} y={py - 6} fill="#f59e0b" className="text-[9px] font-mono font-bold bg-zinc-950 px-1.5 py-0.5 rounded border border-zinc-800 shadow-lg">
-                          {activeTweakPart.toUpperCase()} PIVOT
-                        </text>
-                      </g>
-                    );
-                  })()}
-                </svg>
-
-                <div className="absolute bottom-2.5 left-2.5 bg-black/80 backdrop-blur-md px-2 py-1 rounded text-[9px] font-mono text-zinc-400 border border-zinc-800 shadow-md">
-                  Click on parts inside preview to switch focus
-                </div>
-              </div>
-
-              {/* Part Selector Buttons */}
-              <div className="space-y-1.5 font-mono">
-                <span className="text-[9px] text-zinc-500 uppercase block tracking-wider font-mono">
-                  Active Part to Fine-Tune:
-                </span>
-                <div className="grid grid-cols-5 gap-1 font-mono">
-                  {(["head", "body", "frontLegs", "backLegs", "tail"] as const).map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => setActiveTweakPart(p)}
-                      className={`py-1.5 px-0.5 rounded-lg text-[9px] font-bold border transition-all text-center uppercase ${
-                        activeTweakPart === p
-                          ? "bg-amber-500/20 text-amber-400 border-amber-500/50 shadow-md"
-                          : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-850 hover:text-zinc-200"
-                      }`}
-                    >
-                      {p === "frontLegs" ? "F-Legs" : p === "backLegs" ? "B-Legs" : p}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Adjustments Panel */}
-              <div className="p-3 bg-zinc-950/60 rounded-xl border border-zinc-900 space-y-3 font-mono">
-                <div className="flex items-center justify-between pb-1 border-b border-zinc-900">
-                  <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest flex items-center gap-1">
-                    <SlidersHorizontal size={10} />
-                    {activeTweakPart} Transform
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleResetPart}
-                    className="text-[9px] font-mono text-zinc-500 hover:text-zinc-300 hover:underline flex items-center gap-1"
-                  >
-                    <RefreshCw size={8} /> RESET
-                  </button>
-                </div>
-
-                <div className="space-y-2.5">
-                  {/* Translate X */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Translate X</span>
-                      <span className="text-amber-500 font-bold">{activeT.tx}px</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="-120"
-                      max="120"
-                      step="1"
-                      value={activeT.tx}
-                      onChange={(e) => activeT.setTx(parseInt(e.target.value) || 0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-
-                  {/* Translate Y */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Translate Y</span>
-                      <span className="text-amber-500 font-bold">{activeT.ty}px</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="-120"
-                      max="120"
-                      step="1"
-                      value={activeT.ty}
-                      onChange={(e) => activeT.setTy(parseInt(e.target.value) || 0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-
-                  {/* Rotate */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Rotate Angle</span>
-                      <span className="text-amber-500 font-bold">{activeT.rot}°</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="-180"
-                      max="180"
-                      step="1"
-                      value={activeT.rot}
-                      onChange={(e) => activeT.setRot(parseInt(e.target.value) || 0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-
-                  {/* Scale */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Scale Factor</span>
-                      <span className="text-amber-500 font-bold">x{activeT.scale.toFixed(2)}</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0.3"
-                      max="2.5"
-                      step="0.05"
-                      value={activeT.scale}
-                      onChange={(e) => activeT.setScale(parseFloat(e.target.value) || 1.0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-
-                  {/* Pivot X */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Rotation Pivot X</span>
-                      <span className="text-amber-500 font-bold">{activeT.px}px</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max={activeT.viewBoxMaxX}
-                      step="1"
-                      value={activeT.px}
-                      onChange={(e) => activeT.setPx(parseInt(e.target.value) || 0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-
-                  {/* Pivot Y */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono">
-                      <span className="text-zinc-400">Rotation Pivot Y</span>
-                      <span className="text-amber-500 font-bold">{activeT.py}px</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max={activeT.viewBoxMaxY}
-                      step="1"
-                      value={activeT.py}
-                      onChange={(e) => activeT.setPy(parseInt(e.target.value) || 0)}
-                      className="w-full accent-amber-500 bg-zinc-800 h-1 rounded-lg appearance-none cursor-pointer"
-                    />
-                  </div>
-                </div>
-
-                {/* SUB-SHAPE ADJUSTER INTEGRATION */}
-                <div className="border-t border-zinc-800/80 pt-4 mt-4 space-y-3 font-sans">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-500 uppercase tracking-widest font-mono">
-                      <SlidersHorizontal size={12} />
-                      Sub-Shape Adjuster ({activeTweakPart})
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <button type="button" title="Undo layer edit" disabled={!svgUndo[activeTweakPart].length} onClick={undoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Undo2 size={10}/></button>
-                      <button type="button" title="Redo layer edit" disabled={!svgRedo[activeTweakPart].length} onClick={redoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Redo2 size={10}/></button>
-                    {activeShapeIndex !== null && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          commitActiveSvg(resetSvgLayerTransform(activePartSvgCode, activeShapeIndex));
-                          setActiveShapeIndex(null);
-                        }}
-                        className="text-[9px] font-mono font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white px-1.5 py-0.5 rounded transition-colors"
-                      >
-                        RESET SHAPE
-                      </button>
-                    )}
-                    </div>
-                  </div>
-
-                  {shapes.length === 0 ? (
-                    <div className="text-[10px] text-zinc-500 font-mono italic p-3 bg-zinc-950/40 rounded-lg border border-zinc-900/60 text-center">
-                      No vector shapes detected for {activeTweakPart}
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="space-y-1">
-                        <label className="text-[9px] text-zinc-400 font-mono block">Stable SVG Layers</label>
-                        <SvgLayersPanel
-                          layers={layerTree}
-                          selectedId={activeShapeIndex}
-                          onSelect={setActiveShapeIndex}
-                          onRename={(id, value) => updateLayer((svg) => renameSvgLayer(svg, id, value))}
-                          onVisibility={(id, visible) => updateLayer((svg) => setSvgLayerVisibility(svg, id, visible))}
-                          onLock={(id, locked) => {
-                            updateLayer((svg) => setSvgLayerLocked(svg, id, locked));
-                            if (locked && activeShapeIndex === id) setActiveShapeIndex(null);
-                          }}
-                          onMove={moveLayer}
-                        />
-                      </div>
-
-                      {activeShapeIndex !== null && (
-                        <div className="space-y-2.5 p-2.5 bg-zinc-950/50 rounded-lg border border-zinc-900/60 animate-fade-in">
-                          {/* Sub-shape transform inputs */}
-                          {(() => {
-                            const currentTransform: ShapeTransform = getSvgLayerTransform(activePartSvgCode, activeShapeIndex);
-
-                            const updateTransform = (fields: Partial<ShapeTransform>) => {
-                              const fixedPivot = activeTweakPart === "head" ? { pivotX: 120, pivotY: 110 }
-                                : activeTweakPart === "frontLegs" ? { pivotX: 75, pivotY: 15 }
-                                : activeTweakPart === "backLegs" ? { pivotX: 195, pivotY: 15 }
-                                : activeTweakPart === "tail" ? { pivotX: 15, pivotY: 15 }
-                                : { pivotX: neckX, pivotY: neckY };
-                              const next = { ...currentTransform, ...(keepLayerAnchorFixed && fields.scale !== undefined ? fixedPivot : {}), ...fields };
-                              commitActiveSvg(setSvgLayerTransform(activePartSvgCode, activeShapeIndex, next));
-                            };
-
-                            return (
-                              <div className="space-y-2.5 font-mono">
-                                {/* Translate X */}
-                                <div className="space-y-1">
-                                  <div className="flex justify-between text-[9px]">
-                                    <span className="text-zinc-400">Shape Move X</span>
-                                    <span className="text-amber-500 font-bold">{currentTransform.translateX || 0}px</span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min="-100"
-                                    max="100"
-                                    step="1"
-                                    value={currentTransform.translateX || 0}
-                                    onChange={(e) => updateTransform({ translateX: parseInt(e.target.value) || 0 })}
-                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
-                                  />
-                                </div>
-
-                                {/* Translate Y */}
-                                <div className="space-y-1">
-                                  <div className="flex justify-between text-[9px]">
-                                    <span className="text-zinc-400">Shape Move Y</span>
-                                    <span className="text-amber-500 font-bold">{currentTransform.translateY || 0}px</span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min="-100"
-                                    max="100"
-                                    step="1"
-                                    value={currentTransform.translateY || 0}
-                                    onChange={(e) => updateTransform({ translateY: parseInt(e.target.value) || 0 })}
-                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
-                                  />
-                                </div>
-
-                                {/* Rotate */}
-                                <div className="space-y-1">
-                                  <div className="flex justify-between text-[9px]">
-                                    <span className="text-zinc-400">Shape Rotate</span>
-                                    <span className="text-amber-500 font-bold">{currentTransform.rotate || 0}°</span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min="-180"
-                                    max="180"
-                                    step="1"
-                                    value={currentTransform.rotate || 0}
-                                    onChange={(e) => updateTransform({ rotate: parseInt(e.target.value) || 0 })}
-                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
-                                  />
-                                </div>
-
-                                {/* Scale */}
-                                <div className="space-y-1">
-                                  <div className="flex justify-between text-[9px]">
-                                    <span className="text-zinc-400">Shape Scale</span>
-                                    <span className="text-amber-500 font-bold">X {(currentTransform.scaleX ?? currentTransform.scale ?? 1).toFixed(2)} · Y {(currentTransform.scaleY ?? currentTransform.scale ?? 1).toFixed(2)}</span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min="0.2"
-                                    max="3"
-                                    step="0.05"
-                                    value={currentTransform.scale !== undefined ? currentTransform.scale : 1}
-                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0, scaleX: undefined, scaleY: undefined })}
-                                    className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
-                                  />
-                                </div>
-
-                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
-                                  <input type="checkbox" checked={keepLayerAnchorFixed} onChange={(event) => setKeepLayerAnchorFixed(event.target.checked)} className="accent-amber-500" />
-                                  Keep attachment anchor fixed while scaling
-                                </label>
-                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
-                                  <input type="checkbox" checked={proportionalLayerScaling} onChange={(event) => setProportionalLayerScaling(event.target.checked)} className="accent-amber-500" />
-                                  Proportional corner/side resizing
-                                </label>
-
-                                <div className="grid grid-cols-2 gap-2">
-                                  <label className="text-[9px] text-zinc-400">Pivot X<input type="number" value={currentTransform.pivotX ?? 0} onChange={(event) => updateTransform({ pivotX: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
-                                  <label className="text-[9px] text-zinc-400">Pivot Y<input type="number" value={currentTransform.pivotY ?? 0} onChange={(event) => updateTransform({ pivotY: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
-                                </div>
-
-                                {/* Fill Color override */}
-                                <div className="space-y-1 pt-1">
-                                  <span className="text-[9px] text-zinc-400 block mb-1">Color Override</span>
-                                  <div className="flex items-center gap-2">
-                                    <input
-                                      type="color"
-                                      value={currentTransform.fill || "#ffffff"}
-                                      onChange={(e) => updateTransform({ fill: e.target.value })}
-                                      className="w-7 h-7 bg-transparent border border-zinc-800 rounded cursor-pointer"
-                                    />
-                                    <input
-                                      type="text"
-                                      placeholder="HEX code or empty"
-                                      value={currentTransform.fill || ""}
-                                      onChange={(e) => updateTransform({ fill: e.target.value || undefined })}
-                                      className="flex-1 text-[11px] font-mono px-2 py-1 bg-zinc-950 border border-zinc-800 rounded text-zinc-300 focus:outline-none focus:border-amber-500"
-                                    />
-                                    {currentTransform.fill && (
-                                      <button
-                                        type="button"
-                                        onClick={() => updateTransform({ fill: undefined })}
-                                        className="text-[9px] px-1.5 py-1 bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white rounded"
-                                      >
-                                        Clear
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })()}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-              <RigEditorPanel
-                partId={activeTweakPart}
-                selectedGroupId={activeShapeIndex}
-                groupIds={activeLayerIds}
-                defaultPivot={attachmentPivot()}
-                rig={rigDefinition}
-                rotations={rigPoseRotations}
-                onRigChange={setRigDefinition}
-                onRotationsChange={setRigPoseRotations}
-              />
-            </div>
-
-            {/* COLUMN 2: Basic Info & Joints */}
-            <div className="lg:col-span-4 space-y-4 font-sans">
+            {/* Basic Info & Joints */}
+            <div className="space-y-4 font-sans">
               <div className="space-y-1.5">
                 <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest block font-mono">
                   Animal Name
@@ -2406,14 +3435,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <input
                         type="number"
                         value={neckX}
-                        onChange={(e) => setNeckX(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("neck", { x: parseInt(e.target.value) || 0, y: neckY })}
+                        onBlur={() => commitAnchor("neck")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
                       <input
                         type="number"
                         value={neckY}
-                        onChange={(e) => setNeckY(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("neck", { x: neckX, y: parseInt(e.target.value) || 0 })}
+                        onBlur={() => commitAnchor("neck")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
@@ -2426,14 +3457,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <input
                         type="number"
                         value={tailX}
-                        onChange={(e) => setTailX(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("tail", { x: parseInt(e.target.value) || 0, y: tailY })}
+                        onBlur={() => commitAnchor("tail")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
                       <input
                         type="number"
                         value={tailY}
-                        onChange={(e) => setTailY(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("tail", { x: tailX, y: parseInt(e.target.value) || 0 })}
+                        onBlur={() => commitAnchor("tail")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
@@ -2446,14 +3479,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <input
                         type="number"
                         value={frontLegsX}
-                        onChange={(e) => setFrontLegsX(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("frontLegs", { x: parseInt(e.target.value) || 0, y: frontLegsY })}
+                        onBlur={() => commitAnchor("frontLegs")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
                       <input
                         type="number"
                         value={frontLegsY}
-                        onChange={(e) => setFrontLegsY(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("frontLegs", { x: frontLegsX, y: parseInt(e.target.value) || 0 })}
+                        onBlur={() => commitAnchor("frontLegs")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
@@ -2466,14 +3501,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <input
                         type="number"
                         value={backLegsX}
-                        onChange={(e) => setBackLegsX(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("backLegs", { x: parseInt(e.target.value) || 0, y: backLegsY })}
+                        onBlur={() => commitAnchor("backLegs")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="X"
                       />
                       <input
                         type="number"
                         value={backLegsY}
-                        onChange={(e) => setBackLegsY(parseInt(e.target.value) || 0)}
+                        onChange={(e) => handleAnchorChange("backLegs", { x: backLegsX, y: parseInt(e.target.value) || 0 })}
+                        onBlur={() => commitAnchor("backLegs")}
                         className="w-full text-[10px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-center text-zinc-200"
                         placeholder="Y"
                       />
@@ -2483,8 +3520,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             </div>
 
-            {/* COLUMN 3: SVG Code Editors */}
-            <div className="lg:col-span-4 space-y-4 font-sans">
+            {/* SVG Code Editors */}
+            <div className="space-y-4 font-sans">
               <div className="flex items-center justify-between pb-1 border-b border-zinc-800">
                 <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest block font-mono">
                   SVG Part Vectors (Pure SVGs)

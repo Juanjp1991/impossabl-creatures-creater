@@ -55,9 +55,20 @@ export interface Animal {
 }
 
 export interface PartAdjustment {
+  /**
+   * Uniform scale, and the value the rest of the layout maths reads — connection targets
+   * and the ground shadow all key off it. `scaleX`/`scaleY` stretch on top of it.
+   */
   scale: number;
   offsetX: number;
   offsetY: number;
+  /** Degrees about the part's own joint. Optional so persisted rosters keep loading. */
+  rotation?: number;
+  /** Set only while non-uniform stretch is active; otherwise `scale` governs both axes. */
+  scaleX?: number;
+  scaleY?: number;
+  flipX?: boolean;
+  flipY?: boolean;
 }
 
 export interface ShapeAdjustment {

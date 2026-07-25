@@ -22,7 +22,7 @@ const SVG_FIELD: Record<AnimalPartType, keyof AnimalDraft> = { head: "headSvg", 
 const REQUIRED_GROUPS: Record<AnimalPartType, string[]> = {
   head: ["head-root"], body: ["body-root"], frontLegs: ["frontLegs-root"], backLegs: ["backLegs-root"], tail: ["tail-root"],
 };
-const CONNECTION_BOUNDS = {
+export const CONNECTION_BOUNDS = {
   neck: { minX: 40, maxX: 120, minY: 50, maxY: 130 },
   tail: { minX: 200, maxX: 280, minY: 80, maxY: 160 },
   frontLegs: { minX: 70, maxX: 140, minY: 130, maxY: 190 },

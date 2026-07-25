@@ -1,5 +1,6 @@
 import React from "react";
 import { resolveRamp, type RampToken } from "../generation/palette";
+import { toSvgTransform, type PartTransform as ShapeTransform } from "../editor/transform";
 
 const ALLOWED_TAGS = new Set([
   "svg",
@@ -54,19 +55,11 @@ function camelCaseAttribute(attr: string): string {
 }
 
 /**
- * Interface representing a transformed shape inside an SVG part.
+ * A transformed shape inside an SVG part. Canonically defined in `src/editor/transform.ts`
+ * (which stays DOM- and React-free so it is unit-testable); re-exported here under its
+ * original name because most of the app imports it from this module.
  */
-export interface ShapeTransform {
-  translateX: number;
-  translateY: number;
-  rotate: number;
-  scale: number;
-  scaleX?: number;
-  scaleY?: number;
-  fill?: string;
-  pivotX?: number;
-  pivotY?: number;
-}
+export type { PartTransform as ShapeTransform } from "../editor/transform";
 
 export interface SvgShapeInfo {
   index: number;
@@ -250,20 +243,7 @@ export function parseSvgToReact(
     if (currentShapeIndex !== -1 && shapeTransforms && shapeTransforms[currentShapeIndex]) {
       const stableId = node.getAttribute("id") || "";
       const transform = shapeTransforms[stableId] || shapeTransforms[currentShapeIndex];
-      let tString = "";
-      if (transform.translateX !== 0 || transform.translateY !== 0) {
-        tString += `translate(${transform.translateX}, ${transform.translateY}) `;
-      }
-      if (transform.rotate !== 0) {
-        tString += `rotate(${transform.rotate}, ${transform.pivotX || 0}, ${transform.pivotY || 0}) `;
-      }
-      const scaleX = transform.scaleX ?? transform.scale;
-      const scaleY = transform.scaleY ?? transform.scale;
-      if (scaleX !== 1 || scaleY !== 1) {
-        const px = transform.pivotX || 0;
-        const py = transform.pivotY || 0;
-        tString += `translate(${px}, ${py}) scale(${scaleX}, ${scaleY}) translate(${-px}, ${-py}) `;
-      }
+      const tString = toSvgTransform(transform);
 
       if (tString) {
         const existingTransform = props.transform || "";
