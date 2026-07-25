@@ -48,7 +48,10 @@ function tagTokens(svg: string): Array<{ closing: boolean; selfClosing: boolean;
 
 function geometryPoints(svg: string): Array<{ x: number; y: number }> {
   const points: Array<{ x: number; y: number }> = [];
-  for (const match of svg.matchAll(/<(path|polygon|polyline)\b[^>]*(?:d|points)\s*=\s*["']([^"']+)["'][^>]*>/gi)) {
+  // The attribute name must be preceded by whitespace and matched lazily: a greedy [^>]* would
+  // otherwise prefer the LAST "d="-looking text in the tag, which is the `d` inside `id="…"`,
+  // capturing the id value instead of the path data and reporting a fully-drawn part as empty.
+  for (const match of svg.matchAll(/<(path|polygon|polyline)\b[^>]*?\s(?:d|points)\s*=\s*["']([^"']+)["']/gi)) {
     const nums = match[2].match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
     for (let index = 0; index + 1 < nums.length; index += 2) points.push({ x: nums[index], y: nums[index + 1] });
   }
