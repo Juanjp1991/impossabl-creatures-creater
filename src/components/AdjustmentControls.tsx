@@ -1,7 +1,6 @@
 import React from "react";
 import { PartAdjustment, AnimalPartType } from "../types";
 import { Move, Maximize2, RotateCcw } from "lucide-react";
-import { getSvgShapes, ShapeTransform } from "../utils/svgParser";
 
 interface AdjustmentControlsProps {
   activePart: AnimalPartType | null;

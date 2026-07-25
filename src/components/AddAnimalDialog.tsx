@@ -1,7 +1,23 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2 } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2 } from "lucide-react";
 import { Animal } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
+import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
+import { populateGuidedBrief } from "../generation/clientPipeline";
+import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode } from "../generation/contracts";
+import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
+import { validateAnimalDraft } from "../generation/validation";
+import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
+import { fetchModels, type ModelOption } from "../generation/apiClient";
+import { ContactSheetSelector } from "./ContactSheetSelector";
+import { SvgLayersPanel } from "./SvgLayersPanel";
+import { RigEditorPanel } from "./RigEditorPanel";
+import { ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
+import type { RigDefinition } from "../rig/contracts";
+import { computeForwardKinematics, computeLocalJointMatrices, rigMatrixToSvg } from "../rig/engine";
+
+type EditablePart = "head" | "body" | "frontLegs" | "backLegs" | "tail";
+const EMPTY_HISTORY = (): Record<EditablePart, string[]> => ({ head: [], body: [], frontLegs: [], backLegs: [], tail: [] });
 
 interface AddAnimalDialogProps {
   isOpen: boolean;
@@ -124,6 +140,22 @@ const TEMPLATES = [
   }
 ];
 
+// Minimal plan used only to shape a metadata record when a sampled composition has no
+// usable per-sample plan. Never used to gate: validation runs against the real plan.
+const FALLBACK_PLAN: AnatomyStylePlan = {
+  speciesFeatures: [],
+  anatomyTemplate: "quadruped-five-part",
+  requiredParts: ["head", "body", "frontLegs", "backLegs", "tail"],
+  proportionsAndSilhouette: "",
+  pose: "",
+  orientation: "left-facing",
+  paletteAndMarkings: "",
+  layerPlan: [],
+  attachmentStrategy: [],
+  requiredNamedGroups: { head: ["head-root"], body: ["body-root"], frontLegs: ["frontLegs-root"], backLegs: ["backLegs-root"], tail: ["tail-root"] },
+  suggestedJoints: [],
+};
+
 export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }: AddAnimalDialogProps) {
   const [name, setName] = useState("");
   const [color, setColor] = useState("#3B82F6");
@@ -148,23 +180,51 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [tailSvg, setTailSvg] = useState("");
 
   // Sub-shape adjustment states
-  const [shapeAdjustments, setShapeAdjustments] = useState<Record<"head" | "body" | "frontLegs" | "backLegs" | "tail", Record<number, ShapeTransform>>>({
+  const [shapeAdjustments, setShapeAdjustments] = useState<Record<EditablePart, Record<string, ShapeTransform>>>({
     head: {},
     body: {},
     frontLegs: {},
     backLegs: {},
     tail: {},
   });
-  const [activeShapeIndex, setActiveShapeIndex] = useState<number | null>(null);
+  const [activeShapeIndex, setActiveShapeIndex] = useState<string | null>(null);
+  const [svgUndo, setSvgUndo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
+  const [svgRedo, setSvgRedo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
+  const [keepLayerAnchorFixed, setKeepLayerAnchorFixed] = useState(true);
+  const [proportionalLayerScaling, setProportionalLayerScaling] = useState(true);
+  const previewStageRef = useRef<SVGSVGElement>(null);
+  const [selectedLayerBounds, setSelectedLayerBounds] = useState<{ x: number; y: number; width: number; height: number; transform: string } | null>(null);
+  const [rigDefinition, setRigDefinition] = useState<RigDefinition | undefined>();
+  const [rigPoseRotations, setRigPoseRotations] = useState<Record<string, number>>({});
 
   const [errorMsg, setErrorMsg] = useState("");
 
   // AI Generation State
   const [aiPrompt, setAiPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isAutoFillingBrief, setIsAutoFillingBrief] = useState(false);
   const [generationStep, setGenerationStep] = useState("");
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
   const [isDragging, setIsDragging] = useState(false);
+  const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
+  const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
+  const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
+  // §5.3 parallel-sample-and-select state. When `samples` is set the contact sheet is shown.
+  const [samples, setSamples] = useState<GeneratedSample[] | null>(null);
+  const [sampleCount, setSampleCount] = useState(DEFAULT_SAMPLE_COUNT);
+  const [sampleProgress, setSampleProgress] = useState<{ done: number; total: number } | null>(null);
+  // §7 in-app model selector — the chosen model threads through every AI call.
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelId, setModelId] = useState<string>("");
+  const displayedValidation = generationMetadata
+    ? generationMetadata.validationHistory[generationMetadata.bestAttempt ?? generationMetadata.validationHistory.length - 1] ?? generationMetadata.validationHistory.at(-1)
+    : undefined;
+  const displayedReview = generationMetadata
+    ? [...(generationMetadata.attemptHistory ?? [])].reverse().find((attempt) => attempt.accepted && attempt.attempt <= (generationMetadata.bestAttempt ?? Number.MAX_SAFE_INTEGER) && attempt.review)?.review
+      ?? generationMetadata.reviewHistory[0]
+      ?? generationMetadata.reviewHistory.at(-1)
+    : undefined;
 
   const handleImageUpload = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -208,6 +268,13 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     if (e.target.files && e.target.files[0]) {
       handleImageUpload(e.target.files[0]);
     }
+  };
+
+  const updateBriefField = <K extends keyof GuidedAnimalBrief>(key: K, value: GuidedAnimalBrief[K]) => {
+    setGuidedBrief((current) => {
+      const next = { ...current, [key]: value };
+      return key === "summary" ? next : { ...next, summary: summarizeBrief(next) };
+    });
   };
 
   // Preview settings states
@@ -265,11 +332,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   // Pre-populate fields when editing an existing animal
   useEffect(() => {
     if (isOpen) {
+      setSvgUndo(EMPTY_HISTORY());
+      setSvgRedo(EMPTY_HISTORY());
+      setSamples(null);
+      setSampleProgress(null);
       if (editingAnimal) {
         setName(editingAnimal.name);
         setColor(editingAnimal.color);
         setAccentColor(editingAnimal.accentColor);
         setDescription(editingAnimal.description);
+        setGenerationMetadata(editingAnimal.generationMetadata);
+        setReferenceMode(editingAnimal.generationMetadata?.referenceMode ?? "match");
+        setGuidedBrief(editingAnimal.generationMetadata?.brief ?? createDefaultBrief(editingAnimal.name));
+        setPipelinePreviews(null);
+        setRigDefinition(editingAnimal.rig);
+        setRigPoseRotations(editingAnimal.rig?.bindPose ?? {});
         
         setNeckX(editingAnimal.bodyConnections.neck.x);
         setNeckY(editingAnimal.bodyConnections.neck.y);
@@ -304,6 +381,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setColor("#3B82F6");
         setAccentColor("#F59E0B");
         setDescription("");
+        setGenerationMetadata(undefined);
+        setGuidedBrief(createDefaultBrief());
+        setPipelinePreviews(null);
+        setRigDefinition(undefined);
+        setRigPoseRotations({});
         setNeckX(75);
         setNeckY(90);
         setTailX(260);
@@ -330,109 +412,147 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   }, [isOpen, editingAnimal]);
 
-  const handleGenerateWithAI = async () => {
-    if (!aiPrompt.trim() && !uploadedImage) {
+  // Load the available models once the dialog opens; keep any prior explicit choice.
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    fetchModels().then((result) => {
+      if (cancelled) return;
+      setModels(result.models);
+      setModelId((current) => (current && result.models.some((model) => model.id === current)) ? current : result.defaultModelId);
+    });
+    return () => { cancelled = true; };
+  }, [isOpen]);
+
+  // Keep the pipeline previews synchronized with palette, connection and SVG
+  // edits. This also re-colourizes older generated drafts that used CSS
+  // variable placeholders before the preview renderer supported them.
+  useEffect(() => {
+    if (!generationMetadata || !headSvg.trim() || !bodySvg.trim() || !frontLegsSvg.trim() || !backLegsSvg.trim() || !tailSvg.trim()) return;
+    const draft: AnimalDraft = {
+      name: name || "Generated creature",
+      color,
+      accentColor,
+      description: description || name || "Generated creature",
+      bodyConnections: {
+        neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY },
+        frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY },
+      },
+      headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg,
+      layoutMetadata: generationMetadata.generatedLayout,
+    };
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(draft), diagnosticSvg: buildAssembledPreviewSvg(draft, true) });
+  }, [generationMetadata, name, color, accentColor, description, neckX, neckY, tailX, tailY, frontLegsX, frontLegsY, backLegsX, backLegsY, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
+
+  const applyAnimalDraft = (data: AnimalDraft) => {
+    setName(data.name || ""); setColor(data.color || "#cccccc"); setAccentColor(data.accentColor || "#ffaa00"); setDescription(data.description || "");
+    setNeckX(data.bodyConnections?.neck?.x ?? 75); setNeckY(data.bodyConnections?.neck?.y ?? 90);
+    setTailX(data.bodyConnections?.tail?.x ?? 260); setTailY(data.bodyConnections?.tail?.y ?? 105);
+    setFrontLegsX(data.bodyConnections?.frontLegs?.x ?? 115); setFrontLegsY(data.bodyConnections?.frontLegs?.y ?? 160);
+    setBackLegsX(data.bodyConnections?.backLegs?.x ?? 235); setBackLegsY(data.bodyConnections?.backLegs?.y ?? 160);
+    setHeadSvg(data.headSvg || ""); setBodySvg(data.bodySvg || ""); setFrontLegsSvg(data.frontLegsSvg || ""); setBackLegsSvg(data.backLegsSvg || ""); setTailSvg(data.tailSvg || "");
+  };
+
+  const handleAutoFillBrief = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
+      setErrorMsg("Enter an animal name or upload a reference image before auto-filling details.");
+      return;
+    }
+    setIsAutoFillingBrief(true);
+    setErrorMsg("");
+    setGenerationStep("Gemini 3.6 Flash is preparing the guided prompt details...");
+    try {
+      const brief = await populateGuidedBrief({ currentBrief: { ...guidedBrief, animalName }, image: uploadedImage, referenceMode, modelId });
+      setGuidedBrief(brief);
+      setAiPrompt(brief.animalName);
+      setGenerationStep("Prompt details populated. Review or edit them before generating.");
+    } catch (error: any) {
+      setErrorMsg(error?.message || "Could not auto-fill the guided prompt details.");
+      setGenerationStep("Prompt auto-fill stopped; your existing details were preserved.");
+    } finally {
+      setIsAutoFillingBrief(false);
+    }
+  };
+
+  // §5.3: generate N whole-animal samples in parallel, then let the user pick the best
+  // part per slot from a contact sheet. No review/repair loop, no new endpoint.
+  const handleGenerateSamples = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
       setErrorMsg("Please enter an animal description or upload an inspiring image first.");
       return;
     }
-
+    const brief: GuidedAnimalBrief = { ...guidedBrief, animalName: animalName || guidedBrief.animalName, summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: animalName || guidedBrief.animalName }) };
+    setGuidedBrief(brief);
     setIsGenerating(true);
     setErrorMsg("");
-    setGenerationStep("Contacting Gemini 3.5 Flash...");
-
+    setSamples(null);
+    setSampleProgress({ done: 0, total: sampleCount });
+    setGenerationStep(`Generating ${sampleCount} variations in parallel (concurrency ${DEFAULT_SAMPLE_CONCURRENCY})...`);
     try {
-      const timers = [
-        setTimeout(() => setGenerationStep("Drafting unique creature biology..."), 1200),
-        setTimeout(() => setGenerationStep("Forging vector coordinates for custom parts..."), 3000),
-        setTimeout(() => setGenerationStep("Aligning joints for head, legs, and tail..."), 5000),
-        setTimeout(() => setGenerationStep("Polishing SVG paths..."), 7000),
-      ];
-
-      const response = await fetch("/api/generate-animal", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ 
-          prompt: aiPrompt.trim(),
-          image: uploadedImage,
-        }),
+      const results = await runSampleGeneration({
+        prompt: brief.animalName,
+        image: uploadedImage,
+        referenceMode,
+        brief,
+        modelId,
+        sampleCount,
+        concurrency: DEFAULT_SAMPLE_CONCURRENCY,
+        onProgress: (done, total) => setSampleProgress({ done, total }),
       });
-
-      timers.forEach(t => clearTimeout(t));
-
-      if (!response.ok) {
-        let errMsg = `Server returned error status ${response.status}`;
-        try {
-          const text = await response.text();
-          try {
-            const errData = JSON.parse(text);
-            errMsg = errData.error || errMsg;
-          } catch {
-            if (text.includes("<!doctype html>") || text.includes("<html")) {
-              errMsg = `Server error (${response.status}): The server is temporarily busy or returned an HTML error page. Please try again.`;
-            } else {
-              errMsg = text.substring(0, 150) || errMsg;
-            }
-          }
-        } catch {
-          // ignore
-        }
-        throw new Error(errMsg);
-      }
-
-      const data = await response.json().catch(() => {
-        throw new Error("Failed to parse the generated creature JSON data from the server.");
-      });
-      
-      setName(data.name || "");
-      setColor(data.color || "#cccccc");
-      setAccentColor(data.accentColor || "#ffaa00");
-      setDescription(data.description || "");
-      
-      if (data.bodyConnections) {
-        if (data.bodyConnections.neck) {
-          setNeckX(data.bodyConnections.neck.x ?? 75);
-          setNeckY(data.bodyConnections.neck.y ?? 90);
-        }
-        if (data.bodyConnections.tail) {
-          setTailX(data.bodyConnections.tail.x ?? 260);
-          setTailY(data.bodyConnections.tail.y ?? 105);
-        }
-        if (data.bodyConnections.frontLegs) {
-          setFrontLegsX(data.bodyConnections.frontLegs.x ?? 115);
-          setFrontLegsY(data.bodyConnections.frontLegs.y ?? 160);
-        }
-        if (data.bodyConnections.backLegs) {
-          setBackLegsX(data.bodyConnections.backLegs.x ?? 235);
-          setBackLegsY(data.bodyConnections.backLegs.y ?? 160);
-        }
-      }
-
-      setHeadSvg(data.headSvg || "");
-      setBodySvg(data.bodySvg || "");
-      setFrontLegsSvg(data.frontLegsSvg || "");
-      setBackLegsSvg(data.backLegsSvg || "");
-      setTailSvg(data.tailSvg || "");
-
-      // Reset transform adjustments for fresh generation
-      setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
-      setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
-      setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
-      setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
-      setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
-      setActiveTweakPart("head");
-
-      setAiPrompt("");
-      setAiMode("refine"); // Auto-switch to refine mode upon successful generation
-      setGenerationStep("Success! Animal draft generated below. Feel free to tweak and forge!");
-      setTimeout(() => setGenerationStep(""), 5000);
+      const usable = results.filter((sample) => sample.animal).length;
+      if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every sample failed to generate.");
+      setSamples(results);
+      setGenerationStep(`Generated ${usable}/${results.length} usable samples. Pick the best part for each slot.`);
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err?.message || "An unexpected error occurred during generation. Make sure GEMINI_API_KEY is configured.");
+      setErrorMsg(err?.message || "Variation generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Variation generation stopped.");
     } finally {
       setIsGenerating(false);
+      setSampleProgress(null);
     }
+  };
+
+  const handleUseSelection = (animal: AnimalDraft, provenance: SampleProvenance) => {
+    applyAnimalDraft(animal);
+    // Validate the composed frankenstein on physical ground truth only (the validator no
+    // longer consults the plan; parts came from different samples anyway).
+    const plan = provenance.plan;
+    const validation = validateAnimalDraft(animal);
+    const metadata: GenerationMetadata = {
+      originalRequest: aiPrompt.trim() || guidedBrief.animalName,
+      brief: guidedBrief,
+      plan: plan ?? FALLBACK_PLAN,
+      models: provenance.models ?? { planner: "sampled", generator: "sampled", reviewer: "n/a", repair: "n/a" },
+      promptVersions: provenance.promptVersions ?? { planner: "sample", generator: "sample", reviewer: "n/a", repair: "n/a" },
+      validationHistory: [validation],
+      reviewHistory: [],
+      repairs: [],
+      automaticRepairLimit: 0,
+      completedRepairRounds: 0,
+      attemptHistory: [],
+      bestAttempt: 0,
+      stopReason: validation.valid ? "approved" : "no-actionable-issues",
+      rescueUsed: false,
+      finalStatus: validation.valid ? "approved" : "warnings",
+      createdAt: new Date().toISOString(),
+      generatedLayout: animal.layoutMetadata,
+      referenceMode: uploadedImage ? referenceMode : undefined,
+      metrics: { firstPassGeometrySuccess: validation.valid && !validation.issues.some((entry) => entry.code.startsWith("geometry.")), repairCount: 0, latencyMs: 0 },
+    };
+    setGenerationMetadata(metadata);
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(animal), diagnosticSvg: buildAssembledPreviewSvg(animal, true) });
+    setSamples(null);
+    setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
+    setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
+    setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
+    setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
+    setActiveTweakPart("head");
+    setAiMode("refine");
+    setGenerationStep(validation.valid ? "Selection applied and passes the deterministic checks. Refine or forge." : "Selection applied with warnings. Refine a part, edit the SVG, or forge as-is.");
   };
 
   const handleRefineWithAI = async () => {
@@ -443,7 +563,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     setIsGenerating(true);
     setErrorMsg("");
-    setGenerationStep(`Refining ${refinePart === "all" ? "the entire creature" : refinePart} with Gemini 3.5 Flash...`);
+    setGenerationStep(`Refining ${refinePart === "all" ? "the entire creature" : refinePart} with Gemini 3.6 Flash...`);
 
     try {
       const timers = [
@@ -462,6 +582,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           prompt: refinePrompt.trim(),
           targetPart: refinePart,
           image: uploadedImage,
+          referenceMode,
+          modelId,
           currentAnimal: {
             name,
             color,
@@ -507,13 +629,20 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       const data = await response.json().catch(() => {
         throw new Error("Failed to parse the modified creature JSON data from the server.");
       });
-      
-      setName(data.name || name);
-      setColor(data.color || color);
-      setAccentColor(data.accentColor || accentColor);
-      setDescription(data.description || description);
-      
-      if (data.bodyConnections) {
+
+      if (refinePart !== "all" && !data.modifiedParts?.includes(refinePart)) {
+        throw new Error(`Gemini did not return a changed ${refinePart} SVG. Every existing part was preserved.`);
+      }
+      const changedSvg = (value: unknown, fallback: string) => typeof value === "string" && value.trim() && !/^(?:null|undefined)$/i.test(value.trim()) ? value : fallback;
+
+      if (refinePart === "all") {
+        setName(data.name || name);
+        setColor(data.color || color);
+        setAccentColor(data.accentColor || accentColor);
+        setDescription(data.description || description);
+      }
+
+      if ((refinePart === "all" || refinePart === "body") && data.bodyConnections) {
         if (data.bodyConnections.neck) {
           setNeckX(data.bodyConnections.neck.x ?? neckX);
           setNeckY(data.bodyConnections.neck.y ?? neckY);
@@ -532,11 +661,17 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         }
       }
 
-      setHeadSvg(data.headSvg || headSvg);
-      setBodySvg(data.bodySvg || bodySvg);
-      setFrontLegsSvg(data.frontLegsSvg || frontLegsSvg);
-      setBackLegsSvg(data.backLegsSvg || backLegsSvg);
-      setTailSvg(data.tailSvg || tailSvg);
+      if (refinePart === "all") {
+        setHeadSvg(changedSvg(data.headSvg, headSvg));
+        setBodySvg(changedSvg(data.bodySvg, bodySvg));
+        setFrontLegsSvg(changedSvg(data.frontLegsSvg, frontLegsSvg));
+        setBackLegsSvg(changedSvg(data.backLegsSvg, backLegsSvg));
+        setTailSvg(changedSvg(data.tailSvg, tailSvg));
+      } else if (refinePart === "head") setHeadSvg(changedSvg(data.headSvg, headSvg));
+      else if (refinePart === "body") setBodySvg(changedSvg(data.bodySvg, bodySvg));
+      else if (refinePart === "frontLegs") setFrontLegsSvg(changedSvg(data.frontLegsSvg, frontLegsSvg));
+      else if (refinePart === "backLegs") setBackLegsSvg(changedSvg(data.backLegsSvg, backLegsSvg));
+      else if (refinePart === "tail") setTailSvg(changedSvg(data.tailSvg, tailSvg));
 
       setRefinePrompt("");
       setGenerationStep(`Success! Iterative modification applied to ${refinePart === "all" ? "creature" : refinePart}.`);
@@ -591,6 +726,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setErrorMsg("All five part SVGs (Head, Body, Front Legs, Back Legs, Tail) must be populated.");
       return;
     }
+    let finalGenerationMetadata = generationMetadata;
+    if (generationMetadata) {
+      const validation = validateAnimalDraft({ name, color, accentColor, description: description || name, bodyConnections: { neck: { x: neckX, y: neckY }, tail: { x: tailX, y: tailY }, frontLegs: { x: frontLegsX, y: frontLegsY }, backLegs: { x: backLegsX, y: backLegsY } }, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg, layoutMetadata: generationMetadata.generatedLayout }, generationMetadata.plan);
+      finalGenerationMetadata = {
+        ...generationMetadata,
+        validationHistory: [...generationMetadata.validationHistory, validation],
+        finalStatus: validation.valid ? generationMetadata.finalStatus : "warnings",
+        forgedWithTechnicalWarnings: !validation.valid || generationMetadata.forgedWithTechnicalWarnings,
+      };
+      setGenerationMetadata(finalGenerationMetadata);
+      if (!validation.valid) console.warn(`Forging with ${validation.issues.filter((entry) => entry.severity === "error").length} unresolved technical validation warning(s).`);
+    }
 
     // Helper to bake the custom transformations into the raw SVG strings via group wraps
     const wrapWithTransform = (svg: string, tx: number, ty: number, rot: number, scale: number, px: number, py: number) => {
@@ -605,7 +752,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
     const applyShapeTransformsToSvg = (
       svgString: string,
-      transforms: Record<number, ShapeTransform>
+      transforms: Record<string, ShapeTransform>
     ): string => {
       if (!svgString.trim()) return "";
       if (!transforms || Object.keys(transforms).length === 0) return svgString;
@@ -623,17 +770,21 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           const tagName = node.tagName.toLowerCase();
           if (isAdjustableTag(tagName)) {
             const currentIdx = shapeCounter++;
-            const t = transforms[currentIdx];
+            const t = transforms[node.getAttribute("id") || String(currentIdx)];
             if (t) {
               let tString = "";
               if (t.translateX !== 0 || t.translateY !== 0) {
                 tString += `translate(${t.translateX}, ${t.translateY}) `;
               }
               if (t.rotate !== 0) {
-                tString += `rotate(${t.rotate}) `;
+                tString += `rotate(${t.rotate}, ${t.pivotX || 0}, ${t.pivotY || 0}) `;
               }
-              if (t.scale !== 1) {
-                tString += `scale(${t.scale}) `;
+              const scaleX = t.scaleX ?? t.scale;
+              const scaleY = t.scaleY ?? t.scale;
+              if (scaleX !== 1 || scaleY !== 1) {
+                const px = t.pivotX || 0;
+                const py = t.pivotY || 0;
+                tString += `translate(${px}, ${py}) scale(${scaleX}, ${scaleY}) translate(${-px}, ${-py}) `;
               }
               tString = tString.trim();
 
@@ -667,11 +818,11 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       }
     };
 
-    const bakedHeadSvg = applyShapeTransformsToSvg(headSvg, shapeAdjustments.head);
-    const bakedBodySvg = applyShapeTransformsToSvg(bodySvg, shapeAdjustments.body);
-    const bakedFrontLegsSvg = applyShapeTransformsToSvg(frontLegsSvg, shapeAdjustments.frontLegs);
-    const bakedBackLegsSvg = applyShapeTransformsToSvg(backLegsSvg, shapeAdjustments.backLegs);
-    const bakedTailSvg = applyShapeTransformsToSvg(tailSvg, shapeAdjustments.tail);
+    const bakedHeadSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(headSvg, "head"), shapeAdjustments.head);
+    const bakedBodySvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(bodySvg, "body"), shapeAdjustments.body);
+    const bakedFrontLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(frontLegsSvg, "frontLegs"), shapeAdjustments.frontLegs);
+    const bakedBackLegsSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(backLegsSvg, "backLegs"), shapeAdjustments.backLegs);
+    const bakedTailSvg = applyShapeTransformsToSvg(ensureStableSvgLayerIds(tailSvg, "tail"), shapeAdjustments.tail);
 
     const finalHeadSvg = wrapWithTransform(bakedHeadSvg, headTx, headTy, headRot, headScale, headPivotX, headPivotY);
     const finalBodySvg = wrapWithTransform(bakedBodySvg, bodyTx, bodyTy, bodyRot, bodyScale, bodyPivotX, bodyPivotY);
@@ -755,6 +906,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
           rawContent: finalTailSvg.trim(),
         },
       },
+      generationMetadata: finalGenerationMetadata,
+      rig: rigDefinition,
     };
 
     onAddAnimal(newAnimal);
@@ -792,7 +945,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       case "body":
         return {
           tx: bodyTx, setTx: setBodyTx,
-          ty: bodyTy, setTy: setHeadTy, // wait, map to correct setter
+          ty: bodyTy, setTy: setBodyTy,
           rot: bodyRot, setRot: setBodyRot,
           scale: bodyScale, setScale: setBodyScale,
           px: bodyPivotX, setPx: setBodyPivotX,
@@ -836,9 +989,190 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     return activeTweakPart === "head" ? headSvg : activeTweakPart === "body" ? bodySvg : activeTweakPart === "frontLegs" ? frontLegsSvg : activeTweakPart === "backLegs" ? backLegsSvg : tailSvg;
   }, [activeTweakPart, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
 
+  const setPartSvg = (part: EditablePart, value: string) => {
+    if (part === "head") setHeadSvg(value);
+    else if (part === "body") setBodySvg(value);
+    else if (part === "frontLegs") setFrontLegsSvg(value);
+    else if (part === "backLegs") setBackLegsSvg(value);
+    else setTailSvg(value);
+  };
+
+  const commitActiveSvg = (next: string) => {
+    if (next === activePartSvgCode) return;
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart].slice(-49), activePartSvgCode] }));
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: [] }));
+    setPartSvg(activeTweakPart, next);
+  };
+
+  const undoSvg = () => {
+    const stack = svgUndo[activeTweakPart];
+    const previous = stack.at(-1);
+    if (previous === undefined) return;
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: history[activeTweakPart].slice(0, -1) }));
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart], activePartSvgCode] }));
+    setPartSvg(activeTweakPart, previous);
+  };
+
+  const redoSvg = () => {
+    const stack = svgRedo[activeTweakPart];
+    const next = stack.at(-1);
+    if (next === undefined) return;
+    setSvgRedo((history) => ({ ...history, [activeTweakPart]: history[activeTweakPart].slice(0, -1) }));
+    setSvgUndo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart], activePartSvgCode] }));
+    setPartSvg(activeTweakPart, next);
+  };
+
+  useEffect(() => {
+    if (!activePartSvgCode.trim()) return;
+    const stabilized = ensureStableSvgLayerIds(activePartSvgCode, activeTweakPart);
+    if (stabilized !== activePartSvgCode) setPartSvg(activeTweakPart, stabilized);
+  }, [activePartSvgCode, activeTweakPart]);
+
   const shapes = useMemo(() => {
     return activePartSvgCode ? getSvgShapes(activePartSvgCode) : [];
   }, [activePartSvgCode]);
+
+  const layerTree = useMemo(() => activePartSvgCode ? getSvgLayerTree(activePartSvgCode) : [], [activePartSvgCode]);
+  const activeLayerIds = useMemo(() => {
+    const ids: string[] = [];
+    const visit = (nodes: typeof layerTree) => nodes.forEach((node) => { ids.push(node.id); visit(node.children); });
+    visit(layerTree);
+    return ids;
+  }, [layerTree]);
+
+  const rigTransformsByPart = useMemo(() => {
+    const transforms: Record<EditablePart, Record<string, string>> = { head: {}, body: {}, frontLegs: {}, backLegs: {}, tail: {} };
+    if (!rigDefinition?.joints.length) return transforms;
+    try {
+      const result = computeForwardKinematics(rigDefinition, rigPoseRotations);
+      const localMatrices = computeLocalJointMatrices(rigDefinition, rigPoseRotations);
+      const svgByPart: Record<EditablePart, string> = { head: headSvg, body: bodySvg, frontLegs: frontLegsSvg, backLegs: backLegsSvg, tail: tailSvg };
+      for (const joint of rigDefinition.joints) if (joint.partId in transforms) {
+        let nestedUnderParent = false;
+        const parent = joint.parentJointId ? rigDefinition.joints.find((item) => item.id === joint.parentJointId) : undefined;
+        if (parent && parent.partId === joint.partId && typeof DOMParser !== "undefined") {
+          const document = new DOMParser().parseFromString(`<g>${svgByPart[joint.partId as EditablePart]}</g>`, "image/svg+xml");
+          const elements = [...document.querySelectorAll("[id]")];
+          const childElement = elements.find((element) => element.id === joint.targetGroupId);
+          const parentElement = elements.find((element) => element.id === parent.targetGroupId);
+          nestedUnderParent = Boolean(childElement && parentElement?.contains(childElement));
+        }
+        transforms[joint.partId as EditablePart][joint.targetGroupId] = rigMatrixToSvg(nestedUnderParent ? localMatrices.get(joint.id)! : result.matrices.get(joint.id)!);
+      }
+    } catch { /* Invalid in-progress parent edits are shown without applying a pose. */ }
+    return transforms;
+  }, [rigDefinition, rigPoseRotations, headSvg, bodySvg, frontLegsSvg, backLegsSvg, tailSvg]);
+
+  const updateLayer = (operation: (svg: string) => string) => commitActiveSvg(operation(activePartSvgCode));
+  const moveLayer = (id: string, direction: LayerMove) => updateLayer((svg) => moveSvgLayer(svg, id, direction));
+
+  useEffect(() => {
+    if (!activeShapeIndex || !previewStageRef.current) { setSelectedLayerBounds(null); return; }
+    const frame = requestAnimationFrame(() => {
+      const partGroup = previewStageRef.current?.querySelector(`[data-editor-part="${activeTweakPart}"]`);
+      const element = partGroup ? [...partGroup.querySelectorAll("[id]")].find((candidate) => candidate.id === activeShapeIndex) as SVGGraphicsElement | undefined : undefined;
+      if (!element || typeof element.getBBox !== "function") { setSelectedLayerBounds(null); return; }
+      try {
+        const box = element.getBBox();
+        setSelectedLayerBounds({ x: box.x, y: box.y, width: Math.max(box.width, 1), height: Math.max(box.height, 1), transform: element.getAttribute("transform") || "" });
+      } catch { setSelectedLayerBounds(null); }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeShapeIndex, activePartSvgCode, activeTweakPart]);
+
+  type PointerAction = "move" | "rotate" | "scale-n" | "scale-ne" | "scale-e" | "scale-se" | "scale-s" | "scale-sw" | "scale-w" | "scale-nw";
+  const attachmentPivot = () => activeTweakPart === "head" ? { x: 120, y: 110 }
+    : activeTweakPart === "frontLegs" ? { x: 75, y: 15 }
+    : activeTweakPart === "backLegs" ? { x: 195, y: 15 }
+    : activeTweakPart === "tail" ? { x: 15, y: 15 }
+    : { x: neckX, y: neckY };
+
+  const startLayerPointerAction = (action: PointerAction, event: React.PointerEvent<SVGElement>) => {
+    if (!activeShapeIndex || !selectedLayerBounds || !previewStageRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const part = activeTweakPart;
+    const layerId = activeShapeIndex;
+    const originalSvg = activePartSvgCode;
+    const originalTransform = getSvgLayerTransform(originalSvg, layerId);
+    const partGroup = previewStageRef.current.querySelector(`[data-editor-part="${part}"]`) as SVGGElement | null;
+    const matrix = partGroup?.getScreenCTM();
+    if (!partGroup || !matrix) return;
+    const toLocal = (clientX: number, clientY: number) => {
+      const point = previewStageRef.current!.createSVGPoint();
+      point.x = clientX; point.y = clientY;
+      return point.matrixTransform(matrix.inverse());
+    };
+    const start = toLocal(event.clientX, event.clientY);
+    const bounds = selectedLayerBounds;
+    const startScaleX = originalTransform.scaleX ?? originalTransform.scale ?? 1;
+    const startScaleY = originalTransform.scaleY ?? originalTransform.scale ?? 1;
+    const fixed = attachmentPivot();
+    const oppositePivot = {
+      x: action.includes("w") ? bounds.x + bounds.width : action.includes("e") ? bounds.x : bounds.x + bounds.width / 2,
+      y: action.includes("n") ? bounds.y + bounds.height : action.includes("s") ? bounds.y : bounds.y + bounds.height / 2,
+    };
+    const pivot = keepLayerAnchorFixed && action.startsWith("scale") ? fixed : {
+      x: originalTransform.pivotX ?? oppositePivot.x,
+      y: originalTransform.pivotY ?? oppositePivot.y,
+    };
+    const startAngle = Math.atan2(start.y - pivot.y, start.x - pivot.x);
+    let latestSvg = originalSvg;
+
+    const move = (pointer: PointerEvent) => {
+      const current = toLocal(pointer.clientX, pointer.clientY);
+      const dx = current.x - start.x;
+      const dy = current.y - start.y;
+      let next: ShapeTransform = { ...originalTransform };
+      if (action === "move") {
+        next = { ...next, translateX: (originalTransform.translateX || 0) + dx, translateY: (originalTransform.translateY || 0) + dy };
+      } else if (action === "rotate") {
+        const angle = Math.atan2(current.y - pivot.y, current.x - pivot.x);
+        next = { ...next, rotate: (originalTransform.rotate || 0) + (angle - startAngle) * 180 / Math.PI, pivotX: pivot.x, pivotY: pivot.y };
+      } else {
+        let factorX = action.includes("e") ? 1 + dx / bounds.width : action.includes("w") ? 1 - dx / bounds.width : 1;
+        let factorY = action.includes("s") ? 1 + dy / bounds.height : action.includes("n") ? 1 - dy / bounds.height : 1;
+        factorX = Math.max(.1, factorX); factorY = Math.max(.1, factorY);
+        if (proportionalLayerScaling) {
+          const factors = [action.includes("e") || action.includes("w") ? factorX : undefined, action.includes("n") || action.includes("s") ? factorY : undefined].filter((value): value is number => value !== undefined);
+          const factor = factors.reduce((sum, value) => sum + value, 0) / factors.length;
+          factorX = factorY = factor;
+        }
+        next = { ...next, scale: 1, scaleX: startScaleX * factorX, scaleY: startScaleY * factorY, pivotX: pivot.x, pivotY: pivot.y };
+      }
+      latestSvg = setSvgLayerTransform(originalSvg, layerId, next);
+      setPartSvg(part, latestSvg);
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      if (latestSvg !== originalSvg) {
+        setSvgUndo((history) => ({ ...history, [part]: [...history[part].slice(-49), originalSvg] }));
+        setSvgRedo((history) => ({ ...history, [part]: [] }));
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish, { once: true });
+  };
+
+  const renderLayerSelection = (part: EditablePart) => {
+    if (part !== activeTweakPart || !activeShapeIndex || !selectedLayerBounds) return null;
+    const { x, y, width, height, transform } = selectedLayerBounds;
+    const middleX = x + width / 2;
+    const middleY = y + height / 2;
+    const handles: Array<{ action: PointerAction; x: number; y: number; cursor: string }> = [
+      { action: "scale-nw", x, y, cursor: "nwse-resize" }, { action: "scale-n", x: middleX, y, cursor: "ns-resize" },
+      { action: "scale-ne", x: x + width, y, cursor: "nesw-resize" }, { action: "scale-e", x: x + width, y: middleY, cursor: "ew-resize" },
+      { action: "scale-se", x: x + width, y: y + height, cursor: "nwse-resize" }, { action: "scale-s", x: middleX, y: y + height, cursor: "ns-resize" },
+      { action: "scale-sw", x, y: y + height, cursor: "nesw-resize" }, { action: "scale-w", x, y: middleY, cursor: "ew-resize" },
+    ];
+    return <g transform={transform} data-testid="layer-selection-overlay">
+      <rect x={x} y={y} width={width} height={height} fill="rgba(245,158,11,.04)" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4 3" style={{ cursor: "move" }} onPointerDown={(event) => startLayerPointerAction("move", event)} />
+      <line x1={middleX} y1={y} x2={middleX} y2={y - 24} stroke="#f59e0b" strokeWidth="1" />
+      <circle cx={middleX} cy={y - 28} r="5" fill="#18181b" stroke="#f59e0b" strokeWidth="2" style={{ cursor: "grab" }} onPointerDown={(event) => startLayerPointerAction("rotate", event)} />
+      {handles.map((handle) => <rect key={handle.action} x={handle.x - 4} y={handle.y - 4} width="8" height="8" rx="1" fill="#f59e0b" stroke="#18181b" strokeWidth="1" style={{ cursor: handle.cursor }} onPointerDown={(event) => startLayerPointerAction(handle.action, event)} />)}
+    </g>;
+  };
 
   const activeT = getActiveTransform();
 
@@ -870,7 +1204,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
     const partTransforms = shapeAdjustments[partType];
     const highlightIdx = activeTweakPart === partType && activeShapeIndex !== null ? activeShapeIndex : undefined;
-    return parseSvgToReact(svgContent, { color, accentColor }, undefined, undefined, partTransforms, highlightIdx);
+    return parseSvgToReact(svgContent, { color, accentColor }, undefined, undefined, partTransforms, highlightIdx, rigTransformsByPart[partType]);
   };
 
   // Base translation of body in preview
@@ -925,6 +1259,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const frontLegsTransformStr = `translate(${frontLegsTranslate.x + frontLegsTx}, ${frontLegsTranslate.y + frontLegsTy}) translate(${frontLegsPivotX}, ${frontLegsPivotY}) scale(${frontLegsScale}) translate(${-frontLegsPivotX}, ${-frontLegsPivotY}) rotate(${frontLegsRot}, ${frontLegsPivotX}, ${frontLegsPivotY})`;
   const backLegsTransformStr = `translate(${backLegsTranslate.x + backLegsTx}, ${backLegsTranslate.y + backLegsTy}) translate(${backLegsPivotX}, ${backLegsPivotY}) scale(${backLegsScale}) translate(${-backLegsPivotX}, ${-backLegsPivotY}) rotate(${backLegsRot}, ${backLegsPivotX}, ${backLegsPivotY})`;
   const tailTransformStr = `translate(${tailTranslate.x + tailTx}, ${tailTranslate.y + tailTy}) translate(${tailPivotX}, ${tailPivotY}) scale(${tailScale}) translate(${-tailPivotX}, ${-tailPivotY}) rotate(${tailRot}, ${tailPivotX}, ${tailPivotY})`;
+  const frontPreviewDepthLayers = splitSvgDepthLayers(frontLegsSvg, generationMetadata?.generatedLayout?.depthGroups.frontLegs);
+  const backPreviewDepthLayers = splitSvgDepthLayers(backLegsSvg, generationMetadata?.generatedLayout?.depthGroups.backLegs);
 
   if (!isOpen) return null;
 
@@ -985,7 +1321,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                 </div>
                 <div>
                   <p className="text-xs font-mono font-bold text-amber-400 uppercase tracking-wide flex items-center gap-2">
-                    AI Creature Lab <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-normal font-sans tracking-normal capitalize">Powered by Gemini 3.5 Flash</span>
+                    AI Creature Lab <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded font-normal font-sans tracking-normal capitalize">Powered by Gemini 3.6 Flash</span>
                   </p>
                   <p className="text-[11px] text-zinc-400 leading-normal mt-0.5">
                     {aiMode === "summon" 
@@ -1024,13 +1360,28 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               )}
             </div>
 
+            {/* Model selector — the chosen model drives every AI call (auto-fill, generation, refine) */}
+            {models.length > 1 && (
+              <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+                <span className="text-[10px] font-mono uppercase font-bold text-amber-500/90">Model</span>
+                <select
+                  value={modelId}
+                  disabled={isGenerating || isAutoFillingBrief}
+                  onChange={(event) => setModelId(event.target.value)}
+                  className="flex-1 text-[11px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-200"
+                >
+                  {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                </select>
+              </div>
+            )}
+
             {/* Main Interactive Row */}
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-stretch">
-              
+
               {/* Left Column: Optional Visual Reference */}
               <div className="md:col-span-4 flex flex-col justify-between">
                 <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold mb-1.5 block">
-                  Optional Visual Inspiration:
+                  Optional Visual Reference:
                 </label>
                 <div
                   onDragOver={handleDragOver}
@@ -1053,10 +1404,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       />
                       <div className="flex-1 min-w-0">
                         <p className="text-[10px] font-mono font-bold text-zinc-300 truncate">
-                          Inspiration Loaded
+                          Reference Loaded
                         </p>
                         <p className="text-[9px] font-sans text-zinc-500">
-                          AI will be inspired by this image
+                          Used during planning, review and repair
                         </p>
                       </div>
                       <button
@@ -1086,53 +1437,108 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     </label>
                   )}
                 </div>
+                {uploadedImage && (
+                  <div className="mt-2 grid grid-cols-2 gap-1 rounded-lg border border-zinc-800 bg-zinc-950 p-1">
+                    {([[
+                      "match", "CLOSE MATCH"
+                    ], ["inspire", "LOOSE INSPIRATION"]] as Array<[ReferenceMode, string]>).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        disabled={isGenerating}
+                        onClick={() => setReferenceMode(mode)}
+                        className={`rounded px-2 py-1.5 text-[8px] font-mono font-bold transition-colors ${referenceMode === mode ? "bg-amber-500 text-zinc-950" : "text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"}`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Right Column: Text Prompts & Action triggers */}
               <div className="md:col-span-8 flex flex-col justify-end">
                 {aiMode === "summon" ? (
-                  <div className="flex flex-col gap-1.5 w-full">
-                    <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">
-                      Summoning Prompt:
+                  <div className="flex flex-col gap-2.5 w-full">
+                    <label className="text-[9px] font-mono text-zinc-400 uppercase">Preset
+                      <select value={guidedBrief.preset} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setGuidedBrief((current) => applyPreset(current, event.target.value as GuidedAnimalBrief["preset"]))} className="mt-1 w-full text-[10px] p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200">
+                        {GENERATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                      </select>
                     </label>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        disabled={isGenerating}
-                        placeholder={
-                          uploadedImage
-                            ? "Describe how to adapt the image (optional, e.g., 'Make it a metallic dragon')"
-                            : "Describe your animal (e.g., 'A mechanical steampunk wolf', 'A cute sapphire owl')"
+                    <label className="text-[10px] font-mono text-amber-500/95 uppercase font-bold block">Animal name (required)</label>
+                    <input
+                      type="text"
+                      disabled={isGenerating || isAutoFillingBrief}
+                      placeholder="e.g. cow"
+                      value={aiPrompt}
+                      onChange={(e) => { setAiPrompt(e.target.value); updateBriefField("animalName", e.target.value); }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          handleGenerateSamples();
                         }
-                        value={aiPrompt}
-                        onChange={(e) => setAiPrompt(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            handleGenerateWithAI();
-                          }
-                        }}
-                        className="flex-1 text-xs font-mono px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-50"
-                      />
+                      }}
+                      className="w-full text-xs font-mono px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500 disabled:opacity-50"
+                    />
+                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 p-2">
                       <button
                         type="button"
-                        disabled={isGenerating}
-                        onClick={handleGenerateWithAI}
-                        className="px-4 py-2 bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-600 hover:shadow-lg disabled:shadow-none text-zinc-950 text-xs font-mono font-bold rounded-xl transition-all flex items-center gap-1.5 whitespace-nowrap active:scale-95 disabled:pointer-events-none"
+                        disabled={isGenerating || isAutoFillingBrief}
+                        onClick={handleGenerateSamples}
+                        className="flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-100 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-all hover:bg-white active:scale-95 disabled:pointer-events-none disabled:bg-zinc-800 disabled:text-zinc-600"
                       >
-                        {isGenerating ? (
-                          <>
-                            <Loader2 size={14} className="animate-spin" />
-                            GENERATING...
-                          </>
-                        ) : (
-                          <>
-                            <Wand2 size={14} />
-                            SUMMON CREATURE
-                          </>
-                        )}
+                        {isGenerating && sampleProgress ? <Loader2 size={14} className="animate-spin" /> : <Layers size={14} />}
+                        {isGenerating && sampleProgress ? `SAMPLING ${sampleProgress.done}/${sampleProgress.total}` : "GENERATE VARIATIONS"}
                       </button>
+                      <label className="flex items-center gap-1 text-[9px] font-mono uppercase text-zinc-400">
+                        samples
+                        <select value={sampleCount} disabled={isGenerating || isAutoFillingBrief} onChange={(event) => setSampleCount(Number(event.target.value))} className="rounded border border-zinc-800 bg-zinc-950 px-1.5 py-1 text-[10px] text-zinc-200">
+                          {[2, 3, 4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}
+                        </select>
+                      </label>
+                      <span className="text-[9px] leading-snug text-zinc-500">Best part-per-slot from N parallel draws — no repair loop.</span>
                     </div>
+                    <button
+                      type="button"
+                      disabled={isGenerating || isAutoFillingBrief}
+                      onClick={handleAutoFillBrief}
+                      className="self-start rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[9px] font-mono font-bold text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40 flex items-center gap-2"
+                    >
+                      {isAutoFillingBrief ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                      {isAutoFillingBrief ? "AUTO-FILLING DETAILS..." : "AUTO-FILL DETAILS WITH GEMINI 3.6 FLASH"}
+                    </button>
+                    <details className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-2">
+                      <summary className="cursor-pointer text-[10px] font-mono font-bold text-amber-400">GUIDED BRIEF OPTIONS</summary>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+                        {([
+                          ["sexOrVariant", "Sex / variant", ["neutral", "female", "male", "cow", "bull"]],
+                          ["age", "Age", ["young", "adult", "mature"]],
+                          ["bodyBuild", "Body build", ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"]],
+                          ["style", "Style", ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"]],
+                          ["detailLevel", "Detail", ["low", "medium", "high"]],
+                          ["pose", "Pose", ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"]],
+                          ["expression", "Expression", ["friendly", "calm", "alert", "determined", "curious and cheerful"]],
+                        ] as Array<[keyof GuidedAnimalBrief, string, string[]]>).map(([key, label, values]) => (
+                          <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
+                            <select disabled={isGenerating || isAutoFillingBrief} value={String(guidedBrief[key])} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300">
+                              {values.map((value) => <option key={value} value={value}>{value}</option>)}
+                            </select>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                        {([[
+                          "mainColour", "Main colour", "natural species colours"
+                        ], ["markings", "Markings", "recognizable species markings"], ["definingAnatomy", "Defining anatomy", "horns, tusks, mane, shell..."], ["advancedInstructions", "Advanced instructions", "Optional extra direction"]] as Array<[keyof GuidedAnimalBrief, string, string]>).map(([key, label, placeholder]) => (
+                          <label key={key} className="text-[8px] font-mono uppercase text-zinc-500">{label}
+                            <input disabled={isGenerating || isAutoFillingBrief} value={String(guidedBrief[key])} placeholder={placeholder} onChange={(event) => updateBriefField(key, event.target.value as never)} className="mt-1 w-full text-[9px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-300" />
+                          </label>
+                        ))}
+                      </div>
+                    </details>
+                    <label className="text-[9px] font-mono text-zinc-400 uppercase">Editable expanded brief
+                      <textarea disabled={isGenerating || isAutoFillingBrief} rows={3} value={guidedBrief.summary} onChange={(event) => updateBriefField("summary", event.target.value)} className="mt-1 w-full text-[10px] leading-relaxed p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-300 resize-y" />
+                    </label>
                   </div>
                 ) : (
                   <div className="flex flex-col gap-2.5 w-full">
@@ -1220,10 +1626,64 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             </div>
 
+            {samples && (
+              <div className="rounded-2xl border border-amber-500/20 bg-zinc-950/40 p-3">
+                <ContactSheetSelector samples={samples} onUse={handleUseSelection} onCancel={() => setSamples(null)} />
+              </div>
+            )}
             {generationStep && (
               <div className="flex items-center gap-2 text-[10px] font-mono text-amber-500/80 bg-amber-500/5 px-3 py-1.5 rounded-lg border border-amber-500/10">
                 {isGenerating && <Loader2 size={10} className="animate-spin text-amber-500" />}
                 <span>{generationStep}</span>
+              </div>
+            )}
+            {generationMetadata && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="md:col-span-2 text-[10px] leading-relaxed font-mono text-zinc-400 space-y-1.5 rounded-lg border border-zinc-800/80 bg-zinc-950 p-3">
+                  <p className="font-bold text-amber-400 uppercase">Pipeline record: {generationMetadata.finalStatus}</p>
+                  <p>Model: {generationMetadata.models.generator}</p>
+                  {generationMetadata.referenceMode && <p>Reference: {generationMetadata.referenceMode === "match" ? "close match" : "loose inspiration"}</p>}
+                  {generationMetadata.plan.referenceAnalysis && (
+                    <p className="text-zinc-300">Detected reference: {generationMetadata.plan.referenceAnalysis.pose} · tail {generationMetadata.plan.referenceAnalysis.externalTail}</p>
+                  )}
+                  <p>Prompts: {Object.values(generationMetadata.promptVersions).join(" · ")}</p>
+                  <p>Automatic repairs: {generationMetadata.completedRepairRounds}/{generationMetadata.automaticRepairLimit}</p>
+                  <p>Validation runs: {generationMetadata.validationHistory.length} · Reviews: {generationMetadata.reviewHistory.length}</p>
+                  {generationMetadata.attemptHistory && (
+                    <>
+                      <p>Best attempt: {generationMetadata.bestAttempt ?? 0} · Stop: {generationMetadata.stopReason ?? "legacy"} · Rescue: {generationMetadata.rescueUsed ? "used" : "not used"}</p>
+                      <ul className="mt-2 space-y-1 break-words text-zinc-300">
+                        {generationMetadata.attemptHistory.map((attempt) => (
+                          <li key={attempt.attempt} className={attempt.accepted ? "text-emerald-300" : "text-zinc-500"}>
+                            Attempt {attempt.attempt} · {attempt.strategy} · {attempt.accepted ? "accepted" : "rejected"}{attempt.scoreDelta !== undefined ? ` · score ${attempt.scoreDelta >= 0 ? "+" : ""}${attempt.scoreDelta}` : ""}: {attempt.reason}
+                            {attempt.failedParts.length ? ` Failed: ${attempt.failedParts.join(", ")}.` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  <div className="flex items-center gap-1 pt-1"><span>Final rating:</span>{[1, 2, 3, 4, 5].map((rating) => <button type="button" key={rating} onClick={() => setGenerationMetadata((current) => current ? { ...current, finalUserRating: rating } : current)} className={`h-5 w-5 rounded border text-[9px] ${generationMetadata.finalUserRating === rating ? "border-amber-400 bg-amber-500 text-zinc-950" : "border-zinc-700 bg-zinc-900"}`}>{rating}</button>)}</div>
+                  {(displayedValidation?.issues.length ?? 0) > 0 && (
+                    <ul className="mt-2 space-y-1 break-words text-red-300">
+                      {displayedValidation!.issues.map((entry, index) => <li key={`${entry.code}-${index}`}>{entry.part}: {entry.message}</li>)}
+                    </ul>
+                  )}
+                  {displayedReview && <p className="text-zinc-300">Best review: {Object.entries(displayedReview.scores).map(([category, score]) => `${category} ${score}`).join(" · ")}</p>}
+                  {(displayedReview?.issues.length ?? 0) > 0 && (
+                    <ul className="mt-2 space-y-1 break-words text-amber-300">
+                      {displayedReview!.issues.map((entry, index) => <li key={`${entry.id ?? entry.category}-${index}`}>[{entry.severity}] {entry.affectedParts.join(", ") || entry.part}: {entry.description} Correction: {entry.suggestedCorrection}</li>)}
+                    </ul>
+                  )}
+                  {displayedReview?.comparison && <p className="text-zinc-300">Resolved: {displayedReview.comparison.resolvedIssueIds.length} · Persistent: {displayedReview.comparison.persistentIssueIds.length} · New: {displayedReview.comparison.introducedIssueIds.length}</p>}
+                  {generationMetadata.metrics && <p>First-pass geometry: {generationMetadata.metrics.firstPassGeometrySuccess ? "pass" : "repair needed"} · {generationMetadata.metrics.latencyMs}ms</p>}
+                  {generationMetadata.finalStatus !== "approved" && <p className="text-amber-300">Remaining warnings are visible; use part-only refinement or the SVG editors below.</p>}
+                </div>
+                {pipelinePreviews && (["cleanSvg", "diagnosticSvg"] as const).map((key) => (
+                  <figure key={key} className="rounded-lg border border-zinc-800 overflow-hidden bg-white">
+                    <img src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(pipelinePreviews[key])}`} alt={key === "cleanSvg" ? "Clean assembled preview" : "Diagnostic preview with part boundaries and anchors"} className="w-full aspect-[6/5] object-contain" />
+                    <figcaption className="bg-zinc-900 px-2 py-1 text-[8px] font-mono uppercase text-zinc-400">{key === "cleanSvg" ? "Clean preview" : "Diagnostic preview"}</figcaption>
+                  </figure>
+                ))}
               </div>
             )}
           </div>
@@ -1259,6 +1719,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               {/* Interactive Vector Stage */}
               <div className="relative w-full aspect-square bg-zinc-950 border border-zinc-850 rounded-xl overflow-hidden shadow-inner group">
                 <svg
+                  ref={previewStageRef}
                   viewBox="0 0 600 500"
                   className="w-full h-full select-none"
                   xmlns="http://www.w3.org/2000/svg"
@@ -1288,8 +1749,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     className={`cursor-pointer transition-all ${activeTweakPart === "tail" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("tail")}
                   >
-                    <g transform={tailTransformStr}>
+                    <g data-editor-part="tail" transform={tailTransformStr}>
                       {renderPartPreview("tail", tailSvg)}
+                      {renderLayerSelection("tail")}
                     </g>
                     {activeTweakPart === "tail" && (
                       <rect
@@ -1305,13 +1767,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 2. BACK LEGS LAYER (Behind body) */}
+                  {/* 2. FAR HIND LIMB (or complete legacy hind-limb part) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("backLegs")}
                   >
-                    <g transform={backLegsTransformStr}>
-                      {renderPartPreview("backLegs", backLegsSvg)}
+                    <g data-editor-part="backLegs" transform={backLegsTransformStr}>
+                      {renderPartPreview("backLegs", backPreviewDepthLayers?.far ?? backLegsSvg)}
+                      {!backPreviewDepthLayers && renderLayerSelection("backLegs")}
                     </g>
                     {activeTweakPart === "backLegs" && (
                       <rect
@@ -1327,13 +1790,26 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 3. BODY LAYER */}
+                  {/* 3. FAR FORELIMB (semantic generated parts only) */}
+                  {frontPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("frontLegs")}
+                    >
+                      <g data-editor-part="frontLegs-far" transform={frontLegsTransformStr}>
+                        {renderPartPreview("frontLegs", frontPreviewDepthLayers.far)}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 4. BODY LAYER */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "body" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("body")}
                   >
-                    <g transform={bodyTransformStr}>
+                    <g data-editor-part="body" transform={bodyTransformStr}>
                       {renderPartPreview("body", bodySvg)}
+                      {renderLayerSelection("body")}
                     </g>
                     {activeTweakPart === "body" && (
                       <rect
@@ -1349,13 +1825,27 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 4. FRONT LEGS LAYER (In front of body) */}
+                  {/* 5. NEAR HIND LIMB (semantic generated parts only) */}
+                  {backPreviewDepthLayers && (
+                    <g
+                      className={`cursor-pointer transition-all ${activeTweakPart === "backLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
+                      onClick={() => setActiveTweakPart("backLegs")}
+                    >
+                      <g data-editor-part="backLegs-near" transform={backLegsTransformStr}>
+                        {renderPartPreview("backLegs", backPreviewDepthLayers.near)}
+                        {renderLayerSelection("backLegs")}
+                      </g>
+                    </g>
+                  )}
+
+                  {/* 6. NEAR FORELIMB (or complete legacy forelimb part) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "frontLegs" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("frontLegs")}
                   >
-                    <g transform={frontLegsTransformStr}>
-                      {renderPartPreview("frontLegs", frontLegsSvg)}
+                    <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
+                      {renderPartPreview("frontLegs", frontPreviewDepthLayers?.near ?? frontLegsSvg)}
+                      {renderLayerSelection("frontLegs")}
                     </g>
                     {activeTweakPart === "frontLegs" && (
                       <rect
@@ -1371,13 +1861,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     )}
                   </g>
 
-                  {/* 5. HEAD LAYER (In front of body) */}
+                  {/* 7. HEAD LAYER (In front of body) */}
                   <g 
                     className={`cursor-pointer transition-all ${activeTweakPart === "head" ? "opacity-100" : "opacity-80 hover:opacity-95"}`}
                     onClick={() => setActiveTweakPart("head")}
                   >
-                    <g transform={headTransformStr}>
+                    <g data-editor-part="head" transform={headTransformStr}>
                       {renderPartPreview("head", headSvg)}
+                      {renderLayerSelection("head")}
                     </g>
                     {activeTweakPart === "head" && (
                       <rect
@@ -1640,15 +2131,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       <SlidersHorizontal size={12} />
                       Sub-Shape Adjuster ({activeTweakPart})
                     </div>
+                    <div className="flex items-center gap-1">
+                      <button type="button" title="Undo layer edit" disabled={!svgUndo[activeTweakPart].length} onClick={undoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Undo2 size={10}/></button>
+                      <button type="button" title="Redo layer edit" disabled={!svgRedo[activeTweakPart].length} onClick={redoSvg} className="p-1 rounded bg-zinc-800 text-zinc-300 disabled:opacity-25"><Redo2 size={10}/></button>
                     {activeShapeIndex !== null && (
                       <button
                         type="button"
                         onClick={() => {
-                          setShapeAdjustments(prev => {
-                            const partAdjustments = { ...prev[activeTweakPart] };
-                            delete partAdjustments[activeShapeIndex];
-                            return { ...prev, [activeTweakPart]: partAdjustments };
-                          });
+                          commitActiveSvg(resetSvgLayerTransform(activePartSvgCode, activeShapeIndex));
                           setActiveShapeIndex(null);
                         }}
                         className="text-[9px] font-mono font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white px-1.5 py-0.5 rounded transition-colors"
@@ -1656,6 +2146,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         RESET SHAPE
                       </button>
                     )}
+                    </div>
                   </div>
 
                   {shapes.length === 0 ? (
@@ -1664,46 +2155,36 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      {/* Shape Selector Dropdown */}
                       <div className="space-y-1">
-                        <label className="text-[9px] text-zinc-400 font-mono block">Select Shape Layer</label>
-                        <select
-                          value={activeShapeIndex !== null ? activeShapeIndex : ""}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setActiveShapeIndex(val === "" ? null : parseInt(val));
+                        <label className="text-[9px] text-zinc-400 font-mono block">Stable SVG Layers</label>
+                        <SvgLayersPanel
+                          layers={layerTree}
+                          selectedId={activeShapeIndex}
+                          onSelect={setActiveShapeIndex}
+                          onRename={(id, value) => updateLayer((svg) => renameSvgLayer(svg, id, value))}
+                          onVisibility={(id, visible) => updateLayer((svg) => setSvgLayerVisibility(svg, id, visible))}
+                          onLock={(id, locked) => {
+                            updateLayer((svg) => setSvgLayerLocked(svg, id, locked));
+                            if (locked && activeShapeIndex === id) setActiveShapeIndex(null);
                           }}
-                          className="w-full text-xs font-mono px-2 py-1.5 bg-zinc-950 border border-zinc-800 rounded-md text-zinc-300 focus:outline-none focus:border-amber-500"
-                        >
-                          <option value="">-- Choose a shape path --</option>
-                          {shapes.map((s, i) => (
-                            <option key={i} value={i}>
-                              [{i}] {s.tagName.toUpperCase()} ({s.id || s.fill || "no fill"})
-                            </option>
-                          ))}
-                        </select>
+                          onMove={moveLayer}
+                        />
                       </div>
 
                       {activeShapeIndex !== null && (
                         <div className="space-y-2.5 p-2.5 bg-zinc-950/50 rounded-lg border border-zinc-900/60 animate-fade-in">
                           {/* Sub-shape transform inputs */}
                           {(() => {
-                            const currentTransform: ShapeTransform = shapeAdjustments[activeTweakPart][activeShapeIndex] || {
-                              translateX: 0,
-                              translateY: 0,
-                              scale: 1,
-                              rotate: 0,
-                            };
+                            const currentTransform: ShapeTransform = getSvgLayerTransform(activePartSvgCode, activeShapeIndex);
 
                             const updateTransform = (fields: Partial<ShapeTransform>) => {
-                              setShapeAdjustments(prev => {
-                                const partAdjustments = { ...prev[activeTweakPart] };
-                                partAdjustments[activeShapeIndex] = {
-                                  ...currentTransform,
-                                  ...fields,
-                                };
-                                return { ...prev, [activeTweakPart]: partAdjustments };
-                              });
+                              const fixedPivot = activeTweakPart === "head" ? { pivotX: 120, pivotY: 110 }
+                                : activeTweakPart === "frontLegs" ? { pivotX: 75, pivotY: 15 }
+                                : activeTweakPart === "backLegs" ? { pivotX: 195, pivotY: 15 }
+                                : activeTweakPart === "tail" ? { pivotX: 15, pivotY: 15 }
+                                : { pivotX: neckX, pivotY: neckY };
+                              const next = { ...currentTransform, ...(keepLayerAnchorFixed && fields.scale !== undefined ? fixedPivot : {}), ...fields };
+                              commitActiveSvg(setSvgLayerTransform(activePartSvgCode, activeShapeIndex, next));
                             };
 
                             return (
@@ -1763,7 +2244,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                                 <div className="space-y-1">
                                   <div className="flex justify-between text-[9px]">
                                     <span className="text-zinc-400">Shape Scale</span>
-                                    <span className="text-amber-500 font-bold">x{(currentTransform.scale !== undefined ? currentTransform.scale : 1).toFixed(2)}</span>
+                                    <span className="text-amber-500 font-bold">X {(currentTransform.scaleX ?? currentTransform.scale ?? 1).toFixed(2)} · Y {(currentTransform.scaleY ?? currentTransform.scale ?? 1).toFixed(2)}</span>
                                   </div>
                                   <input
                                     type="range"
@@ -1771,9 +2252,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                                     max="3"
                                     step="0.05"
                                     value={currentTransform.scale !== undefined ? currentTransform.scale : 1}
-                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0 })}
+                                    onChange={(e) => updateTransform({ scale: parseFloat(e.target.value) || 1.0, scaleX: undefined, scaleY: undefined })}
                                     className="w-full accent-amber-500 bg-zinc-800 h-1 rounded appearance-none cursor-pointer"
                                   />
+                                </div>
+
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={keepLayerAnchorFixed} onChange={(event) => setKeepLayerAnchorFixed(event.target.checked)} className="accent-amber-500" />
+                                  Keep attachment anchor fixed while scaling
+                                </label>
+                                <label className="flex items-center gap-2 text-[9px] text-zinc-400">
+                                  <input type="checkbox" checked={proportionalLayerScaling} onChange={(event) => setProportionalLayerScaling(event.target.checked)} className="accent-amber-500" />
+                                  Proportional corner/side resizing
+                                </label>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                  <label className="text-[9px] text-zinc-400">Pivot X<input type="number" value={currentTransform.pivotX ?? 0} onChange={(event) => updateTransform({ pivotX: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
+                                  <label className="text-[9px] text-zinc-400">Pivot Y<input type="number" value={currentTransform.pivotY ?? 0} onChange={(event) => updateTransform({ pivotY: Number(event.target.value) })} className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-1 py-1 text-zinc-300" /></label>
                                 </div>
 
                                 {/* Fill Color override */}
@@ -1813,6 +2308,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   )}
                 </div>
               </div>
+              <RigEditorPanel
+                partId={activeTweakPart}
+                selectedGroupId={activeShapeIndex}
+                groupIds={activeLayerIds}
+                defaultPivot={attachmentPivot()}
+                rig={rigDefinition}
+                rotations={rigPoseRotations}
+                onRigChange={setRigDefinition}
+                onRotationsChange={setRigPoseRotations}
+              />
             </div>
 
             {/* COLUMN 2: Basic Info & Joints */}

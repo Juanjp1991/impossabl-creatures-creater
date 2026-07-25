@@ -1,0 +1,36 @@
+Pipeline record: warnings
+
+Model: gpt-5.6-sol
+
+Detected reference: Inferred natural side-on standing pose with an alert level head, balanced weight over four grounded paws, forelegs largely columnar and hind legs visibly articulated through thigh, stifle and hock. Near and far limbs are modestly staggered for depth. · tail visible
+
+Prompts: p1-plan-2.2.0 · p1-svg-2.2.0 · p1-review-2.1.0 · p1-repair-2.2.0
+
+Automatic repairs: 2/2
+
+Validation runs: 4 · Reviews: 1
+
+Final rating:
+1
+2
+3
+4
+5
+head: head has no visible geometry within 32px of 'neck' anchor (120, 110).
+frontLegs: frontLegs/body intended overlap covers 30% of the smaller part; keep it at or below 25%.
+backLegs: backLegs/body intended overlap covers 35% of the smaller part; keep it at or below 25%.
+Best review: referenceFidelity 4 · speciesRecognizability 8 · anatomicalPlausibility 4 · overallSilhouette 5 · proportionConsistency 4 · jointContinuity 4 · limbLayering 4 · stylePaletteConsistency 6 · groundAlignment 7 · clippingOverlaps 6 · mobileReadability 7
+
+[major] head, body, frontLegs, backLegs, tail: The result retains the requested tiger colours and markings, but it does not closely match the specified large, low-slung, anatomically credible adult build. The compact torso, oversized head, short legs, simplified joints and thin tail produce a stylized mascot-like animal rather than the requested semi-realistic game asset. Correction: Regenerate with a longer and deeper torso, smaller head-to-body ratio, substantial shoulder and hip masses, longer weight-bearing limbs with realistic joint articulation, and a heavier tapering tail while preserving the current left-facing alert stance and tiger palette.
+[major] body, frontLegs: The forelimbs begin as rounded external capsules beneath the chest rather than flowing through a readable scapula and shoulder. Their upper attachments look pasted onto the torso, and the near and far forelegs lack distinct anatomical paths. Correction: Build each foreleg continuously from a broad shoulder collar hidden beneath the ribcage, taper through elbow and wrist, and finish in a broad paw. Offset the far foreleg slightly rearward and reduce its detail or value so both legs remain separately readable.
+[major] body, backLegs: The hind limbs do not convincingly describe a tiger's hip, thigh, stifle, hock and rearward ankle bend. One rear limb reads as a short hanging segment with a small foot, while the other is largely columnar and visually confused with the belly. Correction: Reconstruct both hind legs from rounded hip masses, with muscular thighs, forward stifles, low rearward hocks and broad grounded paws. Keep the near and far limbs modestly staggered and preserve a continuous hip-to-paw silhouette.
+[major] head, body, frontLegs, backLegs, tail: The head is too large relative to the short torso and low limb length. The body lacks the elongated felid proportions, deep chest and powerful hindquarters described in the brief, and the tail is too light relative to the animal's mass. Correction: Reduce the relative head size, extend the ribcage and flank, deepen the front chest, enlarge the rump and thighs, and increase both the base thickness and overall visual weight of the tail.
+[major] head, body, frontLegs, backLegs, tail: The silhouette remains recognizable as a striped big cat, but the high rounded back, compact barrel-shaped torso, blunt limb columns and lightly attached tail make it resemble a generic cartoon quadruped more than a long, muscular tiger. Correction: Establish a longer nearly level dorsal line, a deep shoulder-heavy chest, gentle abdominal tuck, rounded rump, clear spaces between paired limbs and a thick tail emerging smoothly from the rump.
+[major] body, frontLegs, backLegs: Near/far semantic layering is unclear. The paired limbs merge into similar orange upper-leg shapes, and the small far hind paw appears detached from a clearly traceable upper limb. The silhouette panel consequently loses the intended four-legged depth structure. Correction: Place far limbs behind the torso and near limbs in front with deliberate overlap, modest darkening and reduced stripe detail on far limbs. Ensure every visible paw can be traced continuously back to its corresponding shoulder or hip.
+[minor] body, tail: The tail is present and ringed, but its narrow root and visible directional kink make the rump connection feel mechanical rather than like a heavy muscular continuation of the spine. Correction: Widen the tail root beneath the rump, continue the upper and lower rump curves into it without a notch, and use a smoother gradual curve and taper through the black tip.
+[minor] head, body, frontLegs, backLegs, tail: The burnt-orange, cream, black and muted inner-ear colours broadly follow the requested palette, and the tiger markings are readable. However, the treatment is flat and cartoon-like rather than high-detail semi-realistic game art; several torso stripes are repetitive geometric wedges rather than organic forms wrapping around volume. Correction: Retain the palette but introduce restrained ochre transitions, subtle value modelling, more natural fur-edge variation and irregular branching stripes that curve with the ribcage, shoulder, thighs and tail.
+[minor] body, frontLegs, backLegs: The corrected seam panel does not show catastrophic gaps, but the rounded upper-leg caps remain visibly exposed against the belly and chest, creating assembly-like joins rather than concealed anatomical overlaps. Correction: Extend broad shoulder and hip collars beneath the torso mask and redraw the chest, belly and flank contours over those collars so the joins disappear while preserving continuous outer limb contours.
+[minor] frontLegs, backLegs, tail: The tiger, face, stripes and tail remain identifiable in the mobile panel, but the paired legs collapse into two dominant columns plus a tiny rear foot. Fine toe and joint information is lost at thumbnail scale. Correction: Increase negative space between paired legs, enlarge the far paws slightly, simplify small internal marks and strengthen the distinct bent profile of each hind leg without adding clutter.
+First-pass geometry: repair needed · 256313ms
+
+Remaining warnings are visible; use part-only refinement or the SVG editors below.

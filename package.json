@@ -5,7 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "dev:local": "bash scripts/dev-with-proxy.sh",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "test": "node --import tsx --test src/generation/fixtures.test.ts src/generation/sampleSelection.test.ts src/generation/canonicalStandard.test.ts src/generation/crossSpecies.test.ts src/animalPackage/fixtures.test.ts src/editor/svgLayers.test.ts src/rig/engine.test.ts",
+    "game:dev": "vite --config game/vite.config.ts",
+    "game:build": "vite build --config game/vite.config.ts",
+    "game:lint": "tsc -p game/tsconfig.json --noEmit",
+    "game:test": "node --import tsx --test game/src/*.test.ts",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
@@ -14,22 +20,24 @@
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
     "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-    "vite": "^6.2.3",
-    "express": "^4.21.2",
-    "dotenv": "^17.2.3",
-    "motion": "^12.23.24"
+    "vite": "^6.2.3"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
-    "vite": "^6.2.3",
-    "@types/express": "^4.17.21"
+    "vite": "^6.2.3"
   }
 }
