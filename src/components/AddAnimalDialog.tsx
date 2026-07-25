@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2, FlipHorizontal, FlipVertical, Copy, GitBranch, Spline, Palette, ShieldAlert } from "lucide-react";
+import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2, FlipHorizontal, FlipVertical, Copy, GitBranch, Spline, Palette, ShieldAlert, ZoomIn, ZoomOut } from "lucide-react";
 import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
@@ -220,6 +220,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
    */
   const [selection, setSelection] = useState<string[]>([]);
   const [marquee, setMarquee] = useState<GizmoBounds | null>(null);
+  /**
+   * Stage viewport, as the SVG viewBox.
+   *
+   * Zooming by viewBox rather than by CSS-transforming a wrapper is what keeps every gizmo
+   * working untouched: getScreenCTM() already accounts for the viewBox, so screen-to-local
+   * conversion stays correct at any zoom without a single change to the drag maths.
+   */
+  const [view, setView] = useState({ x: 0, y: 0, w: 600, h: 500 });
   const [svgUndo, setSvgUndo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
   const [svgRedo, setSvgRedo] = useState<Record<EditablePart, string[]>>(EMPTY_HISTORY);
   /**
@@ -1525,6 +1533,61 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     return { x: local.x, y: local.y };
   };
 
+  const STAGE_VIEW = { x: 0, y: 0, w: 600, h: 500 };
+  const MIN_ZOOM = 0.5;
+  const MAX_ZOOM = 12;
+  const zoomLevel = STAGE_VIEW.w / view.w;
+
+  /**
+   * Zoom about the pointer, so the detail under the cursor stays under the cursor — the
+   * behaviour every map and vector editor uses, and the only one that lets you close in on a
+   * small shape without chasing it around the canvas.
+   */
+  const zoomStage = (factor: number, focus?: { clientX: number; clientY: number }) => {
+    setView((current) => {
+      const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (STAGE_VIEW.w / current.w) * factor));
+      const w = STAGE_VIEW.w / next;
+      const h = STAGE_VIEW.h / next;
+      const stage = previewStageRef.current;
+      const rect = stage?.getBoundingClientRect();
+      // Fraction of the viewport the pointer sits at; centre when zooming from a button.
+      const fx = rect && focus ? (focus.clientX - rect.left) / rect.width : 0.5;
+      const fy = rect && focus ? (focus.clientY - rect.top) / rect.height : 0.5;
+      const anchorX = current.x + current.w * fx;
+      const anchorY = current.y + current.h * fy;
+      return { x: anchorX - w * fx, y: anchorY - h * fy, w, h };
+    });
+  };
+
+  const resetStageView = () => setView(STAGE_VIEW);
+
+  const handleStageWheel = (event: React.WheelEvent<SVGSVGElement>) => {
+    event.preventDefault();
+    zoomStage(event.deltaY < 0 ? 1.15 : 1 / 1.15, event);
+  };
+
+  /** Middle-drag, or space-free right-drag, pans without disturbing selection. */
+  const startPan = (event: React.PointerEvent<SVGSVGElement>) => {
+    const stage = previewStageRef.current;
+    const rect = stage?.getBoundingClientRect();
+    if (!stage || !rect) return;
+    const originX = event.clientX;
+    const originY = event.clientY;
+    const from = view;
+    const move = (pointer: PointerEvent) => {
+      setView({
+        x: from.x - ((pointer.clientX - originX) / rect.width) * from.w,
+        y: from.y - ((pointer.clientY - originY) / rect.height) * from.h,
+        w: from.w,
+        h: from.h,
+      });
+    };
+    const finish = () => window.removeEventListener("pointermove", move);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish, { once: true });
+    window.addEventListener("pointercancel", finish, { once: true });
+  };
+
   /**
    * Rubber-band selection.
    *
@@ -1534,6 +1597,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
    * else today. Selecting a single shape is what double-click is for.
    */
   const startMarquee = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (event.button === 1) { event.preventDefault(); startPan(event); return; }
     const target = event.target as Element;
     if (target.closest("[data-editor-chrome]")) return;
     const origin = partPoint(event.clientX, event.clientY);
@@ -1602,16 +1666,28 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     },
   });
 
-  const renderLayerSelection = (part: EditablePart) => {
-    if (part !== activeTweakPart || !activeShapeIndex || !selectedLayerBounds) return null;
+  /**
+   * The selected layer's gizmo, drawn at stage level rather than inside the part.
+   *
+   * Anchor handles, their labels and the pivot crosshair are rendered after the parts, so a
+   * gizmo nested in a part group sat underneath them: wherever they overlapped, a corner or
+   * edge handle showed the wrong cursor and could not be grabbed. Carrying the part's own
+   * transform keeps the bounds — which are in part-local space — landing in the right place.
+   */
+  const renderLayerSelection = () => {
+    if (!selection.length || !selectedLayerBounds) return null;
     return (
-      <GizmoOverlay
-        bounds={selectedLayerBounds}
-        transform={selectedLayerBounds.transform}
-        onPointerAction={startLayerPointerAction}
-      />
+      <g transform={activePartTransformStr()}>
+        <GizmoOverlay bounds={selectedLayerBounds} onPointerAction={startLayerPointerAction} />
+      </g>
     );
   };
+
+  const activePartTransformStr = () => activeTweakPart === "head" ? headTransformStr
+    : activeTweakPart === "body" ? bodyTransformStr
+    : activeTweakPart === "frontLegs" ? frontLegsTransformStr
+    : activeTweakPart === "backLegs" ? backLegsTransformStr
+    : tailTransformStr;
 
   const activeT = getActiveTransform();
 
@@ -1872,6 +1948,22 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <Grid size={13} />
                   </button>
+                  <button type="button" title="Zoom out" onClick={() => zoomStage(1 / 1.3)} className="p-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors">
+                    <ZoomOut size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    title="Reset zoom (scroll to zoom, middle-drag to pan)"
+                    onClick={resetStageView}
+                    className={`px-1.5 py-1 rounded text-[9px] font-mono transition-colors ${zoomLevel === 1 ? "bg-zinc-800 text-zinc-500" : "bg-amber-500/20 text-amber-400"}`}
+                  >
+                    {zoomLevel.toFixed(1)}x
+                  </button>
+                  <button type="button" title="Zoom in" onClick={() => zoomStage(1.3)} className="p-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors">
+                    <ZoomIn size={13} />
+                  </button>
+                  <span className="w-px h-4 bg-zinc-800" />
+
                   {/* Undo/redo live here as well as in the layers panel: the panel sits far
                       below the preview, and these are needed exactly while looking at it. */}
                   <button
@@ -1929,11 +2021,12 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               <div className="relative w-full flex-1 min-h-[320px] bg-zinc-950 border border-zinc-850 rounded-xl overflow-hidden shadow-inner group">
                 <svg
                   ref={previewStageRef}
-                  viewBox="0 0 600 500"
+                  viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
                   className="w-full h-full select-none"
                   xmlns="http://www.w3.org/2000/svg"
                   onDoubleClick={handleStageDoubleClick}
                   onPointerDown={startMarquee}
+                  onWheel={handleStageWheel}
                 >
                   {/* Grid background */}
                   {showPreviewGrid && (
@@ -1962,7 +2055,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <g data-editor-part="tail" transform={tailTransformStr}>
                       {renderPartPreview("tail", tailSvg)}
-                      {renderLayerSelection("tail")}
                     </g>
                     {activeTweakPart === "tail" && (
                       <rect
@@ -1985,7 +2077,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <g data-editor-part="backLegs" transform={backLegsTransformStr}>
                       {renderPartPreview("backLegs", backPreviewDepthLayers?.far ?? backLegsSvg)}
-                      {!backPreviewDepthLayers && renderLayerSelection("backLegs")}
                     </g>
                     {activeTweakPart === "backLegs" && (
                       <rect
@@ -2020,7 +2111,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <g data-editor-part="body" transform={bodyTransformStr}>
                       {renderPartPreview("body", bodySvg)}
-                      {renderLayerSelection("body")}
                     </g>
                     {activeTweakPart === "body" && (
                       <rect
@@ -2044,7 +2134,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     >
                       <g data-editor-part="backLegs-near" transform={backLegsTransformStr}>
                         {renderPartPreview("backLegs", backPreviewDepthLayers.near)}
-                        {renderLayerSelection("backLegs")}
                       </g>
                     </g>
                   )}
@@ -2056,7 +2145,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <g data-editor-part="frontLegs" transform={frontLegsTransformStr}>
                       {renderPartPreview("frontLegs", frontPreviewDepthLayers?.near ?? frontLegsSvg)}
-                      {renderLayerSelection("frontLegs")}
                     </g>
                     {activeTweakPart === "frontLegs" && (
                       <rect
@@ -2079,7 +2167,6 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   >
                     <g data-editor-part="head" transform={headTransformStr}>
                       {renderPartPreview("head", headSvg)}
-                      {renderLayerSelection("head")}
                     </g>
                     {activeTweakPart === "head" && (
                       <rect
@@ -2178,6 +2265,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   )}
 
                   {renderPartSelection()}
+                  {renderLayerSelection()}
 
                   {/* Bend handles last, so they sit above every part. Positioned by the
                       active part's translation only — inheriting its scale or flip would
@@ -2222,7 +2310,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                     }
 
                     return (
-                      <g>
+                      <g pointerEvents="none">
                         <circle cx={px} cy={py} r="10" fill="none" stroke="#f59e0b" strokeWidth="1.5" className="animate-pulse" />
                         <circle cx={px} cy={py} r="4" fill="#f59e0b" stroke="#18181b" strokeWidth="1" />
                         <line x1={px - 14} y1={py} x2={px + 14} y2={py} stroke="#f59e0b" strokeWidth="1.2" />
