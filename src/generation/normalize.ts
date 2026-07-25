@@ -1,6 +1,7 @@
 import type { AnimalPartType } from "../types";
 import type { AnimalDraft, AnatomyStylePlan, BlueprintConnectionProfile } from "./contracts";
-import { isNearBlack, isNearWhite } from "./palette";
+import { isNearBlack, isNearWhite, parseHex, resolveRamp, type RampToken } from "./palette";
+import { STROKE } from "./metrics";
 
 export interface CoordinateMap { scale: number; x: number; y: number; }
 export interface SvgBounds { x: number; y: number; width: number; height: number; }
@@ -27,11 +28,59 @@ const SVG_ATTRIBUTE_REPLACEMENTS: Record<string, string> = {
 // `outline`/`highlight` ramp tokens before the validator's raw-hex gate sees them. This is
 // resolving to the ramp (those tokens ARE a fixed near-black / off-white), not inventing a
 // colour; genuine mid-tone off-palette hexes are left raw so the validator rejects them.
-function foldNeutralHexToTokens(svg: string): string {
-  const token = (hex: string) => isNearBlack(hex) ? "outline" : isNearWhite(hex) ? "highlight" : null;
+/**
+ * Fold raw hex colours onto the shared §5.2 ramp tokens. The fixed neutrals keep their semantic
+ * mapping (near-black IS the outline, near-white IS the highlight); when the creature's palette
+ * resolves, every other raw hex snaps to the nearest ramp step by RGB distance.
+ *
+ * Folding rather than rejecting is deliberate: the roster showed raw hex slipping into parts
+ * (usually one feature in the head) as the single most common remaining validation error across
+ * every model. A part carrying a literal hex is permanently un-recolourable inside a hybrid, so
+ * mapping it onto the ramp is what makes the part reusable — and it is deterministic, which §5.1
+ * prefers over asking the model again.
+ */
+function foldNeutralHexToTokens(svg: string, ramp?: Record<RampToken, string> | null): string {
+  const steps = ramp
+    ? (Object.entries(ramp) as Array<[RampToken, string]>)
+        .map(([name, hex]) => ({ name, rgb: parseHex(hex) }))
+        .filter((step): step is { name: RampToken; rgb: { r: number; g: number; b: number } } => Boolean(step.rgb))
+    : [];
+  const token = (hex: string) => {
+    if (isNearBlack(hex)) return "outline";
+    if (isNearWhite(hex)) return "highlight";
+    const rgb = parseHex(hex);
+    if (!rgb || !steps.length) return null;
+    let best = steps[0];
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const step of steps) {
+      const distance = (step.rgb.r - rgb.r) ** 2 + (step.rgb.g - rgb.g) ** 2 + (step.rgb.b - rgb.b) ** 2;
+      if (distance < bestDistance) { bestDistance = distance; best = step; }
+    }
+    return best.name;
+  };
   return svg
     .replace(/(\b(?:fill|stroke|stop-color)\s*=\s*)(["'])(#[0-9a-f]{3,8})\2/gi, (match, prefix: string, _quote: string, hex: string) => { const mapped = token(hex); return mapped ? `${prefix}"${mapped}"` : match; })
     .replace(/(\b(?:fill|stroke|stop-color)\s*:\s*)(#[0-9a-f]{3,8})/gi, (match, prefix: string, hex: string) => { const mapped = token(hex); return mapped ? `${prefix}${mapped}` : match; });
+}
+
+/**
+ * Snap every stroke-width onto the §5.2 standard so parts from different species and different
+ * models share one line weight — the roster's most common cross-species flag was a stroke jump
+ * at the seam (head 5 next to body 3, body 3 next to tail 8). Anything above the detail band is
+ * silhouette intent and becomes exactly 3; anything below the visible minimum becomes 1 (those
+ * disappear on a cheap 360px screen); values already inside the detail band are left alone.
+ */
+function snapStrokeWidths(svg: string): string {
+  const snap = (raw: number) => raw > STROKE.detailMax ? STROKE.silhouette : raw < STROKE.minVisible ? STROKE.minVisible : raw;
+  return svg
+    .replace(/(\bstroke-width\s*=\s*)(["'])\s*([\d.]+)\s*\2/gi, (match, prefix: string, quote: string, value: string) => {
+      const width = Number(value);
+      return Number.isFinite(width) ? `${prefix}${quote}${snap(width)}${quote}` : match;
+    })
+    .replace(/(\bstroke-width\s*:\s*)([\d.]+)/gi, (match, prefix: string, value: string) => {
+      const width = Number(value);
+      return Number.isFinite(width) ? `${prefix}${snap(width)}` : match;
+    });
 }
 
 function promoteDominantFillToPrimary(svg: string): string {
@@ -57,13 +106,18 @@ function promoteDominantFillToPrimary(svg: string): string {
 export function normalizeGeneratedSvgSyntax(input: AnimalDraft): { animal: AnimalDraft; changedParts: AnimalPartType[] } {
   const animal = structuredClone(input); const changedParts: AnimalPartType[] = [];
   const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Only resolve the ramp when the creature's palette is real hex. A legacy draft that stored the
+  // literal token "primary"/"accent" resolves every step to the same grey fallback, which would
+  // make nearest-step matching arbitrary; there we fold the fixed neutrals only.
+  const ramp = parseHex(animal.color) && parseHex(animal.accentColor) ? resolveRamp(animal.color, animal.accentColor) : null;
   for (const part of PARTS) {
     const field = FIELD[part]; let svg = animal[field];
     for (const [source, target] of Object.entries(SVG_ATTRIBUTE_REPLACEMENTS)) svg = svg.replace(new RegExp(`\\b${source}\\s*=`, "g"), `${target}=`);
     svg = svg
       .replace(new RegExp(`(["'])${escaped(animal.color)}\\1`, "gi"), '"primary"')
       .replace(new RegExp(`(["'])${escaped(animal.accentColor)}\\1`, "gi"), '"accent"');
-    svg = foldNeutralHexToTokens(svg);
+    svg = foldNeutralHexToTokens(svg, ramp);
+    svg = snapStrokeWidths(svg);
     svg = promoteDominantFillToPrimary(svg);
     if (part === "frontLegs" || part === "backLegs") {
       const expected = { farGroupId: `${part}-far`, nearGroupId: `${part}-near` };

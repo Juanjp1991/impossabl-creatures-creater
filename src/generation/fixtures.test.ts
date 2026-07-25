@@ -232,12 +232,27 @@ test("literal palette colours and React-style SVG attributes are normalized with
   assert.ok(!validation.issues.some((entry) => entry.code === "palette.placeholder" && entry.part === "head"));
 });
 
-test("a repaired part with a shifted literal palette promotes its dominant fill", () => {
+test("a part with a shifted literal palette is folded onto the shared ramp", () => {
   const repaired = { ...draft, bodySvg: `<g id="body-root"><path d="M75 90 L115 160 L235 160 L260 105 Z" fill="#7a2f25" stroke="#24100d" stroke-width="3"/></g>` };
   const normalized = normalizeGeneratedSvgSyntax(repaired);
-  assert.match(normalized.animal.bodySvg, /fill="primary"/);
+  // Every raw hex folds onto its NEAREST ramp step, not a blanket promotion to primary: the dark
+  // reddish fill lands on primary-dark and the near-black stroke on the fixed outline neutral.
+  assert.match(normalized.animal.bodySvg, /fill="primary-dark"/);
+  assert.match(normalized.animal.bodySvg, /stroke="outline"/);
+  assert.ok(!/#[0-9a-f]{3,8}/i.test(normalized.animal.bodySvg), "no raw hex may survive normalization");
   const validation = validateAnimalDraft(normalized.animal, plan);
-  assert.ok(!validation.issues.some((entry) => entry.code === "palette.placeholder" && entry.part === "body"));
+  assert.ok(!validation.issues.some((entry) => (entry.code === "palette.placeholder" || entry.code === "palette.rawHex") && entry.part === "body"));
+});
+
+test("stroke widths snap onto the §5.2 standard so donors share one line weight", () => {
+  const drifting = { ...draft, bodySvg: `<g id="body-root" stroke-width="8"><path d="M75 90 L115 160 L235 160 Z" fill="primary" stroke="outline" stroke-width="5"/><path d="M80 95 L110 150 Z" fill="none" stroke="outline" stroke-width="0.4"/><path d="M85 99 L105 140 Z" fill="none" stroke="outline" stroke-width="1.2"/></g>` };
+  const body = normalizeGeneratedSvgSyntax(drifting).animal.bodySvg;
+  // Above the detail band is silhouette intent -> exactly 3; sub-visible -> 1; in-band untouched.
+  assert.match(body, /<g id="body-root" stroke-width="3"/);
+  assert.ok(!/stroke-width="[58]"/.test(body), "silhouette strokes collapse onto 3");
+  assert.ok(!/stroke-width="0\.4"/.test(body), "strokes under the visible minimum are raised to 1");
+  assert.match(body, /stroke-width="1"/);
+  assert.match(body, /stroke-width="1\.2"/);
 });
 
 test("planner invariants and depth-group aliases are normalized before validation", () => {
