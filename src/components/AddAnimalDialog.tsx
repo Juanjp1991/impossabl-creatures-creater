@@ -1,17 +1,34 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2, FlipHorizontal, FlipVertical, Copy, GitBranch, Spline, Palette, ShieldAlert, ZoomIn, ZoomOut } from "lucide-react";
+import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move, RotateCw, Settings, Grid, SlidersHorizontal, RefreshCw, Layers, Upload, Image, Trash2, Undo2, Redo2, FlipHorizontal, FlipVertical, Copy, GitBranch, Spline, Palette, ShieldAlert, ZoomIn, ZoomOut, Bookmark, Library, Crop } from "lucide-react";
 import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
 import { populateGuidedBrief } from "../generation/clientPipeline";
-import type { AnatomyStylePlan, AnimalDraft, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
+import { PART_TYPES } from "../generation/contracts";
+import type { AnatomyStylePlan, AnimalDraft, BlueprintConnectionProfile, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
 import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
 import { normalizeGeneratedSvgSyntax } from "../generation/normalize";
 import { errorSignature, newErrorsSince } from "../editor/validationGate";
 import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
+import { runPartPipeline } from "../generation/partPipeline";
+import { buildExemplarBlock } from "../generation/exemplars";
+import { DEFAULT_VARIATION_CONCURRENCY, DEFAULT_VARIATION_COUNT, VARIATION_STRENGTHS, runPartVariations, type VariationStrength } from "../generation/partVariations";
+import { SVG_FIELD as PART_SVG_FIELD } from "../partBank/contracts";
 import { fetchModels, type ModelOption } from "../generation/apiClient";
+import { downscaleReferenceFile } from "../referenceImage/downscale";
+import { cropReferenceDataUrl, isMeaningfulCrop, type NormalizedCrop, type ReferenceCrops } from "../referenceImage/crop";
+import { scoreKey, scoreRound } from "../referenceImage/scoreRound";
+import type { ConformanceScore } from "../generation/conformance";
+import { ReferenceCropper } from "./ReferenceCropper";
+import { ReferenceIndicator } from "./ReferenceIndicator";
+import { deleteReferenceImage, getReferenceImage, putReferenceImage, type ReferenceImageInput } from "../referenceImage/store";
 import { ContactSheetSelector } from "./ContactSheetSelector";
+import { PartBankPanel } from "./PartBankPanel";
+import { PartBankComposer } from "./PartBankComposer";
+import { SlotCandidatePicker } from "./SlotCandidatePicker";
+import { namespaceEntry, type PartBankEntry } from "../partBank/contracts";
+import { usePartBank } from "../partBank/usePartBank";
 import { SvgLayersPanel } from "./SvgLayersPanel";
 import { RigEditorPanel } from "./RigEditorPanel";
 import { densityAfterDuplication, deleteSvgLayer, duplicateSvgLayer, extendChain, isProtectedLayer, ensureStableSvgLayerIds, getSvgLayerTransform, getSvgLayerTree, moveSvgLayer, renameSvgLayer, resetSvgLayerTransform, setSvgLayerLocked, setSvgLayerTransform, setSvgLayerVisibility, type LayerMove } from "../editor/svgLayers";
@@ -42,6 +59,9 @@ import type { RigDefinition } from "../rig/contracts";
 import { computeForwardKinematics, computeLocalJointMatrices, rigMatrixToSvg } from "../rig/engine";
 
 type EditablePart = "head" | "body" | "frontLegs" | "backLegs" | "tail";
+
+/** Reads naturally inside the progress line, unlike the capitalised control labels. */
+const VARIATION_STRENGTH_WORD: Record<VariationStrength, string> = { tight: "tight", moderate: "related", loose: "loose" };
 const EMPTY_HISTORY = (): Record<EditablePart, string[]> => ({ head: [], body: [], frontLegs: [], backLegs: [], tail: [] });
 
 interface AddAnimalDialogProps {
@@ -288,7 +308,17 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [isGenerating, setIsGenerating] = useState(false);
   const [isAutoFillingBrief, setIsAutoFillingBrief] = useState(false);
   const [generationStep, setGenerationStep] = useState("");
+  // §R1 reference image. `uploadedImage` is the downscaled data URL every AI call and the
+  // preview `<img>` consume; `referenceRecord` carries the JPEG bytes behind it so a save can
+  // write them to IndexedDB without re-encoding. Both are null when no reference is active.
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [referenceRecord, setReferenceRecord] = useState<ReferenceImageInput | null>(null);
+  const [referenceLoading, setReferenceLoading] = useState(false);
+  // §R3 per-slot crops of that reference, and which row's cropper is open.
+  const [referenceCrops, setReferenceCrops] = useState<ReferenceCrops>({});
+  const [cropSlot, setCropSlot] = useState<EditablePart | null>(null);
+  // §S1 conformance scores for whatever round is on screen, keyed `${slot}:${sampleIndex}`.
+  const [conformance, setConformance] = useState<Map<string, ConformanceScore>>(new Map());
   const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
   const [isDragging, setIsDragging] = useState(false);
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
@@ -298,9 +328,28 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [samples, setSamples] = useState<GeneratedSample[] | null>(null);
   const [sampleCount, setSampleCount] = useState(DEFAULT_SAMPLE_COUNT);
   const [sampleProgress, setSampleProgress] = useState<{ done: number; total: number } | null>(null);
+  // §5.5 part bank. `bankSlot` is the SVG editor row whose browser is open; `slotRegen`
+  // holds a single-slot re-roll awaiting a pick; `showComposer` swaps the AI panel for the
+  // build-from-bank flow.
+  const { savePart: savePartToBank, entries: bankEntries, error: bankError, setError: setBankError } = usePartBank();
+  const [bankSlot, setBankSlot] = useState<EditablePart | null>(null);
+  const [showComposer, setShowComposer] = useState(false);
+  const [slotRegen, setSlotRegen] = useState<{ slot: EditablePart; samples: GeneratedSample[]; heading?: string } | null>(null);
+  const [regeneratingSlot, setRegeneratingSlot] = useState<EditablePart | null>(null);
+  const [bankNotice, setBankNotice] = useState("");
+  // §5.6 "more like this": variations seeded with a part you already chose, rather than
+  // fresh draws. Held here rather than in the picker so a round can be re-run from any
+  // candidate without the settings resetting between rounds.
+  const [variationStrength, setVariationStrength] = useState<VariationStrength>("moderate");
+  const [variationInstructions, setVariationInstructions] = useState("");
+  const [variationCount, setVariationCount] = useState(DEFAULT_VARIATION_COUNT);
+  const [varyingSlot, setVaryingSlot] = useState<EditablePart | null>(null);
   // §7 in-app model selector — the chosen model threads through every AI call.
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("");
+  // §P3: extra models to round-robin across a contact sheet. Empty means "just `modelId`",
+  // which is today's behaviour; every non-sheet call still uses `modelId` alone.
+  const [sheetModelIds, setSheetModelIds] = useState<string[]>([]);
   const displayedValidation = generationMetadata
     ? generationMetadata.validationHistory[generationMetadata.bestAttempt ?? generationMetadata.validationHistory.length - 1] ?? generationMetadata.validationHistory.at(-1)
     : undefined;
@@ -310,7 +359,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       ?? generationMetadata.reviewHistory.at(-1)
     : undefined;
 
-  const handleImageUpload = (file: File) => {
+  const handleImageUpload = async (file: File) => {
     if (!file.type.startsWith("image/")) {
       setErrorMsg("Only image files are allowed.");
       return;
@@ -319,15 +368,48 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setErrorMsg("Image size should be less than 5MB.");
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      setUploadedImage(reader.result as string);
+    // Downscale on the way in, so the full-size upload never reaches state, storage or the
+    // wire. Every later consumer sees the ~512px version.
+    setReferenceLoading(true);
+    try {
+      const resized = await downscaleReferenceFile(file);
+      setUploadedImage(resized.dataUrl);
+      setReferenceRecord({ blob: resized.blob, width: resized.width, height: resized.height });
+      // A new photo invalidates every crop drawn against the old one.
+      setReferenceCrops({});
+      setCropSlot(null);
       setErrorMsg("");
-    };
-    reader.onerror = () => {
-      setErrorMsg("Failed to read the image file.");
-    };
-    reader.readAsDataURL(file);
+    } catch (error: any) {
+      setErrorMsg(error?.message || "Failed to read the image file.");
+    } finally {
+      setReferenceLoading(false);
+    }
+  };
+
+  const clearReferenceImage = () => {
+    setUploadedImage(null);
+    setReferenceRecord(null);
+    // Crops are coordinates into a specific image; they mean nothing once it is gone.
+    setReferenceCrops({});
+    setCropSlot(null);
+  };
+
+  /**
+   * §R3: the image a part-targeted call should actually receive. With a crop set for that
+   * slot the model gets only that region, which is a far stronger region hint than asking it
+   * to find the part inside a whole-animal photo. Falls back to the full reference if the
+   * crop cannot be rendered, since a weaker hint beats a failed round.
+   */
+  const referenceForPart = async (slot: EditablePart): Promise<string | null> => {
+    if (!uploadedImage) return null;
+    const crop = referenceCrops[slot];
+    if (!isMeaningfulCrop(crop)) return uploadedImage;
+    try {
+      return await cropReferenceDataUrl(uploadedImage, crop);
+    } catch (error) {
+      console.warn("Could not crop the reference image; sending the whole reference:", error);
+      return uploadedImage;
+    }
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -496,6 +578,84 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   }, [isOpen, editingAnimal]);
 
+  /**
+   * §R1: rehydrate the reference image from IndexedDB when the dialog opens.
+   *
+   * `uploadedImage` used to be dialog-local state that died with the unmount, so re-opening a
+   * saved animal to refine its legs ran with no reference while the mode still read "close
+   * match". This is the read half of that fix; the write half is in `validateAndSubmit`. The
+   * store is async, hence the loading flag rather than a synchronous initializer.
+   */
+  useEffect(() => {
+    if (!isOpen) return;
+    clearReferenceImage();
+    const animalId = editingAnimal?.id;
+    if (!animalId) return;
+    let cancelled = false;
+    setReferenceLoading(true);
+    getReferenceImage(animalId)
+      .then((stored) => {
+        if (cancelled || !stored) return;
+        setUploadedImage(stored.dataUrl);
+        setReferenceRecord({ blob: stored.blob, width: stored.width, height: stored.height, crops: stored.crops });
+        setReferenceCrops(stored.crops);
+      })
+      .catch((error) => console.warn("Could not load the stored reference image:", error))
+      .finally(() => { if (!cancelled) setReferenceLoading(false); });
+    return () => { cancelled = true; };
+  }, [isOpen, editingAnimal?.id]);
+
+  /**
+   * §S1: score whichever round is on screen against the cropped reference. Runs on the
+   * contact sheet (every slot that has a crop) and on a single-slot re-roll or vary round
+   * (that slot only). Slots without a crop produce no score and the UI simply omits the chip.
+   */
+  useEffect(() => {
+    const round = slotRegen
+      ? { slots: [slotRegen.slot] as EditablePart[], samples: slotRegen.samples }
+      : samples
+      ? { slots: PART_TYPES as EditablePart[], samples }
+      : null;
+    if (!round || !uploadedImage) {
+      setConformance(new Map());
+      return;
+    }
+    let cancelled = false;
+    scoreRound({ image: uploadedImage, crops: referenceCrops, slots: round.slots, samples: round.samples })
+      .then((scores) => { if (!cancelled) setConformance(scores); })
+      .catch((error) => console.warn("Conformance scoring failed:", error));
+    return () => { cancelled = true; };
+  }, [samples, slotRegen, referenceCrops, uploadedImage]);
+
+  /** The primary model always leads, so a sheet with no extras behaves exactly as before. */
+  const sampleModelIds = [modelId, ...sheetModelIds.filter((id) => id && id !== modelId)];
+
+  const conformanceOf = (slot: EditablePart, sampleIndex: number) => conformance.get(scoreKey(slot, sampleIndex))?.score;
+
+  /**
+   * §S2 silhouette underlay: the cropped reference as a data URL per slot, rendered ghosted
+   * behind candidate previews. Cut once per crop change rather than per candidate.
+   */
+  const [slotUnderlays, setSlotUnderlays] = useState<Partial<Record<EditablePart, string>>>({});
+  useEffect(() => {
+    let cancelled = false;
+    if (!uploadedImage) { setSlotUnderlays({}); return; }
+    (async () => {
+      const next: Partial<Record<EditablePart, string>> = {};
+      for (const slot of PART_TYPES as EditablePart[]) {
+        const crop = referenceCrops[slot];
+        if (!isMeaningfulCrop(crop)) continue;
+        try {
+          next[slot] = await cropReferenceDataUrl(uploadedImage, crop);
+        } catch (error) {
+          console.warn(`Could not render the ${slot} underlay:`, error);
+        }
+      }
+      if (!cancelled) setSlotUnderlays(next);
+    })();
+    return () => { cancelled = true; };
+  }, [uploadedImage, referenceCrops]);
+
   // Load the available models once the dialog opens; keep any prior explicit choice.
   useEffect(() => {
     if (!isOpen) return;
@@ -581,6 +741,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         referenceMode,
         brief,
         modelId,
+        modelIds: sampleModelIds,
         sampleCount,
         concurrency: DEFAULT_SAMPLE_CONCURRENCY,
         onProgress: (done, total) => setSampleProgress({ done, total }),
@@ -593,6 +754,79 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       console.error(err);
       setErrorMsg(err?.message || "Variation generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
       setGenerationStep("Variation generation stopped.");
+    } finally {
+      setIsGenerating(false);
+      setSampleProgress(null);
+    }
+  };
+
+  /**
+   * §P1: draw the creature as five focused calls instead of one that draws everything —
+   * body first, then head, legs and tail in parallel against it. Kept as its own action
+   * beside the contact sheet so the proven single-call path stays available while this is
+   * being judged.
+   */
+  const handleGeneratePerPart = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
+      setErrorMsg("Please enter an animal description or upload an inspiring image first.");
+      return;
+    }
+    const brief: GuidedAnimalBrief = { ...guidedBrief, animalName: animalName || guidedBrief.animalName, summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: animalName || guidedBrief.animalName }) };
+    setGuidedBrief(brief);
+    setIsGenerating(true);
+    setErrorMsg("");
+    setSamples(null);
+    setSampleProgress({ done: 0, total: PART_TYPES.length });
+    setGenerationStep("Drawing the body, then the head, legs and tail against it...");
+    try {
+      const result = await runPartPipeline({
+        brief,
+        image: uploadedImage,
+        referenceMode,
+        // §R3: each part call gets that slot's crop when one is drawn.
+        imageForSlot: async (slot) => ({
+          image: await referenceForPart(slot as EditablePart),
+          cropped: isMeaningfulCrop(referenceCrops[slot as EditablePart]),
+        }),
+        modelId,
+        // §P2: show the model art this artist has already approved for that slot. The client
+        // has to supply it — the server cannot read localStorage.
+        exemplarsForSlot: (slot) => buildExemplarBlock(slot, bankEntries),
+        onProgress: (done, total, slot) => {
+          setSampleProgress({ done, total });
+          setGenerationStep(`Drew the ${slot} (${done}/${total})...`);
+        },
+      });
+      applyAnimalDraft(result.animal);
+      setGenerationMetadata({
+        originalRequest: brief.animalName,
+        brief,
+        plan: result.plan,
+        models: { planner: "per-part", generator: modelId || "per-part", reviewer: "n/a", repair: "n/a" },
+        promptVersions: { planner: "per-part", generator: "per-part", reviewer: "n/a", repair: "n/a" },
+        validationHistory: [result.validation],
+        reviewHistory: [],
+        repairs: [],
+        automaticRepairLimit: 0,
+        completedRepairRounds: 0,
+        attemptHistory: [],
+        bestAttempt: 0,
+        stopReason: result.validation.valid ? "approved" : "no-actionable-issues",
+        rescueUsed: false,
+        finalStatus: result.validation.valid ? "approved" : "warnings",
+        createdAt: new Date().toISOString(),
+        generatedLayout: result.animal.layoutMetadata,
+        referenceMode: uploadedImage ? referenceMode : undefined,
+      });
+      setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(result.animal), diagnosticSvg: buildAssembledPreviewSvg(result.animal, true) });
+      setAiMode("refine");
+      const failed = result.failedSlots.length ? ` ${result.failedSlots.join(", ")} failed and came back empty.` : "";
+      setGenerationStep(`${result.validation.valid ? "Per-part draw passes the deterministic checks." : "Per-part draw finished with warnings."}${failed}`);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err?.message || "Per-part generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Per-part generation stopped.");
     } finally {
       setIsGenerating(false);
       setSampleProgress(null);
@@ -639,6 +873,46 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setGenerationStep(validation.valid ? "Selection applied and passes the deterministic checks. Refine or forge." : "Selection applied with warnings. Refine a part, edit the SVG, or forge as-is.");
   };
 
+  /**
+   * Adopt a creature assembled purely from banked parts. Same path as a contact-sheet
+   * selection, minus model provenance: these parts came from different runs (or from hand
+   * edits), so there is no single generator to attribute the result to.
+   */
+  const handleUseBankComposition = (animal: AnimalDraft) => {
+    applyAnimalDraft(animal);
+    const validation = validateAnimalDraft(animal);
+    setGenerationMetadata({
+      originalRequest: animal.name || "Composed from part bank",
+      brief: guidedBrief,
+      plan: FALLBACK_PLAN,
+      models: { planner: "part-bank", generator: "part-bank", reviewer: "n/a", repair: "n/a" },
+      promptVersions: { planner: "bank", generator: "bank", reviewer: "n/a", repair: "n/a" },
+      validationHistory: [validation],
+      reviewHistory: [],
+      repairs: [],
+      automaticRepairLimit: 0,
+      completedRepairRounds: 0,
+      attemptHistory: [],
+      bestAttempt: 0,
+      stopReason: validation.valid ? "approved" : "no-actionable-issues",
+      rescueUsed: false,
+      finalStatus: validation.valid ? "approved" : "warnings",
+      createdAt: new Date().toISOString(),
+      generatedLayout: animal.layoutMetadata,
+      metrics: { firstPassGeometrySuccess: validation.valid, repairCount: 0, latencyMs: 0 },
+    });
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(animal), diagnosticSvg: buildAssembledPreviewSvg(animal, true) });
+    setShowComposer(false);
+    setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
+    setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
+    setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
+    setBackLegsTx(0); setBackLegsTy(0); setBackLegsRot(0); setBackLegsScale(1); setBackLegsPivotX(130); setBackLegsPivotY(90);
+    setTailTx(0); setTailTy(0); setTailRot(0); setTailScale(1); setTailPivotX(80); setTailPivotY(80);
+    setActiveTweakPart("head");
+    setAiMode("refine");
+    setGenerationStep(validation.valid ? "Composed from the part bank and passes the deterministic checks." : "Composed from the part bank with warnings. Refine a part or forge as-is.");
+  };
+
   const handleRefineWithAI = async () => {
     if (!refinePrompt.trim() && !uploadedImage) {
       setErrorMsg("Please enter refinement instructions or upload an inspiring image.");
@@ -657,6 +931,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         setTimeout(() => setGenerationStep("Polishing final vector outputs..."), 7000),
       ];
 
+      // §R3: a part-targeted refine sends that slot's crop when one is drawn; "all" keeps
+      // the whole reference, since the call may touch every part.
+      const refineImage = refinePart === "all" ? uploadedImage : await referenceForPart(refinePart);
       const response = await fetch("/api/modify-animal", {
         method: "POST",
         headers: {
@@ -665,8 +942,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         body: JSON.stringify({
           prompt: refinePrompt.trim(),
           targetPart: refinePart,
-          image: uploadedImage,
+          image: refineImage,
           referenceMode,
+          referenceCropped: refinePart !== "all" && isMeaningfulCrop(referenceCrops[refinePart]),
           modelId,
           currentAnimal: {
             name,
@@ -818,6 +1096,9 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         validationHistory: [...generationMetadata.validationHistory, validation],
         finalStatus: validation.valid ? generationMetadata.finalStatus : "warnings",
         forgedWithTechnicalWarnings: !validation.valid || generationMetadata.forgedWithTechnicalWarnings,
+        // Record the mode the reference is actually saved under, not the one that happened to
+        // be set during generation: the image can be swapped or removed after the fact.
+        referenceMode: uploadedImage ? referenceMode : undefined,
       };
       setGenerationMetadata(finalGenerationMetadata);
       if (!validation.valid) console.warn(`Forging with ${validation.issues.filter((entry) => entry.severity === "error").length} unresolved technical validation warning(s).`);
@@ -972,6 +1253,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     const animalId = editingAnimal && editingAnimal.id.startsWith("custom-")
       ? editingAnimal.id
       : "custom-" + name.toLowerCase().replace(/[^a-z0-9]/g, "-") + "-" + Date.now();
+
+    // §R1 write half: keep the reference with the animal so a later refine session still has
+    // it. Fire-and-forget — the animal itself lives in localStorage and must save whether or
+    // not IndexedDB cooperates, so a failure here is logged rather than surfaced as a block.
+    (referenceRecord
+      ? putReferenceImage(animalId, { ...referenceRecord, crops: referenceCrops })
+      : deleteReferenceImage(animalId)
+    ).catch((error) => console.warn("Could not persist the reference image:", error));
 
     const newAnimal: Animal = {
       id: animalId,
@@ -1136,11 +1425,223 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     else setTailSvg(value);
   };
 
-  const commitActiveSvg = (next: string) => {
-    if (next === activePartSvgCode) return;
-    setSvgUndo((history) => ({ ...history, [activeTweakPart]: [...history[activeTweakPart].slice(-49), activePartSvgCode] }));
-    setSvgRedo((history) => ({ ...history, [activeTweakPart]: [] }));
-    setPartSvg(activeTweakPart, next);
+  const partSvgOf = (part: EditablePart) =>
+    part === "head" ? headSvg : part === "body" ? bodySvg : part === "frontLegs" ? frontLegsSvg : part === "backLegs" ? backLegsSvg : tailSvg;
+
+  /**
+   * History-aware write to any slot, not just the focused one. The bank and the per-slot
+   * re-roll both replace a part the user is not currently tweaking, and both must stay
+   * undoable — otherwise inserting the wrong leg is unrecoverable.
+   */
+  const commitPartSvg = (part: EditablePart, next: string) => {
+    const current = partSvgOf(part);
+    if (next === current) return;
+    setSvgUndo((history) => ({ ...history, [part]: [...history[part].slice(-49), current] }));
+    setSvgRedo((history) => ({ ...history, [part]: [] }));
+    setPartSvg(part, next);
+  };
+
+  const commitActiveSvg = (next: string) => commitPartSvg(activeTweakPart, next);
+
+  /**
+   * Replace one slot's entry in the generated layout metadata with the incoming part's own.
+   *
+   * The invariant `assembleFromPartDrafts` maintains applies here too: each slot's depth
+   * groups and ground contacts must describe the art actually kept, or they name group ids
+   * that no longer exist in the SVG and the depth split silently stops working.
+   */
+  const mergeSlotLayout = (
+    slot: EditablePart,
+    incoming: {
+      connection?: BlueprintConnectionProfile;
+      groundContacts?: Array<{ x: number; y: number; raised?: boolean }>;
+      depthGroups?: { farGroupId: string; nearGroupId: string };
+    }
+  ) => {
+    setGenerationMetadata((current) => {
+      if (!current) return current;
+      const layout = current.generatedLayout;
+      if (!layout) return current;
+      const isLimb = slot === "frontLegs" || slot === "backLegs";
+      return {
+        ...current,
+        generatedLayout: {
+          ...layout,
+          connections: slot === "body"
+            ? layout.connections
+            : [...layout.connections.filter((entry) => entry.part !== slot), ...(incoming.connection ? [incoming.connection] : [])],
+          groundContacts: isLimb
+            ? { ...layout.groundContacts, [slot]: incoming.groundContacts }
+            : layout.groundContacts,
+          depthGroups: isLimb
+            ? { ...layout.depthGroups, [slot]: incoming.depthGroups }
+            : layout.depthGroups,
+        },
+      };
+    });
+  };
+
+  /**
+   * Copy-on-apply: the entry is deep-copied into the draft and its SVG ids are namespaced
+   * on the way in, so two banked parts that both ship a `#fur` gradient cannot repaint each
+   * other. Later edits here never propagate back to the bank.
+   */
+  const applyBankEntry = (entry: PartBankEntry) => {
+    const slot = entry.slot as EditablePart;
+    const copy = namespaceEntry(entry, entry.id);
+    commitPartSvg(slot, copy.svg);
+    if (slot === "body" && copy.bodyConnections) {
+      setNeckX(copy.bodyConnections.neck.x); setNeckY(copy.bodyConnections.neck.y);
+      setTailX(copy.bodyConnections.tail.x); setTailY(copy.bodyConnections.tail.y);
+      setFrontLegsX(copy.bodyConnections.frontLegs.x); setFrontLegsY(copy.bodyConnections.frontLegs.y);
+      setBackLegsX(copy.bodyConnections.backLegs.x); setBackLegsY(copy.bodyConnections.backLegs.y);
+    }
+    mergeSlotLayout(slot, { connection: copy.connection, groundContacts: copy.groundContacts, depthGroups: copy.depthGroups });
+    setActiveTweakPart(slot);
+    setBankSlot(null);
+    setBankNotice(
+      `Inserted "${entry.name}"${slot === "body" && copy.bodyConnections ? " with its socket layout" : ""}. Undo restores the previous ${slot}.`
+    );
+  };
+
+  const saveSlotToBank = (part: EditablePart) => {
+    const svg = partSvgOf(part);
+    if (!svg.trim()) {
+      setBankError(`There is no ${part} art to save yet.`);
+      return;
+    }
+    // `currentDraft()` omits layout metadata, so pass it explicitly — without it the entry
+    // would save as bare art and lose the seam profile, ground contacts and depth groups
+    // that make a banked part re-composable rather than just re-paintable.
+    const entry = savePartToBank(currentDraft({ layoutMetadata: generationMetadata?.generatedLayout }), part, {
+      name: `${name.trim() || "Untitled"} ${part}`,
+      // Hand-authored art has no generator layout metadata behind it; saying so keeps the
+      // bank honest about which entries can carry a seam profile.
+      source: generationMetadata ? "generated" : "manual",
+      ...(generationMetadata
+        ? { provenance: { animalName: name.trim() || undefined, models: generationMetadata.models, promptVersions: generationMetadata.promptVersions } }
+        : {}),
+    });
+    if (entry) setBankNotice(`Saved "${entry.name}" to the part bank.`);
+  };
+
+  /**
+   * Re-roll a single slot. There is no per-part endpoint, so this generates whole animals
+   * and keeps one slot from the pick — the rest of each sample stays offerable to the bank
+   * in the picker, so the spend is not wasted.
+   */
+  const handleRegenerateSlot = async (part: EditablePart) => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim() || name.trim();
+    if (!animalName && !uploadedImage) {
+      setErrorMsg("Enter an animal name or upload a reference image before re-rolling a part.");
+      return;
+    }
+    const brief: GuidedAnimalBrief = { ...guidedBrief, animalName: animalName || guidedBrief.animalName };
+    setRegeneratingSlot(part);
+    setErrorMsg("");
+    setSlotRegen(null);
+    setSampleProgress({ done: 0, total: sampleCount });
+    setGenerationStep(`Generating ${sampleCount} new ${part} candidates...`);
+    try {
+      const results = await runSampleGeneration({
+        prompt: brief.animalName,
+        image: uploadedImage,
+        referenceMode,
+        brief,
+        modelId,
+        modelIds: sampleModelIds,
+        sampleCount,
+        concurrency: DEFAULT_SAMPLE_CONCURRENCY,
+        onProgress: (done, total) => setSampleProgress({ done, total }),
+      });
+      const usable = results.filter((sample) => sample.animal).length;
+      if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every sample failed to generate.");
+      setSlotRegen({ slot: part, samples: results });
+      setGenerationStep(`${usable}/${results.length} usable ${part} candidates. Pick one, and bookmark any others worth keeping.`);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err?.message || "Part re-roll failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Part re-roll stopped.");
+    } finally {
+      setRegeneratingSlot(null);
+      setSampleProgress(null);
+    }
+  };
+
+  /**
+   * "More like this": N variations seeded with one part you already chose.
+   *
+   * The seed is the *whole* current creature with `seedSvg` substituted into the target
+   * slot, not the part alone — `/api/modify-animal` is prompted with every part, so
+   * variations come back fitted to the body and limbs they will actually sit on. Passing a
+   * lone part would leave the model guessing at its context.
+   */
+  const runVariationRound = async (slot: EditablePart, seedSvg: string, seedContext?: AnimalDraft) => {
+    if (!seedSvg.trim()) {
+      setErrorMsg(`There is no ${slot} art to vary yet.`);
+      return;
+    }
+    // `seedContext` matters when the round is started from the contact sheet: the selection
+    // has only just been applied, so reading it back out of component state would race and
+    // seed the round with the previous creature.
+    const base = seedContext ?? currentDraft({ layoutMetadata: generationMetadata?.generatedLayout });
+    setVaryingSlot(slot);
+    setErrorMsg("");
+    setSampleProgress({ done: 0, total: variationCount });
+    setGenerationStep(`Generating ${variationCount} ${VARIATION_STRENGTH_WORD[variationStrength]} variations of the ${slot}...`);
+    try {
+      const partImage = await referenceForPart(slot);
+      const results = await runPartVariations({
+        seed: { ...base, [PART_SVG_FIELD[slot]]: seedSvg },
+        slot,
+        strength: variationStrength,
+        instructions: variationInstructions,
+        count: variationCount,
+        concurrency: DEFAULT_VARIATION_CONCURRENCY,
+        modelId,
+        image: partImage,
+        referenceMode,
+        cropped: isMeaningfulCrop(referenceCrops[slot]),
+        onProgress: (done, total) => setSampleProgress({ done, total }),
+      });
+      const usable = results.filter((sample) => sample.animal).length;
+      if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every variation failed.");
+      setSlotRegen({
+        slot,
+        samples: results,
+        heading: `${usable} variations of that ${slot}`,
+      });
+      setGenerationStep(`${usable}/${results.length} usable variations. Pick one, iterate again, or bookmark the rest.`);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err?.message || "Variation round failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Variation round stopped.");
+    } finally {
+      setVaryingSlot(null);
+      setSampleProgress(null);
+    }
+  };
+
+  const applySlotSample = (slot: EditablePart, sample: GeneratedSample) => {
+    const draft = sample.animal;
+    if (!draft) return;
+    const field = slot === "head" ? "headSvg" : slot === "body" ? "bodySvg" : slot === "frontLegs" ? "frontLegsSvg" : slot === "backLegs" ? "backLegsSvg" : "tailSvg";
+    commitPartSvg(slot, String(draft[field] ?? ""));
+    if (slot === "body" && draft.bodyConnections) {
+      setNeckX(draft.bodyConnections.neck.x); setNeckY(draft.bodyConnections.neck.y);
+      setTailX(draft.bodyConnections.tail.x); setTailY(draft.bodyConnections.tail.y);
+      setFrontLegsX(draft.bodyConnections.frontLegs.x); setFrontLegsY(draft.bodyConnections.frontLegs.y);
+      setBackLegsX(draft.bodyConnections.backLegs.x); setBackLegsY(draft.bodyConnections.backLegs.y);
+    }
+    const limb = slot === "frontLegs" || slot === "backLegs" ? slot : undefined;
+    mergeSlotLayout(slot, {
+      connection: draft.layoutMetadata?.connections.find((entry) => entry.part === slot),
+      groundContacts: limb ? draft.layoutMetadata?.groundContacts?.[limb] : undefined,
+      depthGroups: limb ? draft.layoutMetadata?.depthGroups?.[limb] : undefined,
+    });
+    setActiveTweakPart(slot);
+    setSlotRegen(null);
+    setGenerationStep(`Replaced the ${slot} from sample #${sample.index + 1}. Undo restores the previous one.`);
   };
 
   const undoSvg = () => {
@@ -3119,6 +3620,40 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             )}
 
+            {/*
+              §P3 multi-model contact sheet. Model choice moves quality far more than the
+              emphasis paragraphs do, so a sheet can draw its samples from several models and
+              label each candidate with the one that drew it. Off by default: with nothing
+              ticked the round runs entirely on the model chosen above.
+            */}
+            {models.length > 1 && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+                <span className="text-[10px] font-mono uppercase font-bold text-amber-500/90">Also sample</span>
+                {models.filter((model) => model.id !== modelId).map((model) => {
+                  const on = sheetModelIds.includes(model.id);
+                  return (
+                    <button
+                      key={model.id}
+                      type="button"
+                      disabled={isGenerating}
+                      onClick={() => setSheetModelIds((current) => on ? current.filter((id) => id !== model.id) : [...current, model.id])}
+                      title={`Include ${model.label} in contact sheets and part re-rolls`}
+                      className={`rounded border px-1.5 py-0.5 text-[9px] font-mono transition-colors disabled:opacity-40 ${
+                        on ? "border-amber-500 bg-amber-500/10 text-amber-400" : "border-zinc-800 bg-zinc-900 text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      {model.label.replace(/ · (proxy|Gemini)$/, "")}
+                    </button>
+                  );
+                })}
+                <span className="text-[9px] font-sans text-zinc-500">
+                  {sheetModelIds.length
+                    ? `Samples rotate across ${sampleModelIds.length} models; each candidate is labelled with the one that drew it.`
+                    : "Contact sheets and part re-rolls use only the model above."}
+                </span>
+              </div>
+            )}
+
             {/* Main Interactive Row */}
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-stretch">
 
@@ -3151,16 +3686,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           Reference Loaded
                         </p>
                         <p className="text-[9px] font-sans text-zinc-500">
-                          Used during planning, review and repair
+                          {referenceRecord
+                            ? `${referenceRecord.width}×${referenceRecord.height} · ${Math.max(1, Math.round(referenceRecord.blob.size / 1024))} KB · saved with this animal`
+                            : "Used during planning, review and repair"}
                         </p>
                       </div>
                       <button
                         type="button"
-                        onClick={() => setUploadedImage(null)}
+                        onClick={clearReferenceImage}
                         className="p-1.5 bg-zinc-900 border border-zinc-800 hover:bg-red-500/20 hover:border-red-500/30 text-zinc-400 hover:text-red-400 rounded-lg transition-all active:scale-95 shadow"
                       >
                         <Trash2 size={12} />
                       </button>
+                    </div>
+                  ) : referenceLoading ? (
+                    <div className="flex flex-col items-center justify-center gap-1 text-center">
+                      <Loader2 size={16} className="animate-spin text-amber-500" />
+                      <span className="text-[10px] font-mono text-zinc-400">Preparing reference…</span>
                     </div>
                   ) : (
                     <label className="cursor-pointer flex flex-col items-center justify-center text-center w-full h-full py-1">
@@ -3169,7 +3711,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         Drop image or click to browse
                       </span>
                       <span className="text-[8px] text-zinc-600 mt-0.5">
-                        PNG, JPG, WebP up to 5MB
+                        PNG, JPG, WebP up to 5MB · resized to 512px
                       </span>
                       <input
                         type="file"
@@ -3241,6 +3783,23 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                         </select>
                       </label>
                       <span className="text-[9px] leading-snug text-zinc-500">Best part-per-slot from N parallel draws — no repair loop.</span>
+                    </div>
+                    {/*
+                      §P1: the per-part path, alongside the contact sheet rather than
+                      replacing it. Five focused calls (body, then the rest in parallel)
+                      instead of one call that draws everything at a 16k output ceiling.
+                    */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isGenerating || isAutoFillingBrief}
+                        onClick={handleGeneratePerPart}
+                        className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-amber-600/60 bg-amber-500/10 px-3 py-2 text-xs font-mono font-bold text-amber-400 transition-all hover:bg-amber-500/20 active:scale-95 disabled:pointer-events-none disabled:opacity-40"
+                      >
+                        {isGenerating && sampleProgress ? <Loader2 size={14} className="animate-spin" /> : <Spline size={14} />}
+                        DRAW PART BY PART
+                      </button>
+                      <span className="text-[9px] leading-snug text-zinc-500">One focused call per slot: body first, then head, legs and tail drawn to fit it.</span>
                     </div>
                     <button
                       type="button"
@@ -3372,7 +3931,38 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
             {samples && (
               <div className="rounded-2xl border border-amber-500/20 bg-zinc-950/40 p-3">
-                <ContactSheetSelector samples={samples} onUse={handleUseSelection} onCancel={() => setSamples(null)} />
+                <ContactSheetSelector
+                  samples={samples}
+                  onUse={handleUseSelection}
+                  onCancel={() => setSamples(null)}
+                  conformanceOf={(slot, index) => conformanceOf(slot as EditablePart, index)}
+                  underlays={slotUnderlays}
+                  onRefineSlot={(slot, sample, composed, provenance) => {
+                    handleUseSelection(composed, provenance);
+                    const svg = sample.animal?.[PART_SVG_FIELD[slot]];
+                    if (typeof svg === "string") {
+                      setActiveTweakPart(slot as EditablePart);
+                      runVariationRound(slot as EditablePart, svg, composed);
+                    }
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Build from already-banked parts — no generation, no spend. */}
+            {!samples && (
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950/40 p-3">
+                {showComposer ? (
+                  <PartBankComposer onUse={handleUseBankComposition} onCancel={() => setShowComposer(false)} />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowComposer(true)}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-[11px] font-semibold text-zinc-300 hover:border-amber-600 hover:text-amber-400"
+                  >
+                    <Library size={13} /> Build from the part bank
+                  </button>
+                )}
               </div>
             )}
             {generationStep && (
@@ -3619,76 +4209,185 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                 </span>
               </div>
 
+              {/*
+                Variation settings live here as well as inside the picker: without this the
+                first round of a "vary" is stuck on the defaults, because the only controls
+                would be the ones that appear alongside its results.
+              */}
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/60 p-1.5">
+                <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">vary settings</span>
+                {/*
+                  §R1: re-roll and vary both send the reference, so whether one is active has
+                  to be visible here — this is far from the upload panel at the top of the AI
+                  section, and the feature is invisible otherwise.
+                */}
+                <ReferenceIndicator
+                  active={Boolean(uploadedImage)}
+                  loading={referenceLoading}
+                  mode={referenceMode}
+                />
+
+                <div className="flex items-center gap-0.5">
+                  {(Object.keys(VARIATION_STRENGTHS) as VariationStrength[]).map((value) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setVariationStrength(value)}
+                      title={VARIATION_STRENGTHS[value].hint}
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-mono ${
+                        variationStrength === value ? "bg-amber-500 text-zinc-950" : "bg-zinc-900 text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      {VARIATION_STRENGTHS[value].label.toLowerCase()}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex items-center gap-1 text-[9px] font-mono text-zinc-500">
+                  count
+                  <select
+                    value={variationCount}
+                    onChange={(event) => setVariationCount(Number(event.target.value))}
+                    className="rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 text-[9px] text-zinc-200"
+                  >
+                    {[2, 4, 6, 8].map((value) => <option key={value} value={value}>{value}</option>)}
+                  </select>
+                </label>
+                <input
+                  value={variationInstructions}
+                  onChange={(event) => setVariationInstructions(event.target.value)}
+                  placeholder={`optional steer, e.g. "rounder ears, softer muzzle"`}
+                  className="min-w-[10rem] flex-1 rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[9px] text-zinc-200 focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+
+              {(bankNotice || bankError) && (
+                <p className={`rounded-lg border p-2 text-[10px] ${bankError ? "border-amber-900/50 bg-amber-950/20 text-amber-300" : "border-emerald-900/50 bg-emerald-950/20 text-emerald-300"}`}>
+                  {bankError || bankNotice}
+                </p>
+              )}
+
               <div className="space-y-3 text-xs font-mono">
-                {/* HEAD */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>HEAD COMPONENT (Ideal grid: 160x160)</span>
+                {([
+                  { part: "head", label: "HEAD COMPONENT", grid: "160x160", value: headSvg, set: setHeadSvg, placeholder: "e.g. <path d='...' fill='primary' />" },
+                  { part: "body", label: "BODY COMPONENT", grid: "300x220", value: bodySvg, set: setBodySvg, placeholder: "e.g. <ellipse cx='150' cy='110' rx='100' ry='50' fill='primary' />" },
+                  { part: "frontLegs", label: "FRONT LEGS COMPONENT", grid: "260x180", value: frontLegsSvg, set: setFrontLegsSvg, placeholder: "e.g. <path d='...' fill='primary' />" },
+                  { part: "backLegs", label: "BACK LEGS COMPONENT", grid: "260x180", value: backLegsSvg, set: setBackLegsSvg, placeholder: "e.g. <path d='...' fill='primary' />" },
+                  { part: "tail", label: "TAIL COMPONENT", grid: "160x160", value: tailSvg, set: setTailSvg, placeholder: "e.g. <path d='...' fill='accent' />" },
+                ] as const).map((row) => (
+                  <div key={row.part} className="space-y-1">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-500">
+                      <span>{row.label} (Ideal grid: {row.grid})</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => saveSlotToBank(row.part)}
+                          disabled={!row.value.trim()}
+                          title="Save this part to the bank for reuse"
+                          className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[9px] text-zinc-400 hover:border-amber-600 hover:text-amber-400 disabled:opacity-40"
+                        >
+                          <Bookmark size={9} /> save
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBankSlot((current) => (current === row.part ? null : row.part))}
+                          title="Insert a part from the bank"
+                          className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] ${
+                            bankSlot === row.part ? "border-amber-500 bg-amber-500/10 text-amber-400" : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+                          }`}
+                        >
+                          <Library size={9} /> bank
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCropSlot((current) => (current === row.part ? null : row.part))}
+                          disabled={!uploadedImage}
+                          title={uploadedImage
+                            ? "Draw the region of the reference this part should be generated from"
+                            : "Upload a reference image to crop it to this part"}
+                          className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] disabled:opacity-40 ${
+                            cropSlot === row.part || isMeaningfulCrop(referenceCrops[row.part])
+                              ? "border-amber-500 bg-amber-500/10 text-amber-400"
+                              : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+                          }`}
+                        >
+                          <Crop size={9} /> crop
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRegenerateSlot(row.part)}
+                          disabled={isGenerating || regeneratingSlot !== null || varyingSlot !== null}
+                          title="Generate fresh candidates for this part only"
+                          className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[9px] text-zinc-400 hover:border-amber-600 hover:text-amber-400 disabled:opacity-40"
+                        >
+                          {regeneratingSlot === row.part ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />} re-roll
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => runVariationRound(row.part, row.value)}
+                          disabled={isGenerating || varyingSlot !== null || regeneratingSlot !== null || !row.value.trim()}
+                          title="Generate variations based on the part that is here now"
+                          className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[9px] text-zinc-400 hover:border-amber-600 hover:text-amber-400 disabled:opacity-40"
+                        >
+                          {varyingSlot === row.part ? <Loader2 size={9} className="animate-spin" /> : <Sparkles size={9} />} vary
+                        </button>
+                      </div>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={row.value}
+                      onChange={(e) => row.set(e.target.value)}
+                      placeholder={row.placeholder}
+                      className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
+                    />
+                    {bankSlot === row.part && (
+                      <PartBankPanel
+                        slot={row.part}
+                        onInsert={applyBankEntry}
+                        insertLabel="Insert"
+                        onClose={() => setBankSlot(null)}
+                        emptyHint={`No ${row.label.toLowerCase().replace(" component", "")} parts banked yet. Save one with the button above, or bookmark candidates on a contact sheet.`}
+                      />
+                    )}
+                    {cropSlot === row.part && uploadedImage && (
+                      <ReferenceCropper
+                        slot={row.part}
+                        image={uploadedImage}
+                        crop={referenceCrops[row.part]}
+                        onChange={(crop) => setReferenceCrops((current) => {
+                          const next = { ...current };
+                          if (crop) next[row.part] = crop; else delete next[row.part];
+                          return next;
+                        })}
+                        onClose={() => setCropSlot(null)}
+                      />
+                    )}
+                    {slotRegen?.slot === row.part && (
+                      <SlotCandidatePicker
+                        slot={row.part}
+                        samples={slotRegen.samples}
+                        heading={slotRegen.heading}
+                        onPick={(sample) => applySlotSample(row.part, sample)}
+                        onCancel={() => setSlotRegen(null)}
+                        reference={{ active: Boolean(uploadedImage), loading: referenceLoading, mode: referenceMode }}
+                        conformanceOf={isMeaningfulCrop(referenceCrops[row.part]) ? (index) => conformanceOf(row.part, index) : undefined}
+                        underlay={slotUnderlays[row.part]}
+                        variation={{
+                          strength: variationStrength,
+                          setStrength: setVariationStrength,
+                          instructions: variationInstructions,
+                          setInstructions: setVariationInstructions,
+                          count: variationCount,
+                          setCount: setVariationCount,
+                          busy: varyingSlot !== null,
+                          onRun: (sample) => {
+                            const svg = sample.animal?.[PART_SVG_FIELD[row.part]];
+                            if (typeof svg === "string") runVariationRound(row.part, svg);
+                          },
+                        }}
+                      />
+                    )}
                   </div>
-                  <textarea
-                    rows={2}
-                    value={headSvg}
-                    onChange={(e) => setHeadSvg(e.target.value)}
-                    placeholder="e.g. <path d='...' fill='primary' />"
-                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
-                  />
-                </div>
-
-                {/* BODY */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>BODY COMPONENT (Ideal grid: 300x220)</span>
-                  </div>
-                  <textarea
-                    rows={2}
-                    value={bodySvg}
-                    onChange={(e) => setBodySvg(e.target.value)}
-                    placeholder="e.g. <ellipse cx='150' cy='110' rx='100' ry='50' fill='primary' />"
-                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
-                  />
-                </div>
-
-                {/* FRONT LEGS */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>FRONT LEGS COMPONENT (Ideal grid: 260x180)</span>
-                  </div>
-                  <textarea
-                    rows={2}
-                    value={frontLegsSvg}
-                    onChange={(e) => setFrontLegsSvg(e.target.value)}
-                    placeholder="e.g. <path d='...' fill='primary' />"
-                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
-                  />
-                </div>
-
-                {/* BACK LEGS */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>BACK LEGS COMPONENT (Ideal grid: 260x180)</span>
-                  </div>
-                  <textarea
-                    rows={2}
-                    value={backLegsSvg}
-                    onChange={(e) => setBackLegsSvg(e.target.value)}
-                    placeholder="e.g. <path d='...' fill='primary' />"
-                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
-                  />
-                </div>
-
-                {/* TAIL */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-500">
-                    <span>TAIL COMPONENT (Ideal grid: 160x160)</span>
-                  </div>
-                  <textarea
-                    rows={2}
-                    value={tailSvg}
-                    onChange={(e) => setTailSvg(e.target.value)}
-                    placeholder="e.g. <path d='...' fill='accent' />"
-                    className="w-full text-[11px] px-2 py-1.5 bg-zinc-950 border border-zinc-850 rounded-lg text-zinc-300 focus:outline-none focus:border-amber-500 font-mono resize-y"
-                  />
-                </div>
+                ))}
               </div>
             </div>
           </div>

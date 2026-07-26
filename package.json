@@ -7,14 +7,15 @@
     "dev": "tsx server.ts",
     "dev:local": "bash scripts/dev-with-proxy.sh",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "test": "node --import tsx --test src/generation/fixtures.test.ts src/generation/sampleSelection.test.ts src/generation/canonicalStandard.test.ts src/generation/crossSpecies.test.ts src/animalPackage/fixtures.test.ts src/editor/svgLayers.test.ts src/editor/transform.test.ts src/editor/sanitize.test.ts src/editor/partAdjustment.test.ts src/editor/anchors.test.ts src/editor/pathWarp.test.ts src/editor/patterns.test.ts src/editor/validationGate.test.ts src/editor/marquee.test.ts src/rig/engine.test.ts",
+    "test": "node --import tsx --test src/generation/fixtures.test.ts src/generation/sampleSelection.test.ts src/generation/canonicalStandard.test.ts src/generation/crossSpecies.test.ts src/animalPackage/fixtures.test.ts src/partBank/partBank.test.ts src/generation/partVariations.test.ts src/referenceImage/referenceImage.test.ts src/referenceImage/crop.test.ts src/generation/referenceDirective.test.ts src/generation/conformance.test.ts src/generation/partPrompt.test.ts src/generation/exemplars.test.ts src/editor/svgLayers.test.ts src/editor/transform.test.ts src/editor/sanitize.test.ts src/editor/partAdjustment.test.ts src/editor/anchors.test.ts src/editor/pathWarp.test.ts src/editor/patterns.test.ts src/editor/validationGate.test.ts src/editor/marquee.test.ts src/rig/engine.test.ts scripts/baseline.test.ts",
     "game:dev": "vite --config game/vite.config.ts",
     "game:build": "vite build --config game/vite.config.ts",
     "game:lint": "tsc -p game/tsconfig.json --noEmit",
     "game:test": "node --import tsx --test game/src/*.test.ts",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "baseline": "node --import tsx scripts/baseline.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

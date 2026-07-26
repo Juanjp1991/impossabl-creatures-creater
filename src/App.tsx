@@ -6,6 +6,7 @@ import { IsolatedPartPreview } from "./components/IsolatedPartPreview";
 import { AdjustmentControls } from "./components/AdjustmentControls";
 import { SvgCodeViewer } from "./components/SvgCodeViewer";
 import { sanitizeForSave } from "./editor/sanitize";
+import { deleteReferenceImage } from "./referenceImage/store";
 import { AnimalLibrary } from "./components/AnimalLibrary";
 import { PartSelector } from "./components/PartSelector";
 import { parseSvgToReact } from "./utils/svgParser";
@@ -478,6 +479,10 @@ export default function App() {
 
   // Delete Dynamic Custom Animal
   const handleDeleteAnimal = (animalId: string) => {
+    // §R1: the reference image lives in IndexedDB rather than alongside the roster, so it has
+    // to be swept explicitly or it outlives the animal it belonged to.
+    deleteReferenceImage(animalId).catch((error) => console.warn("Could not delete the stored reference image:", error));
+
     // Graceful fallback to default 'bear' parts if we are currently equipping parts from this deleted animal
     setCreature((prev) => {
       const copy = { ...prev };

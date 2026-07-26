@@ -1,8 +1,10 @@
-export const APPROVED_STYLE_GUIDE_VERSION = "approved-bear-cheetah-2.0.0";
+// §P2: the nominal exemplars were the strings "built-in bear" and "built-in cheetah" — no
+// actual SVG ever reached the model, and the bear fails `validateAnimalDraft` with 16 errors.
+// Prose principles are now the *fallback*; real art comes from the part bank's exemplars.
+export const APPROVED_STYLE_GUIDE_VERSION = "approved-principles-3.0.0";
 
 /** Compact characteristics distilled from the approved built-in bear and cheetah assets. */
 export const APPROVED_STYLE_GUIDE = {
-  examples: ["built-in bear", "built-in cheetah"],
   principles: [
     "Readable left-facing silhouette with the head clearly distinct from the torso.",
     "Smooth organic primary contours plus purposeful secondary contour, marking, facial and shading groups; never substitute blocky generic primitives.",

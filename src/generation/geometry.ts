@@ -14,7 +14,7 @@ const FIELD = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", bac
 const PARTS: AnimalPartType[] = ["head", "body", "frontLegs", "backLegs", "tail"];
 const ATTACHED: Exclude<AnimalPartType, "body">[] = ["head", "frontLegs", "backLegs", "tail"];
 
-interface PixelMask {
+export interface PixelMask {
   pixels: Set<number>;
   points: Array<{ x: number; y: number }>;
   bounds?: { x: number; y: number; width: number; height: number };
@@ -113,6 +113,32 @@ function extractGroupMarkup(svg: string, groupId: string): string | undefined {
   }
   return undefined;
 }
+
+/**
+ * §S1: one slot's occupied-pixel mask on its own fixed local view, for comparison against a
+ * rasterised reference. Exposed because conformance scoring needs the same mask the seam and
+ * overlap measurements already use — a second, subtly different rasteriser would make the
+ * IoU chip disagree with the seam number sitting next to it.
+ */
+export function partPixelMask(svg: string, part: AnimalPartType): PixelMask {
+  const view = VIEW[part];
+  return shapePixels(svg, view.width, view.height);
+}
+
+/**
+ * Encode/decode for the packed pixel keys every mask in this module uses.
+ *
+ * `key` packs as `y * 1000 + x`, and `shapePixels` deliberately paints a margin outside the
+ * local view, so x can be negative. A plain `item % 1000` decodes those as x≈999 on the
+ * previous row, which silently smears a mask across a ~2000px-wide phantom bounding box.
+ * Views are at most 300 wide, so the halfway point is a safe place to split the two cases.
+ */
+export const pixelKey = (x: number, y: number) => key(x, y);
+export const pixelAt = (item: number) => {
+  const wrapped = ((item % 1000) + 1000) % 1000;
+  const x = wrapped >= 500 ? wrapped - 1000 : wrapped;
+  return { x, y: (item - x) / 1000 };
+};
 
 export function analyzeSvgGroupGeometry(svg: string, part: AnimalPartType, groupId: string) {
   const markup = extractGroupMarkup(svg, groupId);

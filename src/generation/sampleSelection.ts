@@ -59,12 +59,20 @@ export function briefForSample(brief: GuidedAnimalBrief, index: number): GuidedA
 export interface GeneratedSample {
   index: number;
   emphasis: string;
+  /**
+   * Short human label for this candidate. Absent for contact-sheet samples, which derive
+   * theirs from the index; set by "more like this" rounds, whose angles do not line up with
+   * `SAMPLE_EMPHASIS_LABELS` and whose count can exceed it.
+   */
+  label?: string;
   animal?: AnimalDraft;
   plan?: AnatomyStylePlan;
   validation?: ValidationResult;
   geometry?: DraftGeometryReport;
   models?: GenerationMetadata["models"];
   promptVersions?: GenerationMetadata["promptVersions"];
+  /** §P3: the model id this candidate was drawn with, when a round mixes several. */
+  modelId?: string;
   error?: string;
 }
 
@@ -101,12 +109,25 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, limit: numb
   return results;
 }
 
+/**
+ * §P3: which model draws sample `index`. A round-robin over the chosen ids rather than one
+ * model per round — model choice is a far larger source of variance than prompt nudging, so
+ * a contact sheet that mixes models compares the lever that actually moves quality.
+ */
+export function modelForSample(index: number, modelIds: string[] | undefined, fallback?: string): string | undefined {
+  const usable = (modelIds ?? []).filter(Boolean);
+  if (!usable.length) return fallback;
+  return usable[index % usable.length];
+}
+
 export interface SampleGenerationInput {
   prompt: string;
   image: string | null;
   referenceMode: ReferenceMode;
   brief: GuidedAnimalBrief;
   modelId?: string;
+  /** §P3: sample `i` uses `modelIds[i % n]`; falls back to `modelId` when empty. */
+  modelIds?: string[];
   sampleCount?: number;
   concurrency?: number;
   onProgress?: (done: number, total: number) => void;
@@ -124,18 +145,21 @@ export async function runSampleGeneration(input: SampleGenerationInput): Promise
   let done = 0;
   const tasks = Array.from({ length: total }, (_unused, index) => async (): Promise<GeneratedSample> => {
     const emphasis = emphasisForSample(index);
+    const modelId = modelForSample(index, input.modelIds, input.modelId);
     try {
       const result = await postJson("/api/generate-animal", {
         prompt: input.prompt,
         image: input.image,
         referenceMode: input.referenceMode,
         brief: briefForSample(input.brief, index),
-        modelId: input.modelId,
+        modelId,
       });
       const animal = result.animal as AnimalDraft;
-      return { index, emphasis, animal, plan: result.plan, validation: result.validation as ValidationResult, geometry: safeGeometry(animal), models: result.models, promptVersions: result.promptVersions };
+      // The server echoes the id it actually resolved, which is what provenance should record
+      // when a requested id was unknown and fell back to the default.
+      return { index, emphasis, animal, plan: result.plan, validation: result.validation as ValidationResult, geometry: safeGeometry(animal), models: result.models, promptVersions: result.promptVersions, modelId: result.modelId ?? modelId };
     } catch (error: any) {
-      return { index, emphasis, error: error?.message || "Sample generation failed." };
+      return { index, emphasis, modelId, error: error?.message || "Sample generation failed." };
     } finally {
       done += 1;
       input.onProgress?.(done, total);
@@ -156,23 +180,37 @@ export function partCandidateStats(sample: GeneratedSample, slot: AnimalPartType
   return { hasArt: true, seamPixels: seam, fillRatio: localFillRatio(svg, slot), elementCount: visibleElementCount(svg), errorCount };
 }
 
-/** Lower is better: fewest errors, then a closed seam, then a fill ratio nearest the band centre. */
-function candidateRank(stats: PartCandidateStats, slot: AnimalPartType): number {
+/**
+ * Lower is better: fewest errors, then a closed seam, then shape conformance to the cropped
+ * reference (§S1) when it is known, then a fill ratio nearest the band centre.
+ *
+ * Conformance sits below the technical terms deliberately — a candidate that matches your
+ * silhouette but fails validation or leaves an open seam is still the worse pick — and it
+ * outranks fill, which is a much weaker proxy for "is this the shape I asked for".
+ */
+export function candidateRank(stats: PartCandidateStats, slot: AnimalPartType, conformance?: number): number {
   if (!stats.hasArt) return Number.POSITIVE_INFINITY;
   const seamPenalty = slot === "body" ? 0 : stats.seamPixels !== null && stats.seamPixels >= 40 ? 0 : 1;
   const fillPenalty = Math.abs(stats.fillRatio - 0.8); // band centre from §5.2 (65-95%)
-  return stats.errorCount * 100 + seamPenalty * 10 + fillPenalty;
+  const shapePenalty = conformance === undefined ? 0 : (1 - conformance) * 5;
+  return stats.errorCount * 100 + seamPenalty * 10 + shapePenalty + fillPenalty;
 }
 
-/** Pick the best-ranked sample per slot as the initial selection; humans override by eye. */
-export function defaultSelection(samples: GeneratedSample[]): SlotSelection {
+/**
+ * Pick the best-ranked sample per slot as the initial selection; humans override by eye.
+ * `conformanceOf` is optional so callers without a reference crop keep today's ordering.
+ */
+export function defaultSelection(
+  samples: GeneratedSample[],
+  conformanceOf?: (slot: AnimalPartType, sampleIndex: number) => number | undefined
+): SlotSelection {
   const firstWithArt = (slot: AnimalPartType) => samples.find((sample) => partCandidateStats(sample, slot).hasArt)?.index ?? samples[0]?.index ?? 0;
   const selection = {} as SlotSelection;
   for (const slot of PART_TYPES) {
     let bestIndex = firstWithArt(slot);
     let bestRank = Number.POSITIVE_INFINITY;
     for (const sample of samples) {
-      const rank = candidateRank(partCandidateStats(sample, slot), slot);
+      const rank = candidateRank(partCandidateStats(sample, slot), slot, conformanceOf?.(slot, sample.index));
       if (rank < bestRank) { bestRank = rank; bestIndex = sample.index; }
     }
     selection[slot] = bestIndex;
