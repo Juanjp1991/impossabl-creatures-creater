@@ -6,6 +6,8 @@ import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type GuidedAnimalB
 import { validateAnimalDraft } from "./src/generation/validation";
 import { mergeTargetedModification, type ModificationTarget } from "./src/generation/repair";
 import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
+import { partReferenceDirective, referenceDirective } from "./src/generation/referenceDirective";
+import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
 
 // Load environment variables
@@ -334,12 +336,6 @@ function requestedReferenceMode(value: unknown): ReferenceMode {
   return value === "inspire" ? "inspire" : "match";
 }
 
-function referenceDirective(hasReference: boolean, mode: ReferenceMode): string {
-  if (!hasReference) return "No reference image is supplied; infer species-accurate anatomy from the brief.";
-  if (mode === "inspire") return "The image is loose inspiration: retain its strongest species cues, palette and design language, but the brief may change pose and proportions.";
-  return "The image is the structural authority. Match its side-view silhouette, pose, head/body ratio, limb folding, ground stance, visible digits, palette placement and presence or absence of an external tail. The brief controls finish and naming but must not replace image anatomy with a generic standing mammal. Ignore the image background, crop artifacts, logos, text and watermarks.";
-}
-
 function assertBrief(value: unknown): GuidedAnimalBrief {
   const brief = value as GuidedAnimalBrief;
   if (!brief || typeof brief !== "object" || typeof brief.animalName !== "string" || !brief.animalName.trim() || typeof brief.summary !== "string" || !brief.summary.trim()) {
@@ -525,6 +521,104 @@ app.post("/api/generate-animal", async (req, res) => {
   }
 });
 
+// §P1 per-part generation. One focused call per slot instead of one call that draws
+// everything: each part gets the full token budget and a prompt that says nothing about the
+// other four. `/api/generate-animal` stays alongside this until the new path is proven.
+app.post("/api/generate-part", async (req, res) => {
+  try {
+    const slot = req.body?.slot;
+    if (!PART_TYPES.includes(slot)) return res.status(400).json({ error: "slot must be head, body, frontLegs, backLegs or tail." });
+    const resolved = resolveModel(req.body?.modelId);
+    if (!resolved) return res.status(503).json({ error: noModelError() });
+    const brief = assertBrief(req.body?.brief);
+    const reference = imagePartFromDataUrl(req.body?.image);
+    const referenceMode = requestedReferenceMode(req.body?.referenceMode);
+    const referenceCropped = req.body?.referenceCropped === true;
+    const palette = req.body?.palette && typeof req.body.palette?.color === "string" && typeof req.body.palette?.accentColor === "string"
+      ? { color: req.body.palette.color, accentColor: req.body.palette.accentColor }
+      : undefined;
+    const bodyContext = typeof req.body?.bodyContext === "string" && req.body.bodyContext.trim() ? req.body.bodyContext.trim() : undefined;
+
+    // A part-targeted call reads the reference for that part alone (§R2/§R3).
+    const referenceRules = slot === "body"
+      ? referenceDirective(Boolean(reference), referenceMode)
+      : partReferenceDirective(Boolean(reference), referenceMode, slot, referenceCropped);
+
+    const systemInstruction = buildPartSystemInstruction({
+      slot,
+      brief,
+      palette,
+      bodyContext,
+      referenceRules,
+      exemplars: typeof req.body?.exemplars === "string" ? req.body.exemplars : undefined,
+      styleGuide: approvedStyleGuidePrompt(),
+    });
+
+    const properties: any = { svg: { type: Type.STRING, description: `Inner SVG for the ${slot} only, wrapped in <g id="${slot}-root">.` } };
+    if (slot === "body") {
+      properties.bodyConnections = animalDraftSchema.properties.bodyConnections;
+      properties.groundY = { type: Type.NUMBER, description: "Body-local y of the ground line the limbs will stand on." };
+      if (!palette) {
+        properties.color = animalDraftSchema.properties.color;
+        properties.accentColor = animalDraftSchema.properties.accentColor;
+      }
+    } else {
+      properties.connection = connectionProfileSchema;
+      if (slot === "frontLegs" || slot === "backLegs") {
+        properties.groundContacts = { type: Type.ARRAY, items: groundContactSchema };
+        properties.depthGroups = depthGroupSchema;
+      }
+    }
+
+    const response = await generateContentWithRetry(resolved.client, {
+      model: resolved.model,
+      contents: reference
+        ? { role: "user", parts: [reference, { text: `Draw the ${slot} of this animal. Reference mode: ${referenceMode}. Guided brief: ${JSON.stringify(brief)}` }] }
+        : `Draw the ${slot} of this animal from the guided brief: ${JSON.stringify(brief)}`,
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: { type: Type.OBJECT, properties, required: ["svg"] },
+        reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
+        maxOutputTokens: 16384,
+      },
+    });
+    if (!response.text) throw new Error(`The model returned an empty ${slot} response.`);
+    const part = JSON.parse(response.text);
+    if (typeof part?.svg !== "string" || !part.svg.trim()) throw new Error(`The model returned no ${slot} SVG.`);
+    return res.json({ ...part, slot, modelId: resolved.entry.id, model: resolved.model, promptVersion: PART_PROMPT_VERSION });
+  } catch (error: any) {
+    console.error("Error generating animal part via AI:", error);
+    const status = /guided animal brief|slot must be|required/i.test(error?.message || "") ? 400 : 500;
+    return res.status(status).json({ error: "Failed to generate the part. Details: " + getFriendlyErrorMessage(error) });
+  }
+});
+
+// §P1 assembly. No model call: the five drawn parts go through exactly the same
+// normalisation, snapping and validation chain the single-call path already uses, which is
+// the lowest-risk place to join the new generation path to the existing surface.
+app.post("/api/assemble-parts", async (req, res) => {
+  try {
+    const brief = assertBrief(req.body?.brief);
+    const draft = req.body?.animal;
+    if (!draft || typeof draft !== "object") return res.status(400).json({ error: "An assembled draft is required." });
+    const plan = quadrupedPlan(brief);
+    const syntaxNormalization = normalizeGeneratedSvgSyntax(draft as AnimalDraft);
+    const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
+    const animal = snapAttachedPartsToAnchors(normalization.animal);
+    const validation = validateAnimalDraft(animal);
+    return res.json({
+      animal, plan, validation, brief,
+      promptVersions: { ...PROMPT_VERSIONS, generator: PART_PROMPT_VERSION },
+      deterministicNormalization: { coordinates: normalization.normalizedParts, syntaxAndPalette: syntaxNormalization.changedParts },
+    });
+  } catch (error: any) {
+    console.error("Error assembling generated parts:", error);
+    const status = /guided animal brief|required/i.test(error?.message || "") ? 400 : 500;
+    return res.status(status).json({ error: "Failed to assemble the parts. Details: " + getFriendlyErrorMessage(error) });
+  }
+});
+
 // AI-driven custom animal modifier endpoint
 app.post("/api/modify-animal", async (req, res) => {
   try {
@@ -532,6 +626,8 @@ app.post("/api/modify-animal", async (req, res) => {
     const modificationTarget: ModificationTarget | undefined = targetPart === "all" ? "all" : PART_TYPES.includes(targetPart) ? targetPart : undefined;
     if (!modificationTarget) return res.status(400).json({ error: "Modification target must be all, head, body, frontLegs, backLegs or tail." });
     const referenceMode = requestedReferenceMode(req.body?.referenceMode);
+    // §R3: the client crops the reference to the target part before sending it.
+    const referenceCropped = req.body?.referenceCropped === true;
     if ((!prompt || typeof prompt !== "string" || !prompt.trim()) && !image) {
       return res.status(400).json({ error: "A valid prompt or an inspiring image is required." });
     }
@@ -564,7 +660,9 @@ app.post("/api/modify-animal", async (req, res) => {
 
     const systemInstruction = `You are an expert vector designer and master illustrator who designs clean, adorable, and highly-detailed SVG illustrations for animals and mythological creatures. 
 
-Your task is to modify an EXISTING custom animal/creature template based on the user's prompt or provided visual reference. ${referenceDirective(Boolean(imagePart), referenceMode)}
+Your task is to modify an EXISTING custom animal/creature template based on the user's prompt or provided visual reference. ${modificationTarget === "all"
+      ? referenceDirective(Boolean(imagePart), referenceMode)
+      : partReferenceDirective(Boolean(imagePart), referenceMode, modificationTarget, referenceCropped)}
 You can modify the whole creature, or focus your modifications on a specific body part if the user requested it.
 
 The targeted body part to modify is: "${modificationTarget}".

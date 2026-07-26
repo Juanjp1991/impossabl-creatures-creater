@@ -6,6 +6,7 @@ import {
   composeSelectedAnimal,
   defaultSelection,
   emphasisForSample,
+  modelForSample,
   partCandidateStats,
   SAMPLE_EMPHASES,
   type GeneratedSample,
@@ -101,4 +102,21 @@ test("briefForSample appends a distinct emphasis without mutating the original",
   assert.notEqual(varied.advancedInstructions, base.advancedInstructions);
   assert.ok(varied.advancedInstructions.includes(SAMPLE_EMPHASES[1]));
   assert.equal(base.advancedInstructions, createDefaultBrief("tiger").advancedInstructions, "original brief untouched");
+});
+
+// §P3 multi-model contact sheet.
+test("samples round-robin across the chosen models", () => {
+  const ids = ["proxy:a", "proxy:b", "proxy:c"];
+  assert.deepEqual([0, 1, 2, 3, 4].map((i) => modelForSample(i, ids)), ["proxy:a", "proxy:b", "proxy:c", "proxy:a", "proxy:b"]);
+});
+
+test("with no model list every sample uses the single chosen model", () => {
+  assert.equal(modelForSample(0, undefined, "proxy:only"), "proxy:only");
+  assert.equal(modelForSample(3, [], "proxy:only"), "proxy:only");
+  // Blank entries must not become a turn in the rotation.
+  assert.equal(modelForSample(1, ["", ""], "proxy:only"), "proxy:only");
+});
+
+test("a single-model list behaves exactly like today's single selection", () => {
+  assert.deepEqual([0, 1, 2].map((i) => modelForSample(i, ["proxy:one"], "proxy:other")), ["proxy:one", "proxy:one", "proxy:one"]);
 });
