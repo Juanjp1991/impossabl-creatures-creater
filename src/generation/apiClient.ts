@@ -8,7 +8,13 @@ export const REQUEST_TIMEOUTS: Record<string, number> = {
   "/api/modify-animal": 135_000,
 };
 
-export interface ModelOption { id: string; label: string; provider: "gemini" | "proxy"; }
+export interface ModelOption {
+  id: string;
+  label: string;
+  provider: "gemini" | "proxy";
+  /** False for models that reject image content, e.g. GLM 5.x. Absent on older servers. */
+  vision?: boolean;
+}
 export interface ModelsResponse { models: ModelOption[]; defaultModelId: string; }
 
 /** The models the server offers for selection, plus today's default. Never throws hard —

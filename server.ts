@@ -8,6 +8,7 @@ import { mergeTargetedModification, type ModificationTarget } from "./src/genera
 import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
 import { partReferenceDirective, referenceDirective } from "./src/generation/referenceDirective";
 import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
+import { parseModelJson } from "./src/generation/parseModelJson";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
 
 // Load environment variables
@@ -57,8 +58,14 @@ interface AiClient {
 // Gemini path can be live at once; each contributes its models to a small registry, and
 // resolveModel() maps a per-request modelId to the right client + model. The default is
 // today's behaviour: proxy when configured, else Gemini.
-interface ModelEntry { id: string; label: string; provider: "gemini" | "proxy"; model: string; }
+interface ModelEntry { id: string; label: string; provider: "gemini" | "proxy"; model: string; vision: boolean; }
 const parseModelList = (value: string | undefined) => (value || "").split(",").map((entry) => entry.trim()).filter(Boolean);
+
+// Proxied models that reject image content outright rather than ignoring it. GLM 5.x answers
+// any request carrying an image part with `messages.content.type is invalid, allowed values:
+// ['text']`, which surfaced as an opaque failure on auto-fill and on every generation with a
+// reference attached. Listing them lets the app say what is wrong instead of relaying a 400.
+const TEXT_ONLY_MODELS = new Set(parseModelList(process.env.AI_PROXY_TEXT_ONLY_MODELS));
 
 let geminiClient: AiClient | null = null;
 let proxyClient: AiClient | null = null;
@@ -70,7 +77,7 @@ const MODEL_REGISTRY: ModelEntry[] = [];
 if (AI_PROXY_URL) {
   proxyClient = createOpenAiProxyClient(AI_PROXY_URL, AI_PROXY_KEY);
   const configured = parseModelList(process.env.AI_PROXY_MODELS);
-  for (const model of configured.length ? configured : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `proxy:${model}`, label: `${model} · proxy`, provider: "proxy", model });
+  for (const model of configured.length ? configured : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `proxy:${model}`, label: `${model} · proxy`, provider: "proxy", model, vision: !TEXT_ONLY_MODELS.has(model) });
   console.log(`AI proxy ${AI_PROXY_URL} serving: ${MODEL_REGISTRY.filter((entry) => entry.provider === "proxy").map((entry) => entry.model).join(", ")}`);
 }
 
@@ -101,7 +108,7 @@ if (AI_PROXY_URL) {
   }
   if (geminiClient) {
     const configured = parseModelList(process.env.GEMINI_MODELS);
-    for (const model of configured.length ? configured : AI_PROXY_URL ? [] : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `gemini:${model}`, label: `${model} · Gemini`, provider: "gemini", model });
+    for (const model of configured.length ? configured : AI_PROXY_URL ? [] : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `gemini:${model}`, label: `${model} · Gemini`, provider: "gemini", model, vision: true });
   }
 }
 
@@ -162,7 +169,7 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
             // satisfy the schema while dropping the system prompt's in-string requirements
             // (required element IDs/groups, allowed palette values). The schema constrains
             // shape; the system instructions constrain content; both apply in full.
-            messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. JSON Schema: ${JSON.stringify(schema)}` });
+            messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. Inside any SVG markup you place in a string field, use SINGLE quotes for attribute values — <g id='head-root'><path d='M10 10' fill='primary'/> — so the JSON string needs no escaped quotes. JSON Schema: ${JSON.stringify(schema)}` });
           } else {
             body.response_format = schema
               ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
@@ -332,6 +339,20 @@ function imagePartFromDataUrl(image: unknown) {
   return { inlineData: { mimeType: match?.[1] || "image/png", data: match?.[2] || image } };
 }
 
+/**
+ * Answer a reference-image request aimed at a text-only model with a readable error instead
+ * of relaying the upstream 400. Returns true when it has already sent the response.
+ */
+function refusedBlindModel(entry: ModelEntry, image: unknown, res: any): boolean {
+  const hasImage = typeof image === "string" && image.trim().length > 0;
+  if (!hasImage || entry.vision) return false;
+  const seeing = MODEL_REGISTRY.filter((candidate) => candidate.vision).map((candidate) => candidate.id);
+  res.status(400).json({
+    error: `${entry.model} cannot read images. Remove the reference image, or choose a model that can see: ${seeing.join(", ")}.`,
+  });
+  return true;
+}
+
 function requestedReferenceMode(value: unknown): ReferenceMode {
   return value === "inspire" ? "inspire" : "match";
 }
@@ -417,13 +438,14 @@ const guidedBriefSchema = {
 
 // The models the UI may choose from, and today's default. A plain list — no plugin framework.
 app.get("/api/models", (_req, res) => {
-  res.json({ models: MODEL_REGISTRY.map(({ id, label, provider }) => ({ id, label, provider })), defaultModelId: DEFAULT_MODEL_ID });
+  res.json({ models: MODEL_REGISTRY.map(({ id, label, provider, vision }) => ({ id, label, provider, vision })), defaultModelId: DEFAULT_MODEL_ID });
 });
 
 app.post("/api/populate-brief", async (req, res) => {
   try {
     const resolved = resolveModel(req.body?.modelId);
     if (!resolved) return res.status(503).json({ error: noModelError() });
+    if (refusedBlindModel(resolved.entry, req.body?.image, res)) return;
     const current = (req.body?.currentBrief || {}) as Partial<GuidedAnimalBrief>;
     const reference = imagePartFromDataUrl(req.body?.image);
     if (!current.animalName?.trim() && !reference) return res.status(400).json({ error: "An animal name or reference image is required to auto-fill details." });
@@ -440,7 +462,7 @@ app.post("/api/populate-brief", async (req, res) => {
       },
     });
     if (!response.text) throw new Error("The model returned an empty guided brief.");
-    const generated = JSON.parse(response.text) as GuidedAnimalBrief;
+    const generated = parseModelJson<GuidedAnimalBrief>(response.text, "brief");
     const brief: GuidedAnimalBrief = {
       ...generated,
       animalName: current.animalName?.trim() || generated.animalName.trim(),
@@ -488,6 +510,7 @@ app.post("/api/generate-animal", async (req, res) => {
   try {
     const resolved = resolveModel(req.body?.modelId);
     if (!resolved) return res.status(503).json({ error: noModelError() });
+    if (refusedBlindModel(resolved.entry, req.body?.image, res)) return;
     const brief = assertBrief(req.body?.brief);
     const originalRequest = typeof req.body?.prompt === "string" && req.body.prompt.trim() ? req.body.prompt.trim() : brief.animalName;
     const reference = imagePartFromDataUrl(req.body?.image);
@@ -506,7 +529,7 @@ app.post("/api/generate-animal", async (req, res) => {
       },
     });
     if (!generationResponse.text) throw new Error("The model returned an empty SVG response.");
-    const rawAnimal = JSON.parse(generationResponse.text) as AnimalDraft;
+    const rawAnimal = parseModelJson<AnimalDraft>(generationResponse.text, "animal");
     const plan = quadrupedPlan(brief);
     const syntaxNormalization = normalizeGeneratedSvgSyntax(rawAnimal);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
@@ -530,6 +553,7 @@ app.post("/api/generate-part", async (req, res) => {
     if (!PART_TYPES.includes(slot)) return res.status(400).json({ error: "slot must be head, body, frontLegs, backLegs or tail." });
     const resolved = resolveModel(req.body?.modelId);
     if (!resolved) return res.status(503).json({ error: noModelError() });
+    if (refusedBlindModel(resolved.entry, req.body?.image, res)) return;
     const brief = assertBrief(req.body?.brief);
     const reference = imagePartFromDataUrl(req.body?.image);
     const referenceMode = requestedReferenceMode(req.body?.referenceMode);
@@ -584,7 +608,7 @@ app.post("/api/generate-part", async (req, res) => {
       },
     });
     if (!response.text) throw new Error(`The model returned an empty ${slot} response.`);
-    const part = JSON.parse(response.text);
+    const part = parseModelJson<any>(response.text, slot);
     if (typeof part?.svg !== "string" || !part.svg.trim()) throw new Error(`The model returned no ${slot} SVG.`);
     return res.json({ ...part, slot, modelId: resolved.entry.id, model: resolved.model, promptVersion: PART_PROMPT_VERSION });
   } catch (error: any) {
@@ -637,6 +661,7 @@ app.post("/api/modify-animal", async (req, res) => {
 
     const resolved = resolveModel(req.body?.modelId);
     if (!resolved) return res.status(503).json({ error: noModelError() });
+    if (refusedBlindModel(resolved.entry, image, res)) return;
 
     let imagePart: any = null;
     if (image && typeof image === "string" && image.trim()) {
@@ -744,7 +769,7 @@ Apply the requested modification: "${prompt || "Modify creature using the provid
       throw new Error("Empty response from Gemini model.");
     }
 
-    const animalData = JSON.parse(text) as Partial<AnimalDraft>;
+    const animalData = parseModelJson<Partial<AnimalDraft>>(text, "modification");
     const { animal: mergedAnimal, changedParts } = mergeTargetedModification(currentAnimal as AnimalDraft, animalData, modificationTarget);
     if (targetField && !changedParts.includes(modificationTarget as typeof PART_TYPES[number])) {
       return res.status(422).json({ error: `Gemini did not return a changed ${targetField}. The original animal was preserved; try a more specific instruction.` });

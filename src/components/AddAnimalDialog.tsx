@@ -630,6 +630,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   /** The primary model always leads, so a sheet with no extras behaves exactly as before. */
   const sampleModelIds = [modelId, ...sheetModelIds.filter((id) => id && id !== modelId)];
 
+  // A model that cannot read images fails the whole call rather than ignoring the reference,
+  // so this has to be visible before the button is pressed, not after a 400 comes back.
+  const blindWithReference = Boolean(uploadedImage) && models.some((model) => model.id === modelId && model.vision === false);
+
   const conformanceOf = (slot: EditablePart, sampleIndex: number) => conformance.get(scoreKey(slot, sampleIndex))?.score;
 
   /**
@@ -3615,9 +3619,20 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                   onChange={(event) => setModelId(event.target.value)}
                   className="flex-1 text-[11px] p-1.5 bg-zinc-900 border border-zinc-800 rounded text-zinc-200"
                 >
-                  {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                  {models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}{model.vision === false ? " — text only" : ""}
+                    </option>
+                  ))}
                 </select>
               </div>
+            )}
+
+            {blindWithReference && (
+              <p className="rounded-lg border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-300">
+                A reference image is attached, but <span className="font-mono">{modelId.replace(/^(proxy|gemini):/, "")}</span> is text only and will reject it.
+                Pick a model without the “text only” note, or remove the reference.
+              </p>
             )}
 
             {/*
