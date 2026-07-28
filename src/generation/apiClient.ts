@@ -5,6 +5,8 @@
 export const REQUEST_TIMEOUTS: Record<string, number> = {
   "/api/populate-brief": 90_000,
   "/api/generate-animal": 270_000,
+  "/api/generate-part": 270_000,
+  "/api/enrich-silhouette-part": 270_000,
   "/api/modify-animal": 135_000,
 };
 

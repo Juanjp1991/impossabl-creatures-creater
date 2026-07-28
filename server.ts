@@ -7,7 +7,11 @@ import { validateAnimalDraft } from "./src/generation/validation";
 import { mergeTargetedModification, type ModificationTarget } from "./src/generation/repair";
 import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
 import { partReferenceDirective, referenceDirective } from "./src/generation/referenceDirective";
-import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
+import { buildPartSystemInstruction, buildSilhouettePartSystemInstruction, PART_PROMPT_VERSION, SILHOUETTE_PROMPT_VERSION } from "./src/generation/partPrompt";
+import { detailDensityProfile, resolveDetailLevel, wholeAnimalDensityInstruction } from "./src/generation/detailDensity";
+import { ENRICHMENT_STAGES, SILHOUETTE_BANDS, SILHOUETTE_TARGETS, STAGE_LABELS, salvageEnrichmentAdditions, stageAdditionTarget, upsertEnrichmentLayer, type EnrichmentStage } from "./src/generation/silhouettePolicy";
+import { visibleElementCount } from "./src/generation/metrics";
+import type { AnimalPartType } from "./src/types";
 import { parseModelJson } from "./src/generation/parseModelJson";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
 
@@ -169,7 +173,15 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
             // satisfy the schema while dropping the system prompt's in-string requirements
             // (required element IDs/groups, allowed palette values). The schema constrains
             // shape; the system instructions constrain content; both apply in full.
+            // Order matters as much as content. The schema lecture used to be the last thing
+            // the model read, and recency decided what it optimised for: Opus 5 returned
+            // schema-perfect answers with a 5-element torso (band floor 8) and raw hex fills,
+            // because "draw richly" sat thousands of tokens upstream while "populate these
+            // fields" sat last. The drawing contract now goes after the schema, restated in
+            // concrete numbers rather than as a pointer to earlier instructions.
             messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. Inside any SVG markup you place in a string field, use SINGLE quotes for attribute values — <g id='head-root'><path d='M10 10' fill='primary'/> — so the JSON string needs no escaped quotes. JSON Schema: ${JSON.stringify(schema)}` });
+            const reminder = (config as any)?.contentReminder;
+            if (reminder) messages.push({ role: "user", content: `BEFORE YOU ANSWER, CHECK THE DRAWING ITSELF. Satisfying the schema is not the task; it is the packaging. ${reminder} A response that is valid JSON but thin, sparse or off-palette is a failed response — count the shapes and re-check the palette before you return it.` });
           } else {
             body.response_format = schema
               ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
@@ -284,10 +296,21 @@ async function generateContentWithRetry(
   maxRetries = 3,
   initialDelay = 2000
 ) {
+  const { contentReminder, ...providerConfig } = options.config ?? {};
+  const requestOptions = {
+    ...options,
+    config: {
+      ...providerConfig,
+      ...(contentReminder && aiClient === proxyClient ? { contentReminder } : {}),
+      ...(contentReminder
+        ? { systemInstruction: `${geminiToText(providerConfig.systemInstruction)}\n\nFINAL DRAWING CHECK — this selected requirement overrides any earlier baseline density numbers: ${contentReminder}` }
+        : {}),
+    },
+  };
   let attempt = 0;
   while (true) {
     try {
-      return await aiClient.models.generateContent(options);
+      return await aiClient.models.generateContent(requestOptions);
     } catch (error: any) {
       attempt++;
       const errorMsg = typeof error === "string" ? error : (error?.message || JSON.stringify(error) || "");
@@ -362,7 +385,7 @@ function assertBrief(value: unknown): GuidedAnimalBrief {
   if (!brief || typeof brief !== "object" || typeof brief.animalName !== "string" || !brief.animalName.trim() || typeof brief.summary !== "string" || !brief.summary.trim()) {
     throw new Error("A complete guided animal brief with an editable summary is required.");
   }
-  return brief;
+  return { ...brief, detailLevel: resolveDetailLevel(brief.detailLevel) };
 }
 
 const pointSchema = { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ["x", "y"] };
@@ -426,7 +449,7 @@ const guidedBriefSchema = {
     age: { type: Type.STRING, enum: ["young", "adult", "mature"] },
     bodyBuild: { type: Type.STRING, enum: ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"] },
     style: { type: Type.STRING, enum: ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"] },
-    detailLevel: { type: Type.STRING, enum: ["low", "medium", "high"] },
+    detailLevel: { type: Type.STRING, enum: ["low", "medium", "high", "ultra"] },
     pose: { type: Type.STRING, enum: ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"] },
     expression: { type: Type.STRING, enum: ["friendly", "calm", "alert", "determined", "curious and cheerful"] },
     mainColour: { type: Type.STRING }, markings: { type: Type.STRING }, definingAnatomy: { type: Type.STRING },
@@ -524,6 +547,7 @@ app.post("/api/generate-animal", async (req, res) => {
       config: {
         systemInstruction: `You design and draw one polished, richly-detailed, left-facing five-part SVG animal in a single structured response. ${referenceRules} The five parts are head, body, frontLegs, backLegs and tail, each authored in ITS OWN fixed local coordinate space, never one shared canvas. Restart coordinates near zero for every field: headSvg and tailSvg inside 0..160 x 0..160; bodySvg inside 0..300 x 0..220; both leg SVGs inside 0..260 x 0..180. Do not add an assembled-canvas offset to any path or anchor. Plan recognizable, species-specific proportions and silhouette before drawing; use purposeful organic contour, facial, marking and shading groups rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill a local view. Give the body opaque geometry around all four socket anchors. Attachment regions are approximate because exact placement is corrected in code, so you need not hit them pixel-perfectly: head meets the body near local (120,110); frontLegs near (75,15); backLegs near (195,15); tail near (15,15). bodyConnections are BODY-LOCAL: neck x40-120 y50-130, tail x200-280 y80-160, frontLegs x70-140 y130-190, backLegs x180-250 y130-190, with the neck left of the tail. Around each limb attachment create a broad 24-40px upper-limb collar spanning local y=0..35 so 10-18px of the limb visibly enters the torso. Every foreleg silhouette is continuous from shoulder to paw and every hind-leg silhouette continuous from hip through hock to paw, never floating fragments. Every seam needs both opaque silhouettes inside the joint zone and at least 40 overlapping opaque pixels. Grounded paws stay within 10px of a common groundY. Layer order is tail, far hind, far fore, body, near hind, near fore, head. Put every visible limb shape under a semantic depth group and emit exact far/near group IDs frontLegs-far, frontLegs-near, backLegs-far and backLegs-near. Emit local layoutMetadata with facing "left", groundY, per-leg ground contacts, depth groups and one connection profile per attached part whose attachmentAnchor is the local point that meets the body. COLOUR: use ONLY these shared ramp tokens as fill and stroke values inside the SVGs, never raw hex or rgb — primary with primary-light and primary-dark for the main silhouette and its shading, accent with accent-dark for markings, the fixed token outline for dark outlines and highlight for light glints. Separately, the top-level color and accentColor fields MUST be two concrete 6-digit hex values (e.g. "#8B5A2B" and "#F5E6C8") — the real, species-appropriate colours this creature is painted in — NOT the words "primary"/"accent"; every ramp token above is computed from those two hexes at render time, so a wrong or missing hex makes the whole creature render grey. STROKE WEIGHT: use stroke-width 3 for silhouette outlines and 1 to 1.5 for fine internal detail; never below 1. DETAIL DENSITY — AIM FOR THE MIDDLE OF EACH BAND, NEVER THE MINIMUM: target about head 18, body 17, each leg set 9 and tail 6 visible shapes; the permitted range is head 8-28, body 8-26, each leg set 5-14 and tail 3-10. UNDER-DETAILING IS THE MOST COMMON FAILURE and is worse than slight over-detailing: a torso built from three flat shapes reads as a featureless blob, not an animal. Give the body distinct shoulder, haunch, ribcage, chest and belly masses plus the species' signature markings; give each limb its upper mass, lower mass and a paw or hoof; give the tail its base, length and tip. Let each part fill about 65-95% of its own local view height. Every group ID appears once and all IDs are globally unique; include each root group head-root, body-root, frontLegs-root, backLegs-root and tail-root. Use compact valid inner SVG only: no <svg> wrapper and no gradients, filters, masks or clipPaths. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.generator}.`,
         responseMimeType: "application/json", responseSchema: animalDraftSchema,
+        contentReminder: `${wholeAnimalDensityInstruction(brief.detailLevel)} Every one of the five SVG fields must be a fully drawn part, not a placeholder. The torso in particular needs distinct shoulder, ribcage, chest, belly and haunch masses plus markings. Every fill and stroke inside the SVGs is a ramp token (primary, primary-light, primary-dark, accent, accent-dark, outline, highlight) and never a raw hex; color and accentColor at the top level are the only concrete hex values. Each part fills 65-95% of its own local view, and every attached part overlaps the body opaquely at its anchor.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
         maxOutputTokens: 16384,
       },
@@ -534,6 +558,7 @@ app.post("/api/generate-animal", async (req, res) => {
     const syntaxNormalization = normalizeGeneratedSvgSyntax(rawAnimal);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
     const animal = snapAttachedPartsToAnchors(normalization.animal);
+    if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
     const validation = validateAnimalDraft(animal);
     const models = { ...MODEL_VERSIONS, planner: resolved.model, generator: resolved.model };
     return res.json({ animal, plan, validation, originalRequest, brief, models, promptVersions: PROMPT_VERSIONS, modelId: resolved.entry.id, deterministicNormalization: { coordinates: normalization.normalizedParts, syntaxAndPalette: syntaxNormalization.changedParts } });
@@ -562,13 +587,15 @@ app.post("/api/generate-part", async (req, res) => {
       ? { color: req.body.palette.color, accentColor: req.body.palette.accentColor }
       : undefined;
     const bodyContext = typeof req.body?.bodyContext === "string" && req.body.bodyContext.trim() ? req.body.bodyContext.trim() : undefined;
+    const silhouetteMode = req.body?.generationMode === "silhouette";
+    const conceptDirection = typeof req.body?.conceptDirection === "string" ? req.body.conceptDirection.trim() : "";
 
     // A part-targeted call reads the reference for that part alone (§R2/§R3).
     const referenceRules = slot === "body"
       ? referenceDirective(Boolean(reference), referenceMode)
       : partReferenceDirective(Boolean(reference), referenceMode, slot, referenceCropped);
 
-    const systemInstruction = buildPartSystemInstruction({
+    const promptInput = {
       slot,
       brief,
       palette,
@@ -576,7 +603,11 @@ app.post("/api/generate-part", async (req, res) => {
       referenceRules,
       exemplars: typeof req.body?.exemplars === "string" ? req.body.exemplars : undefined,
       styleGuide: approvedStyleGuidePrompt(),
-    });
+    };
+    const systemInstruction = silhouetteMode
+      ? buildSilhouettePartSystemInstruction({ ...promptInput, direction: conceptDirection })
+      : buildPartSystemInstruction(promptInput);
+    const density = detailDensityProfile(brief.detailLevel);
 
     const properties: any = { svg: { type: Type.STRING, description: `Inner SVG for the ${slot} only, wrapped in <g id="${slot}-root">.` } };
     if (slot === "body") {
@@ -597,12 +628,15 @@ app.post("/api/generate-part", async (req, res) => {
     const response = await generateContentWithRetry(resolved.client, {
       model: resolved.model,
       contents: reference
-        ? { role: "user", parts: [reference, { text: `Draw the ${slot} of this animal. Reference mode: ${referenceMode}. Guided brief: ${JSON.stringify(brief)}` }] }
-        : `Draw the ${slot} of this animal from the guided brief: ${JSON.stringify(brief)}`,
+        ? { role: "user", parts: [reference, { text: `${silhouetteMode ? "Draw only the silhouette foundation for" : "Draw"} the ${slot} of this animal. Reference mode: ${referenceMode}. Guided brief: ${JSON.stringify(brief)}` }] }
+        : `${silhouetteMode ? "Draw only the silhouette foundation for" : "Draw"} the ${slot} of this animal from the guided brief: ${JSON.stringify(brief)}`,
       config: {
         systemInstruction,
         responseMimeType: "application/json",
         responseSchema: { type: Type.OBJECT, properties, required: ["svg"] },
+        contentReminder: silhouetteMode
+          ? `Return a silhouette foundation only for ${slot}: target ${SILHOUETTE_TARGETS[slot]} strong external shapes in range ${SILHOUETTE_BANDS[slot][0]}-${SILHOUETTE_BANDS[slot][1]}. No eyes, markings, internal anatomy, shading or surface detail.`
+          : `The ${slot} must be fully drawn at ${density.label} detail: target about ${density.targets[slot]} visible SVG shapes in the selected range ${density.bands[slot][0]}-${density.bands[slot][1]}, filling 65-95% of its own local view. Every shape must carry silhouette, anatomy, shading, markings or species identity. Every fill and stroke is a ramp token, never a raw hex.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
         maxOutputTokens: 16384,
       },
@@ -610,7 +644,7 @@ app.post("/api/generate-part", async (req, res) => {
     if (!response.text) throw new Error(`The model returned an empty ${slot} response.`);
     const part = parseModelJson<any>(response.text, slot);
     if (typeof part?.svg !== "string" || !part.svg.trim()) throw new Error(`The model returned no ${slot} SVG.`);
-    return res.json({ ...part, slot, modelId: resolved.entry.id, model: resolved.model, promptVersion: PART_PROMPT_VERSION });
+    return res.json({ ...part, slot, modelId: resolved.entry.id, model: resolved.model, promptVersion: silhouetteMode ? SILHOUETTE_PROMPT_VERSION : PART_PROMPT_VERSION });
   } catch (error: any) {
     console.error("Error generating animal part via AI:", error);
     const status = /guided animal brief|slot must be|required/i.test(error?.message || "") ? 400 : 500;
@@ -630,6 +664,8 @@ app.post("/api/assemble-parts", async (req, res) => {
     const syntaxNormalization = normalizeGeneratedSvgSyntax(draft as AnimalDraft);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
     const animal = snapAttachedPartsToAnchors(normalization.animal);
+    if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
+    if (animal.layoutMetadata && req.body?.generationMode === "silhouette") animal.layoutMetadata.artworkStage = "silhouette";
     const validation = validateAnimalDraft(animal);
     return res.json({
       animal, plan, validation, brief,
@@ -640,6 +676,127 @@ app.post("/api/assemble-parts", async (req, res) => {
     console.error("Error assembling generated parts:", error);
     const status = /guided animal brief|required/i.test(error?.message || "") ? 400 : 500;
     return res.status(status).json({ error: "Failed to assemble the parts. Details: " + getFriendlyErrorMessage(error) });
+  }
+});
+
+app.post("/api/validate-animal", (req, res) => {
+  const animal = req.body?.animal;
+  if (!animal || typeof animal !== "object") return res.status(400).json({ error: "An animal draft is required." });
+  return res.json({ validation: validateAnimalDraft(animal) });
+});
+
+const ENRICHMENT_DIRECTIVE: Record<EnrichmentStage, string> = {
+  anatomy: "Add internal construction shapes for skull, muzzle, cheek, shoulder, chest, ribcage, belly, haunch, thighs, knees, hocks, paws, toes or hooves as appropriate. Do not add decorative markings or lighting.",
+  shading: "Add controlled light and shadow planes that explain the accepted anatomy: underside shadows, far-limb depth, cheek, chest, shoulder and haunch planes, contact shadows and restrained highlights. Do not add markings or texture.",
+  "surface-detail": "Add species-defining facial features, eyes, nostrils, mouth, wrinkles, fur or feather separations, scales, spots, stripes, claws, whiskers and small highlights where appropriate.",
+};
+
+app.post("/api/enrich-silhouette-part", async (req, res) => {
+  try {
+    const slot = req.body?.slot as AnimalPartType;
+    const stage = req.body?.stage as EnrichmentStage;
+    if (!PART_TYPES.includes(slot)) return res.status(400).json({ error: "slot must be head, body, frontLegs, backLegs or tail." });
+    if (!ENRICHMENT_STAGES.includes(stage)) return res.status(400).json({ error: "stage must be anatomy, shading or surface-detail." });
+    const currentAnimal = req.body?.currentAnimal as AnimalDraft;
+    if (!currentAnimal || typeof currentAnimal !== "object") return res.status(400).json({ error: "The locked silhouette draft is required." });
+    const brief = assertBrief(req.body?.brief);
+    const currentStage = currentAnimal.layoutMetadata?.artworkStage;
+    const expectedPrevious: Record<EnrichmentStage, string> = { anatomy: "silhouette", shading: "anatomy", "surface-detail": "shading" };
+    if (currentStage !== expectedPrevious[stage] && currentStage !== stage) {
+      return res.status(409).json({ error: `${STAGE_LABELS[stage]} requires an accepted ${expectedPrevious[stage]} stage; current stage is ${currentStage ?? "untracked"}.` });
+    }
+    const field = REPAIR_FIELD_BY_PART[slot];
+    const currentSvg = currentAnimal[field];
+    if (typeof currentSvg !== "string" || !currentSvg.trim()) return res.status(400).json({ error: `The locked ${slot} silhouette is empty.` });
+    const target = stageAdditionTarget(brief.detailLevel, slot, stage);
+    if (target === 0) {
+      const animal: AnimalDraft = {
+        ...currentAnimal,
+        layoutMetadata: currentAnimal.layoutMetadata
+          ? { ...currentAnimal.layoutMetadata, detailLevel: brief.detailLevel, artworkStage: stage }
+          : currentAnimal.layoutMetadata,
+      };
+      return res.json({ animal, validation: validateAnimalDraft(animal), stage, slot, addedElements: 0, skipped: true });
+    }
+
+    const resolved = resolveModel(req.body?.modelId);
+    if (!resolved) return res.status(503).json({ error: noModelError() });
+    if (refusedBlindModel(resolved.entry, req.body?.image, res)) return;
+    const reference = imagePartFromDataUrl(req.body?.image);
+    const referenceMode = requestedReferenceMode(req.body?.referenceMode);
+    const referenceRules = slot === "body"
+      ? referenceDirective(Boolean(reference), referenceMode)
+      : partReferenceDirective(Boolean(reference), referenceMode, slot, req.body?.referenceCropped === true);
+
+    const systemInstruction = [
+      `You are performing the ${STAGE_LABELS[stage].toUpperCase()} PASS on a locked SVG ${slot} silhouette.`,
+      "The accepted silhouette is immutable. Return ONLY new flat drawable SVG elements to place inside it. Do not return the existing SVG, an <svg> wrapper, a root group, any <g> element, or prose.",
+      "Every new element must remain visually inside the existing filled silhouette and must not change its external contour, attachment, pose, proportions or ground contact.",
+      ENRICHMENT_DIRECTIVE[stage],
+      `Aim for about ${target} purposeful new drawable elements. Do not pad the count with invisible, fully covered or random shapes.`,
+      "Allowed tags: path, circle, rect, ellipse, polygon, polyline and line. Use unique semantic IDs.",
+      "Allowed fill/stroke values are primary, primary-light, primary-dark, accent, accent-dark, outline, highlight and none. No raw colours, gradients, filters, masks, clipPaths, transforms that move art outside the silhouette, or strokes below 1px.",
+      referenceRules,
+      `Creature brief: ${brief.summary}. Palette: primary ${currentAnimal.color}, accent ${currentAnimal.accentColor}.`,
+      `LOCKED ${slot.toUpperCase()} SVG — do not repeat or rewrite it:\n${currentSvg}`,
+      slot === "body" ? "" : `LOCKED BODY CONTEXT:\n${currentAnimal.bodySvg}`,
+      "Prompt version additive-stage-1.0.0.",
+    ].filter(Boolean).join("\n\n");
+
+    const response = await generateContentWithRetry(resolved.client, {
+      model: resolved.model,
+      contents: reference
+        ? { role: "user", parts: [reference, { text: `Add the ${STAGE_LABELS[stage].toLowerCase()} pass to the locked ${slot}. Return additions only.` }] }
+        : `Add the ${STAGE_LABELS[stage].toLowerCase()} pass to the locked ${slot}. Return additions only.`,
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: { additions: { type: Type.STRING, description: "Flat SVG drawable elements only; no svg or g wrapper." } },
+          required: ["additions"],
+        },
+        contentReminder: `Return approximately ${target} NEW ${STAGE_LABELS[stage].toLowerCase()} elements only. The locked silhouette markup must not be repeated or changed.`,
+        reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
+        maxOutputTokens: 16384,
+      },
+    });
+    if (!response.text) throw new Error(`The model returned an empty ${stage} response.`);
+    let additions: string | undefined;
+    try {
+      additions = parseModelJson<{ additions?: string }>(response.text, `${stage} ${slot}`).additions;
+    } catch (parseError) {
+      additions = salvageEnrichmentAdditions(response.text);
+      if (!additions) throw parseError;
+    }
+    if (typeof additions !== "string") throw new Error(`The model returned no ${stage} SVG additions.`);
+
+    const nextSvg = upsertEnrichmentLayer(currentSvg, additions, slot, stage);
+    const animal: AnimalDraft = {
+      ...currentAnimal,
+      [field]: nextSvg,
+      layoutMetadata: currentAnimal.layoutMetadata
+        ? { ...currentAnimal.layoutMetadata, detailLevel: brief.detailLevel, artworkStage: stage }
+        : currentAnimal.layoutMetadata,
+    };
+    const beforeErrors = new Set(validateAnimalDraft(currentAnimal).issues.filter((issue) => issue.severity === "error").map((issue) => `${issue.part}|${issue.code}`));
+    const validation = validateAnimalDraft(animal);
+    const introduced = validation.issues.filter((issue) => issue.severity === "error" && !beforeErrors.has(`${issue.part}|${issue.code}`));
+    if (introduced.length) {
+      return res.status(422).json({ error: `The ${stage} pass introduced ${introduced.map((issue) => `${issue.part}: ${issue.message}`).join("; ")}. The locked silhouette was preserved.` });
+    }
+    return res.json({
+      animal,
+      validation,
+      stage,
+      slot,
+      addedElements: visibleElementCount(nextSvg) - visibleElementCount(currentSvg),
+      modelId: resolved.entry.id,
+    });
+  } catch (error: any) {
+    console.error("Error enriching locked silhouette:", error);
+    const slot = typeof req.body?.slot === "string" ? ` ${req.body.slot}` : "";
+    return res.status(500).json({ error: `Failed to enrich the locked${slot} silhouette. Details: ` + getFriendlyErrorMessage(error) });
   }
 });
 

@@ -3,15 +3,18 @@ import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move,
 import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
+import { detailDensityProfile, detailDensityTotal } from "../generation/detailDensity";
 import { populateGuidedBrief } from "../generation/clientPipeline";
 import { PART_TYPES } from "../generation/contracts";
-import type { AnatomyStylePlan, AnimalDraft, BlueprintConnectionProfile, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
+import type { AnatomyStylePlan, AnimalDraft, BlueprintConnectionProfile, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue, ValidationResult } from "../generation/contracts";
 import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/preview";
 import { validateAnimalDraft } from "../generation/validation";
 import { normalizeGeneratedSvgSyntax } from "../generation/normalize";
 import { errorSignature, newErrorsSince } from "../editor/validationGate";
 import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
 import { runPartPipeline } from "../generation/partPipeline";
+import { runSilhouetteEnrichment, runSilhouetteGeneration } from "../generation/silhouettePipeline";
+import { ENRICHMENT_STAGES, STAGE_LABELS, silhouettePreviewSvg, type EnrichmentStage } from "../generation/silhouettePolicy";
 import { buildExemplarBlock } from "../generation/exemplars";
 import { DEFAULT_VARIATION_CONCURRENCY, DEFAULT_VARIATION_COUNT, VARIATION_STRENGTHS, runPartVariations, type VariationStrength } from "../generation/partVariations";
 import { SVG_FIELD as PART_SVG_FIELD } from "../partBank/contracts";
@@ -59,6 +62,20 @@ import type { RigDefinition } from "../rig/contracts";
 import { computeForwardKinematics, computeLocalJointMatrices, rigMatrixToSvg } from "../rig/engine";
 
 type EditablePart = "head" | "body" | "frontLegs" | "backLegs" | "tail";
+type SamplePurpose = "standard" | "silhouette";
+
+interface SilhouetteCheckpoint {
+  stage: EnrichmentStage;
+  animal: AnimalDraft;
+  validation: ValidationResult;
+}
+
+interface SilhouetteWorkflow {
+  locked: AnimalDraft;
+  lockedValidation: ValidationResult;
+  accepted: SilhouetteCheckpoint[];
+  pending?: SilhouetteCheckpoint;
+}
 
 /** Reads naturally inside the progress line, unlike the capitalised control labels. */
 const VARIATION_STRENGTH_WORD: Record<VariationStrength, string> = { tight: "tight", moderate: "related", loose: "loose" };
@@ -322,12 +339,16 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
   const [isDragging, setIsDragging] = useState(false);
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
+  const selectedDetailDensity = detailDensityProfile(guidedBrief.detailLevel);
+  const selectedDetailTotal = detailDensityTotal(guidedBrief.detailLevel);
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
   const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
   // §5.3 parallel-sample-and-select state. When `samples` is set the contact sheet is shown.
   const [samples, setSamples] = useState<GeneratedSample[] | null>(null);
+  const [samplePurpose, setSamplePurpose] = useState<SamplePurpose | null>(null);
   const [sampleCount, setSampleCount] = useState(DEFAULT_SAMPLE_COUNT);
   const [sampleProgress, setSampleProgress] = useState<{ done: number; total: number } | null>(null);
+  const [silhouetteWorkflow, setSilhouetteWorkflow] = useState<SilhouetteWorkflow | null>(null);
   // §5.5 part bank. `bankSlot` is the SVG editor row whose browser is open; `slotRegen`
   // holds a single-slot re-roll awaiting a pick; `showComposer` swaps the AI panel for the
   // build-from-bank flow.
@@ -501,6 +522,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
       setSvgUndo(EMPTY_HISTORY());
       setSvgRedo(EMPTY_HISTORY());
       setSamples(null);
+      setSamplePurpose(null);
+      setSilhouetteWorkflow(null);
       setSampleProgress(null);
       if (editingAnimal) {
         setName(editingAnimal.name);
@@ -736,6 +759,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setIsGenerating(true);
     setErrorMsg("");
     setSamples(null);
+    setSamplePurpose("standard");
+    setSilhouetteWorkflow(null);
     setSampleProgress({ done: 0, total: sampleCount });
     setGenerationStep(`Generating ${sampleCount} variations in parallel (concurrency ${DEFAULT_SAMPLE_CONCURRENCY})...`);
     try {
@@ -781,6 +806,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setIsGenerating(true);
     setErrorMsg("");
     setSamples(null);
+    setSamplePurpose(null);
+    setSilhouetteWorkflow(null);
     setSampleProgress({ done: 0, total: PART_TYPES.length });
     setGenerationStep("Drawing the body, then the head, legs and tail against it...");
     try {
@@ -837,6 +864,61 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     }
   };
 
+  /**
+   * Silhouette Generation deliberately spends its first round on structure only. Each
+   * concept is still assembled from five focused part calls, but the contact sheet renders
+   * them as black masks so colour and rendering cannot rescue a weak outline.
+   */
+  const handleGenerateSilhouettes = async () => {
+    const animalName = aiPrompt.trim() || guidedBrief.animalName.trim();
+    if (!animalName && !uploadedImage) {
+      setErrorMsg("Please enter an animal description or upload an inspiring image first.");
+      return;
+    }
+    const brief: GuidedAnimalBrief = {
+      ...guidedBrief,
+      animalName: animalName || guidedBrief.animalName,
+      summary: guidedBrief.summary.trim() || summarizeBrief({ ...guidedBrief, animalName: animalName || guidedBrief.animalName }),
+    };
+    setGuidedBrief(brief);
+    setIsGenerating(true);
+    setErrorMsg("");
+    setSamples(null);
+    setSamplePurpose("silhouette");
+    setSilhouetteWorkflow(null);
+    setSampleProgress({ done: 0, total: sampleCount });
+    setGenerationStep(`Generating ${sampleCount} structural silhouette concepts...`);
+    try {
+      const results = await runSilhouetteGeneration({
+        brief,
+        image: uploadedImage,
+        referenceMode,
+        imageForSlot: async (slot) => ({
+          image: await referenceForPart(slot as EditablePart),
+          cropped: isMeaningfulCrop(referenceCrops[slot as EditablePart]),
+        }),
+        modelId,
+        modelIds: sampleModelIds,
+        count: sampleCount,
+        onProgress: (done, total) => {
+          setSampleProgress({ done, total });
+          setGenerationStep(`Generated silhouette concept ${done}/${total}...`);
+        },
+      });
+      const usable = results.filter((sample) => sample.animal).length;
+      if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every silhouette concept failed to generate.");
+      setSamples(results);
+      setGenerationStep(`Generated ${usable}/${results.length} usable silhouettes. Choose the strongest parts, then lock the assembled outline.`);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err?.message || "Silhouette generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
+      setGenerationStep("Silhouette generation stopped.");
+    } finally {
+      setIsGenerating(false);
+      setSampleProgress(null);
+    }
+  };
+
   const handleUseSelection = (animal: AnimalDraft, provenance: SampleProvenance) => {
     applyAnimalDraft(animal);
     // Validate the composed frankenstein on physical ground truth only (the validator no
@@ -867,6 +949,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setGenerationMetadata(metadata);
     setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(animal), diagnosticSvg: buildAssembledPreviewSvg(animal, true) });
     setSamples(null);
+    setSamplePurpose(null);
     setHeadTx(0); setHeadTy(0); setHeadRot(0); setHeadScale(1); setHeadPivotX(80); setHeadPivotY(80);
     setBodyTx(0); setBodyTy(0); setBodyRot(0); setBodyScale(1); setBodyPivotX(150); setBodyPivotY(110);
     setFrontLegsTx(0); setFrontLegsTy(0); setFrontLegsRot(0); setFrontLegsScale(1); setFrontLegsPivotX(130); setFrontLegsPivotY(90);
@@ -875,6 +958,109 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setActiveTweakPart("head");
     setAiMode("refine");
     setGenerationStep(validation.valid ? "Selection applied and passes the deterministic checks. Refine or forge." : "Selection applied with warnings. Refine a part, edit the SVG, or forge as-is.");
+  };
+
+  const applySilhouetteCheckpoint = (animal: AnimalDraft, validation: ValidationResult, recordValidation: boolean) => {
+    applyAnimalDraft(animal);
+    setPipelinePreviews({ cleanSvg: buildAssembledPreviewSvg(animal), diagnosticSvg: buildAssembledPreviewSvg(animal, true) });
+    setGenerationMetadata((current) => current ? {
+      ...current,
+      generatedLayout: animal.layoutMetadata,
+      validationHistory: recordValidation ? [...current.validationHistory, validation] : current.validationHistory,
+      finalStatus: validation.valid ? "approved" : "warnings",
+      stopReason: validation.valid ? "approved" : "no-actionable-issues",
+    } : current);
+  };
+
+  const handleLockSilhouette = (animal: AnimalDraft, provenance: SampleProvenance) => {
+    const validation = validateAnimalDraft(animal);
+    handleUseSelection(animal, provenance);
+    setSilhouetteWorkflow({ locked: animal, lockedValidation: validation, accepted: [] });
+    setGenerationStep("Silhouette locked. Generate the anatomy pass; it will add shapes without redrawing the accepted outline.");
+  };
+
+  const handleGenerateEnrichment = async (stage: EnrichmentStage) => {
+    if (!silhouetteWorkflow) return;
+    const previousPending = silhouetteWorkflow.pending;
+    const base = silhouetteWorkflow.accepted.at(-1) ?? {
+      stage: "anatomy" as const,
+      animal: silhouetteWorkflow.locked,
+      validation: silhouetteWorkflow.lockedValidation,
+    };
+    setIsGenerating(true);
+    setErrorMsg("");
+    setSampleProgress({ done: 0, total: PART_TYPES.length });
+    setGenerationStep(`Generating the ${STAGE_LABELS[stage].toLowerCase()} pass over the accepted checkpoint...`);
+    try {
+      const result = await runSilhouetteEnrichment({
+        stage,
+        animal: base.animal,
+        brief: guidedBrief,
+        image: uploadedImage,
+        referenceMode,
+        imageForSlot: async (slot) => ({
+          image: await referenceForPart(slot as EditablePart),
+          cropped: isMeaningfulCrop(referenceCrops[slot as EditablePart]),
+        }),
+        modelId,
+        onProgress: (done, total, slot) => {
+          setSampleProgress({ done, total });
+          setGenerationStep(`${STAGE_LABELS[stage]}: added ${slot} (${done}/${total})...`);
+        },
+      });
+      const checkpoint: SilhouetteCheckpoint = { stage, animal: result.animal, validation: result.validation };
+      applySilhouetteCheckpoint(result.animal, result.validation, true);
+      setSilhouetteWorkflow((current) => current ? { ...current, pending: checkpoint } : current);
+      setGenerationStep(`${STAGE_LABELS[stage]} preview is ready. Accept it to unlock the next pass, regenerate it, or discard it.`);
+    } catch (err: any) {
+      console.error(err);
+      if (previousPending) {
+        applySilhouetteCheckpoint(previousPending.animal, previousPending.validation, false);
+      } else {
+        applySilhouetteCheckpoint(base.animal, base.validation, false);
+      }
+      setErrorMsg(err?.message || `${STAGE_LABELS[stage]} generation failed.`);
+      setGenerationStep(previousPending
+        ? `${STAGE_LABELS[stage]} regeneration failed; the previous preview is still available to accept, discard or regenerate again.`
+        : `${STAGE_LABELS[stage]} pass stopped; the last accepted checkpoint was restored and you can retry.`);
+    } finally {
+      setIsGenerating(false);
+      setSampleProgress(null);
+    }
+  };
+
+  const handleAcceptSilhouettePass = () => {
+    if (!silhouetteWorkflow?.pending) return;
+    const accepted = silhouetteWorkflow.pending;
+    setSilhouetteWorkflow((current) => current?.pending
+      ? { ...current, accepted: [...current.accepted, current.pending], pending: undefined }
+      : current);
+    const next = ENRICHMENT_STAGES[silhouetteWorkflow.accepted.length + 1];
+    setGenerationStep(next
+      ? `${STAGE_LABELS[accepted.stage]} accepted. ${STAGE_LABELS[next]} is now unlocked.`
+      : "Surface detail accepted. The staged creature is complete and ready to refine or forge.");
+  };
+
+  const handleDiscardSilhouettePass = () => {
+    if (!silhouetteWorkflow?.pending) return;
+    const fallback = silhouetteWorkflow.accepted.at(-1);
+    const animal = fallback?.animal ?? silhouetteWorkflow.locked;
+    const validation = fallback?.validation ?? silhouetteWorkflow.lockedValidation;
+    applySilhouetteCheckpoint(animal, validation, false);
+    setSilhouetteWorkflow((current) => current ? { ...current, pending: undefined } : current);
+    setGenerationStep(`${STAGE_LABELS[silhouetteWorkflow.pending.stage]} discarded. The last accepted checkpoint was restored.`);
+  };
+
+  const handleUndoSilhouettePass = () => {
+    if (!silhouetteWorkflow?.accepted.length) return;
+    const removed = silhouetteWorkflow.accepted.at(-1)!;
+    const accepted = silhouetteWorkflow.accepted.slice(0, -1);
+    const fallback = accepted.at(-1);
+    const animal = fallback?.animal ?? silhouetteWorkflow.locked;
+    const validation = fallback?.validation ?? silhouetteWorkflow.lockedValidation;
+    applySilhouetteCheckpoint(animal, validation, false);
+    setSilhouetteWorkflow({ ...silhouetteWorkflow, accepted, pending: undefined });
+    setGenerationStep(`${STAGE_LABELS[removed.stage]} acceptance undone. The previous checkpoint was restored.`);
   };
 
   /**
@@ -1742,7 +1928,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
   const applyPattern = () => {
     if (!activeShapeIndex) return;
-    const budget = densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType, 0);
+    const budget = densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType, 0, guidedBrief.detailLevel);
     const { svg, markCount } = applyPatternToShape(activePartSvgCode, activeShapeIndex, {
       ...pattern,
       // Seeded from the host id so re-applying the same settings is reproducible, and two
@@ -1866,7 +2052,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
   /** Element count the active part would reach if one more shape were added. */
   const duplicationDensity = () =>
-    densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType);
+    densityAfterDuplication(activePartSvgCode, activeTweakPart as AnimalPartType, 1, guidedBrief.detailLevel);
 
   const duplicateActiveLayer = () => {
     if (!selection.length) return;
@@ -2411,6 +2597,17 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
   const frontPreviewDepthLayers = splitSvgDepthLayers(frontLegsSvg, generationMetadata?.generatedLayout?.depthGroups.frontLegs);
   const backPreviewDepthLayers = splitSvgDepthLayers(backLegsSvg, generationMetadata?.generatedLayout?.depthGroups.backLegs);
+  const silhouetteShownCheckpoint = silhouetteWorkflow?.pending ?? silhouetteWorkflow?.accepted.at(-1);
+  const silhouetteShownAnimal = silhouetteShownCheckpoint?.animal ?? silhouetteWorkflow?.locked;
+  const silhouetteShownStage = silhouetteShownCheckpoint?.stage ?? "silhouette";
+  const silhouetteNextStage = silhouetteWorkflow && !silhouetteWorkflow.pending
+    ? ENRICHMENT_STAGES[silhouetteWorkflow.accepted.length]
+    : undefined;
+  const silhouetteWorkflowPreview = silhouetteShownAnimal
+    ? (silhouetteShownStage === "silhouette"
+      ? silhouettePreviewSvg(buildAssembledPreviewSvg(silhouetteShownAnimal))
+      : buildAssembledPreviewSvg(silhouetteShownAnimal))
+    : "";
 
   if (!isOpen) return null;
 
@@ -3816,6 +4013,22 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       </button>
                       <span className="text-[9px] leading-snug text-zinc-500">One focused call per slot: body first, then head, legs and tail drawn to fit it.</span>
                     </div>
+                    <div className="rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isGenerating || isAutoFillingBrief}
+                          onClick={handleGenerateSilhouettes}
+                          className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-cyan-500/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono font-bold text-cyan-300 transition-all hover:bg-cyan-500/20 active:scale-95 disabled:pointer-events-none disabled:opacity-40"
+                        >
+                          {isGenerating && samplePurpose === "silhouette" ? <Loader2 size={14} className="animate-spin" /> : <ShieldAlert size={14} />}
+                          SILHOUETTE GENERATION
+                        </button>
+                        <span className="text-[9px] leading-snug text-zinc-400">
+                          Generate {sampleCount} clean outline concepts, lock the strongest silhouette, then approve anatomy, shading and surface-detail passes one at a time.
+                        </span>
+                      </div>
+                    </div>
                     <button
                       type="button"
                       disabled={isGenerating || isAutoFillingBrief}
@@ -3833,7 +4046,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           ["age", "Age", ["young", "adult", "mature"]],
                           ["bodyBuild", "Body build", ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"]],
                           ["style", "Style", ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"]],
-                          ["detailLevel", "Detail", ["low", "medium", "high"]],
+                          ["detailLevel", "Detail", ["low", "medium", "high", "ultra"]],
                           ["pose", "Pose", ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"]],
                           ["expression", "Expression", ["friendly", "calm", "alert", "determined", "curious and cheerful"]],
                         ] as Array<[keyof GuidedAnimalBrief, string, string[]]>).map(([key, label, values]) => (
@@ -3843,6 +4056,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                             </select>
                           </label>
                         ))}
+                      </div>
+                      <div className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2 py-1.5" aria-live="polite">
+                        <p className="text-[8px] font-mono uppercase tracking-wide text-amber-400">
+                          {selectedDetailDensity.label} target · {selectedDetailTotal} visible SVG shapes total
+                        </p>
+                        <p className="mt-1 text-[8px] font-mono leading-relaxed text-zinc-400">
+                          Head {selectedDetailDensity.targets.head}
+                          {" · "}Body {selectedDetailDensity.targets.body}
+                          {" · "}Front legs {selectedDetailDensity.targets.frontLegs}
+                          {" · "}Back legs {selectedDetailDensity.targets.backLegs}
+                          {" · "}Tail {selectedDetailDensity.targets.tail}
+                        </p>
                       </div>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
                         {([[
@@ -3948,11 +4173,17 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               <div className="rounded-2xl border border-amber-500/20 bg-zinc-950/40 p-3">
                 <ContactSheetSelector
                   samples={samples}
-                  onUse={handleUseSelection}
-                  onCancel={() => setSamples(null)}
+                  appearance={samplePurpose === "silhouette" ? "silhouette" : "artwork"}
+                  title={samplePurpose === "silhouette" ? "Choose and assemble the strongest silhouette" : undefined}
+                  description={samplePurpose === "silhouette"
+                    ? "Judge only the external contour, proportions, stance and negative space. The flat dark mask deliberately hides colour and rendering. You may mix parts between concepts before locking."
+                    : undefined}
+                  useLabel={samplePurpose === "silhouette" ? "Lock silhouette" : undefined}
+                  onUse={samplePurpose === "silhouette" ? handleLockSilhouette : handleUseSelection}
+                  onCancel={() => { setSamples(null); setSamplePurpose(null); }}
                   conformanceOf={(slot, index) => conformanceOf(slot as EditablePart, index)}
                   underlays={slotUnderlays}
-                  onRefineSlot={(slot, sample, composed, provenance) => {
+                  onRefineSlot={samplePurpose === "silhouette" ? undefined : (slot, sample, composed, provenance) => {
                     handleUseSelection(composed, provenance);
                     const svg = sample.animal?.[PART_SVG_FIELD[slot]];
                     if (typeof svg === "string") {
@@ -3964,8 +4195,120 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
               </div>
             )}
 
+            {silhouetteWorkflow && !samples && (
+              <div className="rounded-2xl border border-cyan-500/30 bg-cyan-500/5 p-3">
+                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-semibold text-cyan-300">Silhouette Generation</p>
+                    <p className="mt-1 max-w-3xl text-[10px] leading-relaxed text-zinc-400">
+                      The locked outline is the immutable foundation. Each later pass may only add a named SVG layer; it cannot regenerate or replace the accepted silhouette markup.
+                    </p>
+                  </div>
+                  <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[9px] font-mono uppercase text-cyan-300">
+                    {STAGE_LABELS[silhouetteShownStage]}
+                  </span>
+                </div>
+
+                <div className="mb-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                  {(["silhouette", ...ENRICHMENT_STAGES] as const).map((stage, index) => {
+                    const accepted = stage === "silhouette" || (index > 0 && silhouetteWorkflow.accepted.length >= index);
+                    const reviewing = silhouetteWorkflow.pending?.stage === stage;
+                    return (
+                      <div
+                        key={stage}
+                        className={`rounded-lg border px-2 py-1.5 text-[9px] font-mono ${
+                          reviewing
+                            ? "border-amber-400 bg-amber-500/10 text-amber-300"
+                            : accepted
+                            ? "border-emerald-700/70 bg-emerald-500/10 text-emerald-300"
+                            : "border-zinc-800 bg-zinc-950/70 text-zinc-600"
+                        }`}
+                      >
+                        <div className="font-bold uppercase">{STAGE_LABELS[stage]}</div>
+                        <div>{reviewing ? "review now" : accepted ? (stage === "silhouette" ? "locked" : "accepted") : "waiting"}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(15rem,0.7fr)] md:items-center">
+                  <div
+                    className="overflow-hidden rounded-xl border border-zinc-800 bg-gradient-to-br from-zinc-300 via-zinc-400 to-zinc-500 [&>svg]:h-auto [&>svg]:w-full"
+                    dangerouslySetInnerHTML={{ __html: silhouetteWorkflowPreview }}
+                  />
+                  <div className="space-y-2">
+                    {silhouetteWorkflow.pending ? (
+                      <>
+                        <p className="text-[10px] leading-relaxed text-zinc-300">
+                          Inspect this {STAGE_LABELS[silhouetteWorkflow.pending.stage].toLowerCase()} preview. Nothing becomes the next checkpoint until you accept it.
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            disabled={isGenerating}
+                            onClick={handleAcceptSilhouettePass}
+                            className="rounded-lg bg-emerald-500 px-3 py-2 text-[10px] font-mono font-bold text-zinc-950 hover:bg-emerald-400 disabled:opacity-40"
+                          >
+                            ACCEPT PASS
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isGenerating}
+                            onClick={handleDiscardSilhouettePass}
+                            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-[10px] font-mono font-bold text-zinc-300 hover:border-red-500 hover:text-red-300 disabled:opacity-40"
+                          >
+                            DISCARD
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isGenerating}
+                            onClick={() => handleGenerateEnrichment(silhouetteWorkflow.pending!.stage)}
+                            className="rounded-lg border border-amber-600/60 bg-amber-500/10 px-3 py-2 text-[10px] font-mono font-bold text-amber-300 hover:bg-amber-500/20 disabled:opacity-40"
+                          >
+                            REGENERATE PASS
+                          </button>
+                        </div>
+                      </>
+                    ) : silhouetteNextStage ? (
+                      <>
+                        <p className="text-[10px] leading-relaxed text-zinc-300">
+                          Next: {STAGE_LABELS[silhouetteNextStage]}. This pass starts from the last accepted checkpoint and adds its own removable SVG layer.
+                        </p>
+                        <button
+                          type="button"
+                          disabled={isGenerating}
+                          onClick={() => handleGenerateEnrichment(silhouetteNextStage)}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500 px-3 py-2 text-[10px] font-mono font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                        >
+                          {isGenerating ? <Loader2 size={12} className="animate-spin" /> : <Layers size={12} />}
+                          GENERATE {STAGE_LABELS[silhouetteNextStage].toUpperCase()} PASS
+                        </button>
+                      </>
+                    ) : (
+                      <p className="rounded-lg border border-emerald-700/50 bg-emerald-500/10 p-2 text-[10px] leading-relaxed text-emerald-300">
+                        All three passes are accepted. Continue with ordinary refinement, manual SVG editing, or forge the creature.
+                      </p>
+                    )}
+                    {silhouetteWorkflow.accepted.length > 0 && (
+                      <button
+                        type="button"
+                        disabled={isGenerating}
+                        onClick={handleUndoSilhouettePass}
+                        className="inline-flex items-center gap-1 text-[9px] font-mono text-zinc-500 hover:text-amber-300 disabled:opacity-40"
+                      >
+                        <Undo2 size={10} /> undo last accepted pass
+                      </button>
+                    )}
+                    {isGenerating && sampleProgress && (
+                      <p className="text-[9px] font-mono text-cyan-300">Parts completed {sampleProgress.done}/{sampleProgress.total}</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Build from already-banked parts — no generation, no spend. */}
-            {!samples && (
+            {!samples && !silhouetteWorkflow && (
               <div className="rounded-2xl border border-zinc-800 bg-zinc-950/40 p-3">
                 {showComposer ? (
                   <PartBankComposer onUse={handleUseBankComposition} onCancel={() => setShowComposer(false)} />

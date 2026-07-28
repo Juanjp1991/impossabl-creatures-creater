@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 
 import { createDefaultBrief } from "./brief";
 import { PART_TYPES } from "./contracts";
+import { DETAIL_LEVELS, detailDensityProfile, detailDensityTotal, wholeAnimalDensityInstruction } from "./detailDensity";
 import { DENSITY_BANDS } from "./metrics";
-import { buildPartSystemInstruction, sharedHouseStyle, slotSection, SLOT_DENSITY_TARGET } from "./partPrompt";
+import { buildPartSystemInstruction, buildSilhouettePartSystemInstruction, sharedHouseStyle, silhouetteSlotSection, slotSection, SILHOUETTE_PROMPT_VERSION, SLOT_DENSITY_TARGET } from "./partPrompt";
+import { SILHOUETTE_BANDS, SILHOUETTE_TARGETS } from "./silhouettePolicy";
 import { namespacePartSvg, partDraft } from "./partPipeline";
 
 const brief = createDefaultBrief("red fox");
@@ -37,10 +39,41 @@ test("every slot is aimed at the middle of its own density band", () => {
   for (const slot of PART_TYPES) {
     const section = slotSection(slot);
     const band = DENSITY_BANDS[slot];
-    assert.match(section, new RegExp(`about ${SLOT_DENSITY_TARGET[slot]} visible shapes`));
+    assert.match(section, new RegExp(`about ${SLOT_DENSITY_TARGET[slot]} visible SVG shapes`));
     assert.match(section, new RegExp(`range ${band[0]}-${band[1]}`));
     assert.ok(SLOT_DENSITY_TARGET[slot] > band[0] && SLOT_DENSITY_TARGET[slot] < band[1], `${slot} target should sit inside its band`);
   }
+});
+
+test("every guided detail level produces its own numerical part targets", () => {
+  for (const detailLevel of DETAIL_LEVELS) {
+    const profile = detailDensityProfile(detailLevel);
+    const levelBrief = { ...brief, detailLevel };
+    for (const slot of PART_TYPES) {
+      const section = buildPartSystemInstruction({
+        slot,
+        brief: levelBrief,
+        referenceRules: "No reference image is supplied.",
+        styleGuide: "STYLE GUIDE.",
+      });
+      assert.match(section, new RegExp(`${profile.label.toUpperCase()}: target about ${profile.targets[slot]} visible SVG shapes`));
+      assert.match(section, new RegExp(`range ${profile.bands[slot][0]}-${profile.bands[slot][1]}`));
+    }
+  }
+});
+
+test("Ultra has the largest per-part and whole-animal shape targets", () => {
+  for (const slot of PART_TYPES) {
+    assert.ok(
+      detailDensityProfile("ultra").targets[slot] > detailDensityProfile("high").targets[slot],
+      `${slot} Ultra target should exceed High`,
+    );
+  }
+  assert.equal(detailDensityTotal("medium"), 59);
+  assert.equal(detailDensityTotal("high"), 112);
+  assert.equal(detailDensityTotal("ultra"), 174);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /head 45 shapes/);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /about 174 visible SVG shapes total/);
 });
 
 test("the house-style block is byte-identical across every slot", () => {
@@ -118,4 +151,39 @@ test("namespacing rewrites internal references along with the ids", () => {
   assert.ok(!/#muzzle["')]/.test(svg), `dangling reference in ${svg}`);
   assert.match(svg, /href="#head-muzzle"/);
   assert.match(svg, /url\(#head-muzzle\)/);
+});
+
+test("silhouette prompts spend their numerical budget only on external structure", () => {
+  for (const slot of PART_TYPES) {
+    const section = silhouetteSlotSection(slot);
+    assert.match(section, new RegExp(`target about ${SILHOUETTE_TARGETS[slot]} purposeful visible SVG shapes`));
+    assert.match(section, new RegExp(`range ${SILHOUETTE_BANDS[slot][0]}-${SILHOUETTE_BANDS[slot][1]}`));
+  }
+  const prompt = buildSilhouettePartSystemInstruction({
+    slot: "head",
+    brief,
+    referenceRules: "No reference image is supplied.",
+    styleGuide: "IGNORED STYLE GUIDE",
+    direction: "Prioritize pose clarity.",
+  });
+  assert.match(prompt, /SILHOUETTE FOUNDATION/);
+  assert.match(prompt, /Do not draw eyes/);
+  assert.match(prompt, /Prioritize pose clarity/);
+  assert.match(prompt, new RegExp(SILHOUETTE_PROMPT_VERSION.replace(/\./g, "\\.")));
+  assert.doesNotMatch(prompt, /Draw skull mass/);
+  assert.doesNotMatch(prompt, /IGNORED STYLE GUIDE/);
+});
+
+test("silhouette leg prompts retain structural depth groups and body context", () => {
+  const prompt = buildSilhouettePartSystemInstruction({
+    slot: "frontLegs",
+    brief,
+    referenceRules: "No reference image is supplied.",
+    styleGuide: "",
+    bodyContext: `<g id="body-root"><path d="M0 0"/></g>`,
+  });
+  assert.match(prompt, /frontLegs-far/);
+  assert.match(prompt, /frontLegs-near/);
+  assert.match(prompt, /LOCKED BODY|exact body silhouette/i);
+  assert.match(prompt, /body-root/);
 });

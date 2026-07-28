@@ -1,4 +1,5 @@
 import type { GenerationPresetId, GuidedAnimalBrief } from "./contracts";
+import { detailDensityTotal } from "./detailDensity";
 
 export const GENERATION_PRESETS: Array<{ id: GenerationPresetId; label: string; defaults: Partial<GuidedAnimalBrief> }> = [
   { id: "friendly-cartoon", label: "Friendly Cartoon", defaults: { sexOrVariant: "neutral", age: "adult", bodyBuild: "soft and balanced", style: "cartoon", detailLevel: "medium", pose: "relaxed side view", expression: "friendly" } },
@@ -42,7 +43,7 @@ export function summarizeBrief(brief: Omit<GuidedAnimalBrief, "summary"> | Guide
   const details = [
     `${brief.age} ${brief.sexOrVariant} ${brief.animalName || "animal"}`,
     `${brief.bodyBuild} build`,
-    `${brief.style}, ${brief.detailLevel} detail`,
+    `${brief.style}, ${brief.detailLevel} detail targeting about ${detailDensityTotal(brief.detailLevel)} visible SVG shapes`,
     `${brief.pose} with a ${brief.expression} expression`,
     `${brief.mainColour}; ${brief.markings}`,
     `defining anatomy: ${brief.definingAnatomy}`,

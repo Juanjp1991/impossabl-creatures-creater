@@ -31,6 +31,9 @@ export interface PartCallResult {
 
 export interface PartPipelineInput {
   brief: GuidedAnimalBrief;
+  generationMode?: "full" | "silhouette";
+  /** Differentiates silhouette concepts without relying on temperature support. */
+  conceptDirection?: string;
   image?: string | null;
   referenceMode?: ReferenceMode;
   /** Per-slot cropped references (§R3); the whole image is used where a slot has no crop. */
@@ -83,6 +86,8 @@ async function callPart(input: PartPipelineInput, slot: AnimalPartType, extra: R
   const payload = await postJson("/api/generate-part", {
     slot,
     brief: input.brief,
+    generationMode: input.generationMode,
+    conceptDirection: input.conceptDirection,
     image: reference.image,
     referenceMode: input.referenceMode,
     referenceCropped: reference.cropped,
@@ -100,11 +105,22 @@ async function callPart(input: PartPipelineInput, slot: AnimalPartType, extra: R
 export function partDraft(
   slot: AnimalPartType,
   part: PartCallResult,
-  base: { name: string; color: string; accentColor: string; description: string; bodyConnections: AnimalDraft["bodyConnections"]; groundY: number }
+  base: {
+    name: string;
+    color: string;
+    accentColor: string;
+    description: string;
+    bodyConnections: AnimalDraft["bodyConnections"];
+    groundY: number;
+    detailLevel?: GuidedAnimalBrief["detailLevel"];
+    artworkStage?: GeneratedLayoutMetadata["artworkStage"];
+  }
 ): AnimalDraft {
   const connections: BlueprintConnectionProfile[] = part.connection ? [{ ...part.connection, part: slot as Exclude<AnimalPartType, "body"> }] : [];
   const layoutMetadata: GeneratedLayoutMetadata = {
     facing: "left",
+    detailLevel: base.detailLevel,
+    artworkStage: base.artworkStage,
     groundY: base.groundY,
     connections,
     groundContacts: part.groundContacts && (slot === "frontLegs" || slot === "backLegs") ? { [slot]: part.groundContacts } : {},
@@ -151,6 +167,8 @@ export async function runPartPipeline(input: PartPipelineInput): Promise<PartPip
     description: input.brief.summary || input.brief.animalName,
     bodyConnections: body.bodyConnections ?? DEFAULT_CONNECTIONS,
     groundY: Number.isFinite(body.groundY) ? Number(body.groundY) : 178,
+    detailLevel: input.brief.detailLevel,
+    artworkStage: input.generationMode === "silhouette" ? "silhouette" as const : undefined,
   };
 
   const attached = await Promise.all(ATTACHED.map(async (slot) => {
@@ -174,7 +192,11 @@ export async function runPartPipeline(input: PartPipelineInput): Promise<PartPip
   })) as Record<AnimalPartType, AnimalDraft>;
 
   const assembled = assembleFromPartDrafts(bySlot);
-  const finished = await postJson("/api/assemble-parts", { brief: input.brief, animal: assembled });
+  const finished = await postJson("/api/assemble-parts", {
+    brief: input.brief,
+    animal: assembled,
+    generationMode: input.generationMode,
+  });
   return {
     animal: finished.animal as AnimalDraft,
     plan: finished.plan as AnatomyStylePlan,

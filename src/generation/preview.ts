@@ -68,7 +68,7 @@ export function buildAssembledPreviewSvg(draft: AnimalDraft, diagnostic = false)
     layer(frontLayers ? "preview-frontLegs-near" : "preview-frontLegs", transforms.frontLegs, frontLayers?.near ?? draft.frontLegsSvg),
     layer("preview-head", transforms.head, draft.headSvg),
   ].join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 500" width="600" height="500" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="600" height="500" fill="#fafafa"/><line x1="0" y1="${groundLine}" x2="600" y2="${groundLine}" stroke="#bbb" stroke-dasharray="4 4" data-derived-ground="true"/>${behindBody}${layer("preview-body", transforms.body, draft.bodySvg)}${inFrontOfBody}${bounds}${anchors}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 500" width="600" height="500" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="600" height="500" fill="#fafafa" data-preview-background="true"/><line x1="0" y1="${groundLine}" x2="600" y2="${groundLine}" stroke="#bbb" stroke-dasharray="4 4" data-derived-ground="true"/>${behindBody}${layer("preview-body", transforms.body, draft.bodySvg)}${inFrontOfBody}${bounds}${anchors}</svg>`;
 }
 
 export function buildJointCropSvg(draft: AnimalDraft, part: Exclude<keyof AnimalDraft["bodyConnections"], never>): string {
@@ -81,7 +81,7 @@ export function buildIsolatedPartPreviewSvg(draft: AnimalDraft, part: AnimalPart
   const views = { head: [160, 160], body: [300, 220], frontLegs: [260, 180], backLegs: [260, 180], tail: [160, 160] } as const;
   const fields = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg" } as const;
   const [width, height] = views[part];
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="${width}" height="${height}" fill="#fafafa"/>${colourize(draft[fields[part]], draft)}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="--primary:${escapeAttr(draft.color)};--accent:${escapeAttr(draft.accentColor)}"><rect width="${width}" height="${height}" fill="#fafafa" data-preview-background="true"/>${colourize(draft[fields[part]], draft)}</svg>`;
 }
 
 function normalizeSvgForImage(svg: string): string {

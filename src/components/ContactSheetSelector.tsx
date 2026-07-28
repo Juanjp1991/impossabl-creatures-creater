@@ -15,7 +15,9 @@ import {
 import { buildAssembledPreviewSvg, buildIsolatedPartPreviewSvg } from "../generation/preview";
 import { analyzeDraftGeometry } from "../generation/geometry";
 import { validateAnimalDraft } from "../generation/validation";
-import { DENSITY_BANDS, FILL_BAND } from "../generation/metrics";
+import { FILL_BAND } from "../generation/metrics";
+import { resolveDetailLevel } from "../generation/detailDensity";
+import { densityBandForArtworkStage, silhouettePreviewSvg } from "../generation/silhouettePolicy";
 import { usePartBank } from "../partBank/usePartBank";
 
 const SLOT_LABELS: Record<AnimalPartType, string> = {
@@ -40,6 +42,10 @@ interface ContactSheetSelectorProps {
   samples: GeneratedSample[];
   onUse: (animal: AnimalDraft, provenance: SampleProvenance) => void;
   onCancel: () => void;
+  appearance?: "artwork" | "silhouette";
+  title?: string;
+  description?: string;
+  useLabel?: string;
   /**
    * "This one is the best so far, but not there yet." Adopts the current composition and
    * immediately starts a variation round on that slot, seeded with this candidate's art.
@@ -57,10 +63,28 @@ function shortModelLabel(modelId: string): string {
   return modelId.replace(/^(proxy|gemini):/, "");
 }
 
-export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, conformanceOf, underlays }: ContactSheetSelectorProps) {
+export function ContactSheetSelector({
+  samples,
+  onUse,
+  onCancel,
+  appearance = "artwork",
+  title = "Pick the best part per slot",
+  description,
+  useLabel = "Use this creature",
+  onRefineSlot,
+  conformanceOf,
+  underlays,
+}: ContactSheetSelectorProps) {
   // The initial pick uses conformance when it is available, so the closest match to your crop
   // is already selected when the sheet opens.
   const [selection, setSelection] = useState<SlotSelection>(() => defaultSelection(samples, conformanceOf));
+  const layout = samples.find((sample) => sample.animal)?.animal?.layoutMetadata;
+  const detailLevel = resolveDetailLevel(layout?.detailLevel);
+  const densityBands = Object.fromEntries(
+    PART_TYPES.map((slot) => [slot, densityBandForArtworkStage(detailLevel, slot, layout?.artworkStage)]),
+  ) as Record<AnimalPartType, readonly [number, number]>;
+  const isSilhouette = appearance === "silhouette";
+  const preview = (svg: string) => isSilhouette ? silhouettePreviewSvg(svg) : svg;
   const select = (slot: AnimalPartType, index: number) => setSelection((current) => ({ ...current, [slot]: index }));
 
   /**
@@ -116,7 +140,11 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
     } catch { return undefined; }
   }, [composed.animal]);
 
-  const assembledSvg = useMemo(() => (composed.animal ? buildAssembledPreviewSvg(composed.animal, false) : ""), [composed.animal]);
+  const assembledSvg = useMemo(() => {
+    if (!composed.animal) return "";
+    const svg = buildAssembledPreviewSvg(composed.animal, false);
+    return isSilhouette ? silhouettePreviewSvg(svg) : svg;
+  }, [composed.animal, isSilhouette]);
   const errorCount = assessment?.validation.issues.filter((issue) => issue.severity === "error").length ?? 0;
   const warningCount = assessment?.validation.issues.filter((issue) => issue.severity === "warning").length ?? 0;
 
@@ -129,17 +157,21 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
           <button onClick={onCancel} className="inline-flex items-center gap-1 text-[11px] font-mono text-zinc-400 hover:text-zinc-200">
             <ArrowLeft size={12} /> back
           </button>
-          <span className="text-xs font-semibold text-zinc-200">Pick the best part per slot</span>
+          <span className="text-xs font-semibold text-zinc-200">{title}</span>
         </div>
         <span className="text-[10px] font-mono text-zinc-500">{usableSamples}/{samples.length} samples usable</span>
       </div>
 
-      {bankError && (
+      {!isSilhouette && bankError && (
         <p className="rounded-lg border border-amber-900/50 bg-amber-950/20 p-2 text-[10px] text-amber-300">{bankError}</p>
       )}
-      <p className="text-[10px] leading-snug text-zinc-500">
-        Bookmark any candidate to keep it in the part bank — including the ones you do not pick. This run generated {samples.length * PART_TYPES.length} parts and the composition keeps {PART_TYPES.length}.
-      </p>
+      {description ? (
+        <p className="text-[10px] leading-snug text-zinc-500">{description}</p>
+      ) : !isSilhouette ? (
+        <p className="text-[10px] leading-snug text-zinc-500">
+          Bookmark any candidate to keep it in the part bank — including the ones you do not pick. This run generated {samples.length * PART_TYPES.length} parts and the composition keeps {PART_TYPES.length}.
+        </p>
+      ) : null}
 
       {/* Per-slot candidate rows */}
       <div className="space-y-3">
@@ -149,16 +181,18 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
               <span className="text-[11px] font-semibold text-zinc-300">{SLOT_LABELS[slot]}</span>
               <div className="flex items-center gap-2">
                 <span className="text-[9px] font-mono text-zinc-600">
-                  fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {DENSITY_BANDS[slot][0]}–{DENSITY_BANDS[slot][1]}{slot === "body" ? "" : " · seam ≥40"}
+                  fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {densityBands[slot][0]}–{densityBands[slot][1]}{slot === "body" ? "" : " · seam ≥40"}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => keepRow(slot)}
-                  title="Save every usable candidate in this row to the part bank"
-                  className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[9px] font-mono text-zinc-500 hover:border-amber-600 hover:text-amber-400"
-                >
-                  <Bookmark size={9} /> keep all
-                </button>
+                {!isSilhouette && (
+                  <button
+                    type="button"
+                    onClick={() => keepRow(slot)}
+                    title="Save every usable candidate in this row to the part bank"
+                    className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[9px] font-mono text-zinc-500 hover:border-amber-600 hover:text-amber-400"
+                  >
+                    <Bookmark size={9} /> keep all
+                  </button>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -166,7 +200,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                 const stats = partCandidateStats(sample, slot);
                 const chosen = selection[slot] === sample.index;
                 const inFill = stats.fillRatio >= FILL_BAND[0] && stats.fillRatio <= FILL_BAND[1];
-                const inDensity = stats.elementCount >= DENSITY_BANDS[slot][0] && stats.elementCount <= DENSITY_BANDS[slot][1];
+                const inDensity = stats.elementCount >= densityBands[slot][0] && stats.elementCount <= densityBands[slot][1];
                 const seamOk = stats.seamPixels === null || stats.seamPixels >= 40;
                 const isSaved = saved.has(cellKey(slot, sample.index));
                 const shape = conformanceOf?.(slot, sample.index);
@@ -191,7 +225,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                     } ${stats.hasArt ? "cursor-pointer" : "opacity-40 cursor-not-allowed"}`}
                   >
                     <div className="absolute right-1 top-1 z-10 flex items-center gap-1">
-                      {stats.hasArt && (
+                      {!isSilhouette && stats.hasArt && (
                         <button
                           type="button"
                           onClick={(event) => { event.stopPropagation(); keep(slot, sample); }}
@@ -207,7 +241,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                       {chosen && <span className="rounded-full bg-amber-400 p-0.5 text-zinc-950"><Check size={10} /></span>}
                     </div>
                     <div className="mb-1 flex flex-col">
-                      <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">#{sample.index + 1} {emphasisLabel(sample.index)}</span>
+                      <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">#{sample.index + 1} {sample.label ?? emphasisLabel(sample.index)}</span>
                       {/* §P3: which model drew this candidate, so a mixed sheet is readable. */}
                       {sample.modelId && (
                         <span className="truncate text-[8px] font-mono text-zinc-600" title={sample.modelId}>{shortModelLabel(sample.modelId)}</span>
@@ -215,11 +249,11 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                     </div>
                     {stats.hasArt && sample.animal ? (
                       <div
-                        className="relative aspect-square w-full overflow-hidden rounded bg-[#fafafa]"
+                        className={`relative aspect-square w-full overflow-hidden rounded ${isSilhouette ? "bg-gradient-to-br from-zinc-300 via-zinc-400 to-zinc-500" : "bg-[#fafafa]"}`}
                         style={underlays?.[slot] ? { backgroundImage: `url(${underlays[slot]})`, backgroundSize: "contain", backgroundPosition: "center", backgroundRepeat: "no-repeat" } : undefined}
                       >
                         {underlays?.[slot] && <div className="absolute inset-0 bg-[#fafafa]/70" />}
-                        <InlineSvg svg={buildIsolatedPartPreviewSvg(sample.animal, slot)} className="absolute inset-0 [&>svg]:h-full [&>svg]:w-full" />
+                        <InlineSvg svg={preview(buildIsolatedPartPreviewSvg(sample.animal, slot))} className="absolute inset-0 [&>svg]:h-full [&>svg]:w-full" />
                       </div>
                     ) : (
                       <div className="flex aspect-square w-full items-center justify-center rounded bg-zinc-950 text-center text-[9px] font-mono text-zinc-600">
@@ -268,7 +302,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
         <div>
           <div className="mb-1 text-[11px] font-semibold text-zinc-300">Assembled selection</div>
           {composed.animal ? (
-            <InlineSvg svg={assembledSvg} className="w-full max-w-md overflow-hidden rounded-lg border border-zinc-800 bg-[#fafafa] [&>svg]:h-auto [&>svg]:w-full" />
+            <InlineSvg svg={assembledSvg} className={`w-full max-w-md overflow-hidden rounded-lg border border-zinc-800 [&>svg]:h-auto [&>svg]:w-full ${isSilhouette ? "bg-gradient-to-br from-zinc-300 via-zinc-400 to-zinc-500" : "bg-[#fafafa]"}`} />
           ) : (
             <div className="rounded-lg border border-amber-900/50 bg-amber-950/20 p-3 text-[11px] text-amber-300">{composed.error}</div>
           )}
@@ -287,7 +321,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
             onClick={() => composed.animal && onUse(composed.animal, sampleProvenance(samples, selection))}
             className="inline-flex items-center justify-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <Sparkles size={14} /> Use this creature
+            <Sparkles size={14} /> {useLabel}
           </button>
           {errorCount > 0 && composed.animal && (
             <p className="text-[9px] leading-snug text-zinc-500">Still forgeable — technical errors are shown for information and can be fixed by hand or by swapping a part.</p>

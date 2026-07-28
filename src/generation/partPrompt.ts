@@ -12,9 +12,11 @@
 
 import type { AnimalPartType } from "../types";
 import type { GuidedAnimalBrief } from "./contracts";
-import { DENSITY_BANDS } from "./metrics";
+import { DETAIL_DENSITY_PROFILES, detailDensityProfile, resolveDetailLevel } from "./detailDensity";
+import { SILHOUETTE_BANDS, SILHOUETTE_TARGETS } from "./silhouettePolicy";
 
 export const PART_PROMPT_VERSION = "p1-part-1.0.0";
+export const SILHOUETTE_PROMPT_VERSION = "silhouette-part-1.0.0";
 
 /** Fixed local view per slot, matching `VIEW` in geometry.ts. */
 export const SLOT_VIEW: Record<AnimalPartType, { width: number; height: number }> = {
@@ -34,9 +36,7 @@ export const SLOT_ATTACHMENT: Record<Exclude<AnimalPartType, "body">, { x: numbe
 };
 
 /** Mid-band element target — the plan's finding is that the floor is where output lands. */
-export const SLOT_DENSITY_TARGET: Record<AnimalPartType, number> = {
-  head: 18, body: 17, frontLegs: 9, backLegs: 9, tail: 6,
-};
+export const SLOT_DENSITY_TARGET: Record<AnimalPartType, number> = DETAIL_DENSITY_PROFILES.medium.targets;
 
 const SLOT_ANATOMY: Record<AnimalPartType, string> = {
   head: "skull mass, muzzle or beak, jaw and cheek, both ears (near and far), the visible eye with a highlight, nostril and mouth line, any horns or antlers, and the species' facial markings",
@@ -44,6 +44,14 @@ const SLOT_ANATOMY: Record<AnimalPartType, string> = {
   frontLegs: "the near and far foreleg each with shoulder mass, forearm, knee, pastern and a paw or hoof with visible digits where the species has them",
   backLegs: "the near and far hind leg each with thigh and hip mass, a clearly angled hock, lower leg, and a paw or hoof with visible digits where the species has them",
   tail: "the base where it leaves the body, the length with its curve, and the tip with any tuft, plume or banding",
+};
+
+const SLOT_SILHOUETTE: Record<AnimalPartType, string> = {
+  head: "the external skull, muzzle or beak, jaw, both visible ear contours, and external horns, tusks or antlers that define the species",
+  body: "one coherent external torso mass with readable shoulder, chest, belly, back and haunch contours",
+  frontLegs: "separate near and far foreleg masses, each continuous from the shoulder collar through the knee to a grounded paw or hoof",
+  backLegs: "separate near and far hind-leg masses, each continuous from the hip through a readable hock to a grounded paw or hoof",
+  tail: "a continuous external base, length, curve and species-defining tip",
 };
 
 /**
@@ -62,9 +70,12 @@ export function sharedHouseStyle(palette?: { color: string; accentColor: string 
 }
 
 /** The slot's own section: its view, its anchor, its density target, its anatomy checklist. */
-export function slotSection(slot: AnimalPartType): string {
+export function slotSection(slot: AnimalPartType, detailLevel: GuidedAnimalBrief["detailLevel"] = "medium"): string {
   const view = SLOT_VIEW[slot];
-  const band = DENSITY_BANDS[slot];
+  const resolvedDetail = resolveDetailLevel(detailLevel);
+  const profile = detailDensityProfile(resolvedDetail);
+  const band = profile.bands[slot];
+  const target = profile.targets[slot];
   const lines = [
     `You are drawing the ${slot} only, in ITS OWN fixed local coordinate space: 0..${view.width} across by 0..${view.height} down. Restart coordinates near zero; never add an assembled-canvas offset.`,
     `Wrap everything in a single root group with id "${slot}-root".`,
@@ -89,9 +100,40 @@ export function slotSection(slot: AnimalPartType): string {
     );
   }
   lines.push(
-    `DETAIL DENSITY — AIM FOR THE MIDDLE OF THE BAND, NEVER THE MINIMUM: about ${SLOT_DENSITY_TARGET[slot]} visible shapes, permitted range ${band[0]}-${band[1]}. Under-detailing is the most common failure and is worse than slight over-detailing.`,
+    `DETAIL DENSITY — ${profile.label.toUpperCase()}: target about ${target} visible SVG shapes, permitted range ${band[0]}-${band[1]}. Count drawable path, circle, rect, ellipse, polygon, polyline and line elements. Every shape must describe silhouette, anatomy, shading, markings or a species-defining feature; never pad the count with random decoration. Under-detailing is the most common failure and is worse than slight over-detailing.`,
     `Draw ${SLOT_ANATOMY[slot]}.`,
     `Let the part fill about 65-95% of its own local view height.`
+  );
+  return lines.join(" ");
+}
+
+export function silhouetteSlotSection(slot: AnimalPartType): string {
+  const view = SLOT_VIEW[slot];
+  const band = SILHOUETTE_BANDS[slot];
+  const lines = [
+    `Draw the ${slot} only in its fixed local coordinate space: 0..${view.width} across by 0..${view.height} down.`,
+    `Wrap everything in one root group with id "${slot}-root".`,
+  ];
+  if (slot === "body") {
+    lines.push(
+      "Keep opaque torso geometry around all four socket anchors.",
+      "Return bodyConnections in BODY-LOCAL coordinates: neck x40-120 y50-130, tail x200-280 y80-160, frontLegs x70-140 y130-190 and backLegs x180-250 y130-190.",
+    );
+  } else {
+    const anchor = SLOT_ATTACHMENT[slot as Exclude<AnimalPartType, "body">];
+    lines.push(`The silhouette must be opaque where it meets the body near local (${anchor.x},${anchor.y}); return that actual local attachment point.`);
+  }
+  if (slot === "frontLegs" || slot === "backLegs") {
+    lines.push(
+      "Create a broad 24-40px upper-limb collar across local y=0..35 so the legs visibly enter the torso.",
+      `Place all far-leg shapes in "${slot}-far" and all near-leg shapes in "${slot}-near".`,
+      "Keep the paws within 10px of a shared ground line and return their ground contacts.",
+    );
+  }
+  lines.push(
+    `SILHOUETTE BUDGET: target about ${SILHOUETTE_TARGETS[slot]} purposeful visible SVG shapes, permitted range ${band[0]}-${band[1]}. Fewer strong organic masses are better than fragmented pieces.`,
+    `Show ${SLOT_SILHOUETTE[slot]}.`,
+    "Let the silhouette fill about 65-95% of its local view height.",
   );
   return lines.join(" ");
 }
@@ -118,7 +160,7 @@ export function buildPartSystemInstruction(input: PartPromptInput): string {
     referenceRules,
     `The animal is: ${brief.summary || brief.animalName}.`,
     "Plan recognizable, species-specific proportions before drawing; use purposeful organic contour, marking and shading shapes rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill the local view.",
-    slotSection(slot),
+    slotSection(slot, brief.detailLevel),
     sharedHouseStyle(palette),
     bodyContext
       ? `The body this part must fit has already been drawn. Match its proportion, line weight and shading language exactly; this is the same animal, not a second one. BODY SVG:\n${bodyContext}`
@@ -126,5 +168,26 @@ export function buildPartSystemInstruction(input: PartPromptInput): string {
     exemplars ?? "",
     styleGuide,
     `Prompt version ${PART_PROMPT_VERSION}.`,
+  ].filter(Boolean).join("\n\n");
+}
+
+export function buildSilhouettePartSystemInstruction(input: PartPromptInput & { direction?: string }): string {
+  const { slot, brief, palette, bodyContext, referenceRules, direction } = input;
+  return [
+    `You are creating the SILHOUETTE FOUNDATION for one part of a left-facing side-view animal: ${slot}.`,
+    "The outer contour, pose, proportions, negative space and attachment are the entire task. Do not draw eyes, pupils, nostrils, mouth lines, markings, highlights, texture, fur lines, wrinkles, internal anatomy planes or decorative shapes.",
+    referenceRules,
+    `The animal is: ${brief.summary || brief.animalName}.`,
+    direction ? `CONCEPT DIRECTION: ${direction}` : "",
+    silhouetteSlotSection(slot),
+    "Use only compact valid inner SVG with path, circle, ellipse, rect, polygon, polyline, line and group elements. No <svg> wrapper, gradients, filters, masks or clipPaths. Every ID is unique.",
+    "Use primary for near silhouette masses, primary-dark for far limb masses, and outline only for a clean 3px external contour. Do not use accent, highlights, opacity tricks or internal strokes.",
+    palette
+      ? `The locked palette is primary ${palette.color} and accent ${palette.accentColor}; keep using ramp tokens inside the SVG.`
+      : "Choose concrete species-appropriate top-level color and accentColor hex values; SVG fills remain ramp tokens.",
+    bodyContext
+      ? `Fit this part to the exact body silhouette below. Preserve its scale, pose language and socket relationship:\n${bodyContext}`
+      : "",
+    `Prompt version ${SILHOUETTE_PROMPT_VERSION}.`,
   ].filter(Boolean).join("\n\n");
 }

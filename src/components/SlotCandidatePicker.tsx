@@ -4,7 +4,8 @@ import type { AnimalPartType } from "../types";
 import { buildIsolatedPartPreviewSvg } from "../generation/preview";
 import { emphasisLabel, partCandidateStats, type GeneratedSample } from "../generation/sampleSelection";
 import { VARIATION_STRENGTHS, type VariationStrength } from "../generation/partVariations";
-import { DENSITY_BANDS, FILL_BAND } from "../generation/metrics";
+import { FILL_BAND } from "../generation/metrics";
+import { detailDensityProfile } from "../generation/detailDensity";
 import { SLOT_LABELS } from "../partBank/contracts";
 import { usePartBank } from "../partBank/usePartBank";
 import { ReferenceIndicator } from "./ReferenceIndicator";
@@ -49,6 +50,7 @@ interface SlotCandidatePickerProps {
 export function SlotCandidatePicker({ slot, samples, onPick, onCancel, variation, heading, reference, conformanceOf, underlay }: SlotCandidatePickerProps) {
   const { savePart, error } = usePartBank();
   const [saved, setSaved] = useState<Set<number>>(new Set());
+  const densityBand = detailDensityProfile(samples.find((sample) => sample.animal)?.animal?.layoutMetadata?.detailLevel).bands[slot];
 
   // §S1: when a crop gives us a shape score, the closest match sorts to the top — the whole
   // point of scoring inside the loop. Without scores the original generation order stands.
@@ -85,7 +87,7 @@ export function SlotCandidatePicker({ slot, samples, onPick, onCancel, variation
           <span className="text-[11px] font-semibold text-zinc-200">{heading ?? `New ${SLOT_LABELS[slot].toLowerCase()} candidates`}</span>
         </div>
         <span className="text-[9px] font-mono text-zinc-600">
-          fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {DENSITY_BANDS[slot][0]}–{DENSITY_BANDS[slot][1]}
+          fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {densityBand[0]}–{densityBand[1]}
         </span>
       </div>
 
