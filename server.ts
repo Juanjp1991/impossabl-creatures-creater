@@ -8,6 +8,7 @@ import { mergeTargetedModification, type ModificationTarget } from "./src/genera
 import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
 import { partReferenceDirective, referenceDirective } from "./src/generation/referenceDirective";
 import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
+import { detailDensityProfile, resolveDetailLevel, wholeAnimalDensityInstruction } from "./src/generation/detailDensity";
 import { parseModelJson } from "./src/generation/parseModelJson";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
 
@@ -170,6 +171,8 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
             // (required element IDs/groups, allowed palette values). The schema constrains
             // shape; the system instructions constrain content; both apply in full.
             messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. Inside any SVG markup you place in a string field, use SINGLE quotes for attribute values — <g id='head-root'><path d='M10 10' fill='primary'/> — so the JSON string needs no escaped quotes. JSON Schema: ${JSON.stringify(schema)}` });
+            const reminder = (config as any)?.contentReminder;
+            if (reminder) messages.push({ role: "user", content: `BEFORE YOU ANSWER, CHECK THE DRAWING ITSELF. Satisfying the schema is not the task; it is the packaging. ${reminder} A response that is valid JSON but thin, sparse or off-palette is a failed response — count the shapes and re-check the palette before you return it.` });
           } else {
             body.response_format = schema
               ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
@@ -284,10 +287,21 @@ async function generateContentWithRetry(
   maxRetries = 3,
   initialDelay = 2000
 ) {
+  const { contentReminder, ...providerConfig } = options.config ?? {};
+  const requestOptions = {
+    ...options,
+    config: {
+      ...providerConfig,
+      ...(contentReminder && aiClient === proxyClient ? { contentReminder } : {}),
+      ...(contentReminder
+        ? { systemInstruction: `${geminiToText(providerConfig.systemInstruction)}\n\nFINAL DRAWING CHECK — this selected requirement overrides any earlier baseline density numbers: ${contentReminder}` }
+        : {}),
+    },
+  };
   let attempt = 0;
   while (true) {
     try {
-      return await aiClient.models.generateContent(options);
+      return await aiClient.models.generateContent(requestOptions);
     } catch (error: any) {
       attempt++;
       const errorMsg = typeof error === "string" ? error : (error?.message || JSON.stringify(error) || "");
@@ -362,7 +376,7 @@ function assertBrief(value: unknown): GuidedAnimalBrief {
   if (!brief || typeof brief !== "object" || typeof brief.animalName !== "string" || !brief.animalName.trim() || typeof brief.summary !== "string" || !brief.summary.trim()) {
     throw new Error("A complete guided animal brief with an editable summary is required.");
   }
-  return brief;
+  return { ...brief, detailLevel: resolveDetailLevel(brief.detailLevel) };
 }
 
 const pointSchema = { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ["x", "y"] };
@@ -426,7 +440,7 @@ const guidedBriefSchema = {
     age: { type: Type.STRING, enum: ["young", "adult", "mature"] },
     bodyBuild: { type: Type.STRING, enum: ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"] },
     style: { type: Type.STRING, enum: ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"] },
-    detailLevel: { type: Type.STRING, enum: ["low", "medium", "high"] },
+    detailLevel: { type: Type.STRING, enum: ["low", "medium", "high", "ultra"] },
     pose: { type: Type.STRING, enum: ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"] },
     expression: { type: Type.STRING, enum: ["friendly", "calm", "alert", "determined", "curious and cheerful"] },
     mainColour: { type: Type.STRING }, markings: { type: Type.STRING }, definingAnatomy: { type: Type.STRING },
@@ -524,6 +538,7 @@ app.post("/api/generate-animal", async (req, res) => {
       config: {
         systemInstruction: `You design and draw one polished, richly-detailed, left-facing five-part SVG animal in a single structured response. ${referenceRules} The five parts are head, body, frontLegs, backLegs and tail, each authored in ITS OWN fixed local coordinate space, never one shared canvas. Restart coordinates near zero for every field: headSvg and tailSvg inside 0..160 x 0..160; bodySvg inside 0..300 x 0..220; both leg SVGs inside 0..260 x 0..180. Do not add an assembled-canvas offset to any path or anchor. Plan recognizable, species-specific proportions and silhouette before drawing; use purposeful organic contour, facial, marking and shading groups rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill a local view. Give the body opaque geometry around all four socket anchors. Attachment regions are approximate because exact placement is corrected in code, so you need not hit them pixel-perfectly: head meets the body near local (120,110); frontLegs near (75,15); backLegs near (195,15); tail near (15,15). bodyConnections are BODY-LOCAL: neck x40-120 y50-130, tail x200-280 y80-160, frontLegs x70-140 y130-190, backLegs x180-250 y130-190, with the neck left of the tail. Around each limb attachment create a broad 24-40px upper-limb collar spanning local y=0..35 so 10-18px of the limb visibly enters the torso. Every foreleg silhouette is continuous from shoulder to paw and every hind-leg silhouette continuous from hip through hock to paw, never floating fragments. Every seam needs both opaque silhouettes inside the joint zone and at least 40 overlapping opaque pixels. Grounded paws stay within 10px of a common groundY. Layer order is tail, far hind, far fore, body, near hind, near fore, head. Put every visible limb shape under a semantic depth group and emit exact far/near group IDs frontLegs-far, frontLegs-near, backLegs-far and backLegs-near. Emit local layoutMetadata with facing "left", groundY, per-leg ground contacts, depth groups and one connection profile per attached part whose attachmentAnchor is the local point that meets the body. COLOUR: use ONLY these shared ramp tokens as fill and stroke values inside the SVGs, never raw hex or rgb — primary with primary-light and primary-dark for the main silhouette and its shading, accent with accent-dark for markings, the fixed token outline for dark outlines and highlight for light glints. Separately, the top-level color and accentColor fields MUST be two concrete 6-digit hex values (e.g. "#8B5A2B" and "#F5E6C8") — the real, species-appropriate colours this creature is painted in — NOT the words "primary"/"accent"; every ramp token above is computed from those two hexes at render time, so a wrong or missing hex makes the whole creature render grey. STROKE WEIGHT: use stroke-width 3 for silhouette outlines and 1 to 1.5 for fine internal detail; never below 1. DETAIL DENSITY — AIM FOR THE MIDDLE OF EACH BAND, NEVER THE MINIMUM: target about head 18, body 17, each leg set 9 and tail 6 visible shapes; the permitted range is head 8-28, body 8-26, each leg set 5-14 and tail 3-10. UNDER-DETAILING IS THE MOST COMMON FAILURE and is worse than slight over-detailing: a torso built from three flat shapes reads as a featureless blob, not an animal. Give the body distinct shoulder, haunch, ribcage, chest and belly masses plus the species' signature markings; give each limb its upper mass, lower mass and a paw or hoof; give the tail its base, length and tip. Let each part fill about 65-95% of its own local view height. Every group ID appears once and all IDs are globally unique; include each root group head-root, body-root, frontLegs-root, backLegs-root and tail-root. Use compact valid inner SVG only: no <svg> wrapper and no gradients, filters, masks or clipPaths. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.generator}.`,
         responseMimeType: "application/json", responseSchema: animalDraftSchema,
+        contentReminder: `${wholeAnimalDensityInstruction(brief.detailLevel)} Every one of the five SVG fields must be a fully drawn part, not a placeholder. The torso in particular needs distinct shoulder, ribcage, chest, belly and haunch masses plus markings. Every fill and stroke inside the SVGs is a ramp token (primary, primary-light, primary-dark, accent, accent-dark, outline, highlight) and never a raw hex; color and accentColor at the top level are the only concrete hex values. Each part fills 65-95% of its own local view, and every attached part overlaps the body opaquely at its anchor.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
         maxOutputTokens: 16384,
       },
@@ -534,6 +549,7 @@ app.post("/api/generate-animal", async (req, res) => {
     const syntaxNormalization = normalizeGeneratedSvgSyntax(rawAnimal);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
     const animal = snapAttachedPartsToAnchors(normalization.animal);
+    if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
     const validation = validateAnimalDraft(animal);
     const models = { ...MODEL_VERSIONS, planner: resolved.model, generator: resolved.model };
     return res.json({ animal, plan, validation, originalRequest, brief, models, promptVersions: PROMPT_VERSIONS, modelId: resolved.entry.id, deterministicNormalization: { coordinates: normalization.normalizedParts, syntaxAndPalette: syntaxNormalization.changedParts } });
@@ -577,6 +593,7 @@ app.post("/api/generate-part", async (req, res) => {
       exemplars: typeof req.body?.exemplars === "string" ? req.body.exemplars : undefined,
       styleGuide: approvedStyleGuidePrompt(),
     });
+    const density = detailDensityProfile(brief.detailLevel);
 
     const properties: any = { svg: { type: Type.STRING, description: `Inner SVG for the ${slot} only, wrapped in <g id="${slot}-root">.` } };
     if (slot === "body") {
@@ -603,6 +620,7 @@ app.post("/api/generate-part", async (req, res) => {
         systemInstruction,
         responseMimeType: "application/json",
         responseSchema: { type: Type.OBJECT, properties, required: ["svg"] },
+        contentReminder: `The ${slot} must be fully drawn at ${density.label} detail: target about ${density.targets[slot]} visible SVG shapes in the selected range ${density.bands[slot][0]}-${density.bands[slot][1]}, filling 65-95% of its own local view. Every shape must carry silhouette, anatomy, shading, markings or species identity. Every fill and stroke is a ramp token, never a raw hex.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
         maxOutputTokens: 16384,
       },
@@ -630,6 +648,7 @@ app.post("/api/assemble-parts", async (req, res) => {
     const syntaxNormalization = normalizeGeneratedSvgSyntax(draft as AnimalDraft);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
     const animal = snapAttachedPartsToAnchors(normalization.animal);
+    if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
     const validation = validateAnimalDraft(animal);
     return res.json({
       animal, plan, validation, brief,

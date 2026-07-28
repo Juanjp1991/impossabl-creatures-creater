@@ -27,6 +27,7 @@ export function mergeTargetedRepair(current: AnimalDraft, patch: Partial<AnimalD
     }
     animal.layoutMetadata = {
       facing: currentMetadata?.facing ?? patch.layoutMetadata.facing,
+      detailLevel: currentMetadata?.detailLevel ?? patch.layoutMetadata.detailLevel,
       groundY: requested.has("body") ? patch.layoutMetadata.groundY : (currentMetadata?.groundY ?? patch.layoutMetadata.groundY),
       connections: [...connectionByPart.values()],
       groundContacts: {

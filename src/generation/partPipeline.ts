@@ -100,11 +100,20 @@ async function callPart(input: PartPipelineInput, slot: AnimalPartType, extra: R
 export function partDraft(
   slot: AnimalPartType,
   part: PartCallResult,
-  base: { name: string; color: string; accentColor: string; description: string; bodyConnections: AnimalDraft["bodyConnections"]; groundY: number }
+  base: {
+    name: string;
+    color: string;
+    accentColor: string;
+    description: string;
+    bodyConnections: AnimalDraft["bodyConnections"];
+    groundY: number;
+    detailLevel?: GuidedAnimalBrief["detailLevel"];
+  }
 ): AnimalDraft {
   const connections: BlueprintConnectionProfile[] = part.connection ? [{ ...part.connection, part: slot as Exclude<AnimalPartType, "body"> }] : [];
   const layoutMetadata: GeneratedLayoutMetadata = {
     facing: "left",
+    detailLevel: base.detailLevel,
     groundY: base.groundY,
     connections,
     groundContacts: part.groundContacts && (slot === "frontLegs" || slot === "backLegs") ? { [slot]: part.groundContacts } : {},
@@ -151,6 +160,7 @@ export async function runPartPipeline(input: PartPipelineInput): Promise<PartPip
     description: input.brief.summary || input.brief.animalName,
     bodyConnections: body.bodyConnections ?? DEFAULT_CONNECTIONS,
     groundY: Number.isFinite(body.groundY) ? Number(body.groundY) : 178,
+    detailLevel: input.brief.detailLevel,
   };
 
   const attached = await Promise.all(ATTACHED.map(async (slot) => {

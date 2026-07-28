@@ -4,6 +4,7 @@
 // same number the gate uses. Values were mined from the committed tiger/hippo examples.
 
 import type { AnimalPartType } from "../types";
+import { DETAIL_DENSITY_PROFILES } from "./detailDensity";
 import { extractSvgBounds } from "./normalize";
 import { isRawColour } from "./palette";
 
@@ -21,7 +22,7 @@ export const FILL_BAND: readonly [number, number] = [0.65, 0.95];
 // Visible drawable elements per part. Too few reads as a generic Version-B blob; too many is
 // the tiger's over-detailed end and blows the old-phone node budget.
 export const DENSITY_BANDS: Record<AnimalPartType, readonly [number, number]> = {
-  head: [8, 28], body: [8, 26], frontLegs: [5, 14], backLegs: [5, 14], tail: [3, 10],
+  ...DETAIL_DENSITY_PROFILES.medium.bands,
 };
 
 const DRAWABLE = /<(?:path|circle|rect|ellipse|polygon|polyline|line)\b/gi;

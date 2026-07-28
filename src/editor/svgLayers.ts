@@ -1,5 +1,6 @@
 import { identityTransform, toSvgTransform, type PartTransform as ShapeTransform } from "./transform";
 import { DENSITY_BANDS, visibleElementCount } from "../generation/metrics";
+import { detailDensityProfile, type DetailLevel } from "../generation/detailDensity";
 import type { AnimalPartType } from "../types";
 
 export type LayerMove = "forward" | "backward" | "front" | "back";
@@ -109,8 +110,8 @@ export function moveSvgLayer(svg: string, id: string, direction: LayerMove) {
  * deliberate 12-segment tail is a legitimate thing to build. Surfacing the number before the
  * click is cheaper than discovering it at save time.
  */
-export function densityAfterDuplication(svg: string, part: AnimalPartType, added = 1) {
-  const [min, max] = DENSITY_BANDS[part];
+export function densityAfterDuplication(svg: string, part: AnimalPartType, added = 1, detailLevel?: DetailLevel) {
+  const [min, max] = detailLevel ? detailDensityProfile(detailLevel).bands[part] : DENSITY_BANDS[part];
   const next = visibleElementCount(svg) + added;
   return { count: next, min, max, withinBand: next >= min && next <= max };
 }

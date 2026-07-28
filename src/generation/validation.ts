@@ -1,6 +1,7 @@
 import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type ValidationIssue, type ValidationResult } from "./contracts";
 import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry } from "./geometry";
+import { detailDensityProfile } from "./detailDensity";
 import { mapPoint, readCoordinateNormalization } from "./normalize";
 import { RAMP_TOKENS } from "./palette";
 import { DENSITY_BANDS, FILL_BAND, STROKE, classifyStrokeWidths, firstRawColour, localFillRatio, visibleElementCount } from "./metrics";
@@ -156,8 +157,11 @@ export function validateAnimalDraft(candidate: unknown, _plan?: AnatomyStylePlan
       const fill = localFillRatio(svg, part);
       if (fill < FILL_BAND[0] || fill > FILL_BAND[1]) issues.push(issue("scale.fill", "warning", part, `${part} occupies ${Math.round(fill * 100)}% of its view height; the shared band is ${Math.round(FILL_BAND[0] * 100)}-${Math.round(FILL_BAND[1] * 100)}%.`));
       const elements = visibleElementCount(svg);
-      const [minElements, maxElements] = DENSITY_BANDS[part];
-      if (elements < minElements || elements > maxElements) issues.push(issue("density.count", "warning", part, `${part} has ${elements} visible elements; the shared band is ${minElements}-${maxElements}.`));
+      const [minElements, maxElements] = draft.layoutMetadata.detailLevel
+        ? detailDensityProfile(draft.layoutMetadata.detailLevel).bands[part]
+        : DENSITY_BANDS[part];
+      const densityName = draft.layoutMetadata.detailLevel ?? "shared";
+      if (elements < minElements || elements > maxElements) issues.push(issue("density.count", "warning", part, `${part} has ${elements} visible elements; the ${densityName} band is ${minElements}-${maxElements}.`));
     }
   }
   if (draft.layoutMetadata) {

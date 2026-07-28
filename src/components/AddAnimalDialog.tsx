@@ -3,6 +3,7 @@ import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move,
 import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
+import { detailDensityProfile, detailDensityTotal } from "../generation/detailDensity";
 import { populateGuidedBrief } from "../generation/clientPipeline";
 import { PART_TYPES } from "../generation/contracts";
 import type { AnatomyStylePlan, AnimalDraft, BlueprintConnectionProfile, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
@@ -322,6 +323,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
   const [isDragging, setIsDragging] = useState(false);
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
+  const selectedDetailDensity = detailDensityProfile(guidedBrief.detailLevel);
+  const selectedDetailTotal = detailDensityTotal(guidedBrief.detailLevel);
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
   const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
   // §5.3 parallel-sample-and-select state. When `samples` is set the contact sheet is shown.
@@ -3833,7 +3836,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           ["age", "Age", ["young", "adult", "mature"]],
                           ["bodyBuild", "Body build", ["soft and balanced", "species-accurate", "athletic", "powerful and muscular", "small and round"]],
                           ["style", "Style", ["natural", "cartoon", "semi-realistic", "fantasy", "semi-realistic game art"]],
-                          ["detailLevel", "Detail", ["low", "medium", "high"]],
+                          ["detailLevel", "Detail", ["low", "medium", "high", "ultra"]],
                           ["pose", "Pose", ["relaxed side view", "natural standing side view", "clear readable side view", "grounded combat-ready side view", "playful standing side view"]],
                           ["expression", "Expression", ["friendly", "calm", "alert", "determined", "curious and cheerful"]],
                         ] as Array<[keyof GuidedAnimalBrief, string, string[]]>).map(([key, label, values]) => (
@@ -3843,6 +3846,18 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                             </select>
                           </label>
                         ))}
+                      </div>
+                      <div className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2 py-1.5" aria-live="polite">
+                        <p className="text-[8px] font-mono uppercase tracking-wide text-amber-400">
+                          {selectedDetailDensity.label} target · {selectedDetailTotal} visible SVG shapes total
+                        </p>
+                        <p className="mt-1 text-[8px] font-mono leading-relaxed text-zinc-400">
+                          Head {selectedDetailDensity.targets.head}
+                          {" · "}Body {selectedDetailDensity.targets.body}
+                          {" · "}Front legs {selectedDetailDensity.targets.frontLegs}
+                          {" · "}Back legs {selectedDetailDensity.targets.backLegs}
+                          {" · "}Tail {selectedDetailDensity.targets.tail}
+                        </p>
                       </div>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
                         {([[

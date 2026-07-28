@@ -273,6 +273,7 @@ export function assembleFromPartDrafts(bySlot: Record<AnimalPartType, AnimalDraf
 
   const layoutMetadata: GeneratedLayoutMetadata = {
     facing: body.layoutMetadata?.facing ?? "left",
+    detailLevel: body.layoutMetadata?.detailLevel,
     groundY: body.layoutMetadata?.groundY ?? 0,
     connections: [
       connectionFor("head", heads),

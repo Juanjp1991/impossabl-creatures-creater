@@ -110,3 +110,19 @@ test("fill-ratio and density are surfaced as warnings on real pipeline output, n
   assert.ok(result.issues.some((entry) => entry.code === "scale.fill" && entry.severity === "warning"));
   assert.ok(!result.issues.some((entry) => (entry.code === "density.count" || entry.code === "scale.fill") && entry.severity === "error"));
 });
+
+test("density validation follows the generated detail tier", () => {
+  const circles = Array.from({ length: 30 }, (_, index) => `<circle cx="${10 + index}" cy="80" r="2" fill="primary"/>`).join("");
+  const medium = validDraft();
+  medium.headSvg = tokenPart("head-root", circles);
+  medium.layoutMetadata = {
+    facing: "left", detailLevel: "medium", groundY: 178,
+    connections: [],
+    groundContacts: { frontLegs: [{ x: 80, y: 178 }], backLegs: [{ x: 195, y: 178 }] },
+    depthGroups: { frontLegs: { farGroupId: "frontLegs-far", nearGroupId: "frontLegs-near" }, backLegs: { farGroupId: "backLegs-far", nearGroupId: "backLegs-near" } },
+  };
+  const high = { ...medium, layoutMetadata: { ...medium.layoutMetadata, detailLevel: "high" as const } };
+
+  assert.ok(validateAnimalDraft(medium).issues.some((entry) => entry.code === "density.count" && entry.part === "head"));
+  assert.ok(!validateAnimalDraft(high).issues.some((entry) => entry.code === "density.count" && entry.part === "head"));
+});

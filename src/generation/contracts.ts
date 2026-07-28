@@ -1,4 +1,5 @@
 import type { AnimalPartType, BodyConnectionPoints } from "../types";
+import type { DetailLevel } from "./detailDensity";
 
 export const PART_TYPES: AnimalPartType[] = ["head", "body", "frontLegs", "backLegs", "tail"];
 
@@ -18,7 +19,7 @@ export interface GuidedAnimalBrief {
   age: string;
   bodyBuild: string;
   style: string;
-  detailLevel: string;
+  detailLevel: DetailLevel;
   pose: string;
   expression: string;
   mainColour: string;
@@ -88,6 +89,8 @@ export interface BlueprintConnectionProfile {
 
 export interface GeneratedLayoutMetadata {
   facing: "left" | "right";
+  /** The selected generation density tier, used to judge shape counts after generation. */
+  detailLevel?: DetailLevel;
   groundY: number;
   connections: BlueprintConnectionProfile[];
   groundContacts: Partial<Record<"frontLegs" | "backLegs", Array<{ x: number; y: number; raised?: boolean }>>>;

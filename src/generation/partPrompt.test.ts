@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { createDefaultBrief } from "./brief";
 import { PART_TYPES } from "./contracts";
+import { DETAIL_LEVELS, detailDensityProfile, detailDensityTotal, wholeAnimalDensityInstruction } from "./detailDensity";
 import { DENSITY_BANDS } from "./metrics";
 import { buildPartSystemInstruction, sharedHouseStyle, slotSection, SLOT_DENSITY_TARGET } from "./partPrompt";
 import { namespacePartSvg, partDraft } from "./partPipeline";
@@ -37,10 +38,41 @@ test("every slot is aimed at the middle of its own density band", () => {
   for (const slot of PART_TYPES) {
     const section = slotSection(slot);
     const band = DENSITY_BANDS[slot];
-    assert.match(section, new RegExp(`about ${SLOT_DENSITY_TARGET[slot]} visible shapes`));
+    assert.match(section, new RegExp(`about ${SLOT_DENSITY_TARGET[slot]} visible SVG shapes`));
     assert.match(section, new RegExp(`range ${band[0]}-${band[1]}`));
     assert.ok(SLOT_DENSITY_TARGET[slot] > band[0] && SLOT_DENSITY_TARGET[slot] < band[1], `${slot} target should sit inside its band`);
   }
+});
+
+test("every guided detail level produces its own numerical part targets", () => {
+  for (const detailLevel of DETAIL_LEVELS) {
+    const profile = detailDensityProfile(detailLevel);
+    const levelBrief = { ...brief, detailLevel };
+    for (const slot of PART_TYPES) {
+      const section = buildPartSystemInstruction({
+        slot,
+        brief: levelBrief,
+        referenceRules: "No reference image is supplied.",
+        styleGuide: "STYLE GUIDE.",
+      });
+      assert.match(section, new RegExp(`${profile.label.toUpperCase()}: target about ${profile.targets[slot]} visible SVG shapes`));
+      assert.match(section, new RegExp(`range ${profile.bands[slot][0]}-${profile.bands[slot][1]}`));
+    }
+  }
+});
+
+test("Ultra has the largest per-part and whole-animal shape targets", () => {
+  for (const slot of PART_TYPES) {
+    assert.ok(
+      detailDensityProfile("ultra").targets[slot] > detailDensityProfile("high").targets[slot],
+      `${slot} Ultra target should exceed High`,
+    );
+  }
+  assert.equal(detailDensityTotal("medium"), 59);
+  assert.equal(detailDensityTotal("high"), 112);
+  assert.equal(detailDensityTotal("ultra"), 174);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /head 45 shapes/);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /about 174 visible SVG shapes total/);
 });
 
 test("the house-style block is byte-identical across every slot", () => {

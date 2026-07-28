@@ -15,7 +15,8 @@ import {
 import { buildAssembledPreviewSvg, buildIsolatedPartPreviewSvg } from "../generation/preview";
 import { analyzeDraftGeometry } from "../generation/geometry";
 import { validateAnimalDraft } from "../generation/validation";
-import { DENSITY_BANDS, FILL_BAND } from "../generation/metrics";
+import { FILL_BAND } from "../generation/metrics";
+import { detailDensityProfile } from "../generation/detailDensity";
 import { usePartBank } from "../partBank/usePartBank";
 
 const SLOT_LABELS: Record<AnimalPartType, string> = {
@@ -61,6 +62,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
   // The initial pick uses conformance when it is available, so the closest match to your crop
   // is already selected when the sheet opens.
   const [selection, setSelection] = useState<SlotSelection>(() => defaultSelection(samples, conformanceOf));
+  const densityBands = detailDensityProfile(samples.find((sample) => sample.animal)?.animal?.layoutMetadata?.detailLevel).bands;
   const select = (slot: AnimalPartType, index: number) => setSelection((current) => ({ ...current, [slot]: index }));
 
   /**
@@ -149,7 +151,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
               <span className="text-[11px] font-semibold text-zinc-300">{SLOT_LABELS[slot]}</span>
               <div className="flex items-center gap-2">
                 <span className="text-[9px] font-mono text-zinc-600">
-                  fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {DENSITY_BANDS[slot][0]}–{DENSITY_BANDS[slot][1]}{slot === "body" ? "" : " · seam ≥40"}
+                  fill {Math.round(FILL_BAND[0] * 100)}–{Math.round(FILL_BAND[1] * 100)}% · elems {densityBands[slot][0]}–{densityBands[slot][1]}{slot === "body" ? "" : " · seam ≥40"}
                 </span>
                 <button
                   type="button"
@@ -166,7 +168,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                 const stats = partCandidateStats(sample, slot);
                 const chosen = selection[slot] === sample.index;
                 const inFill = stats.fillRatio >= FILL_BAND[0] && stats.fillRatio <= FILL_BAND[1];
-                const inDensity = stats.elementCount >= DENSITY_BANDS[slot][0] && stats.elementCount <= DENSITY_BANDS[slot][1];
+                const inDensity = stats.elementCount >= densityBands[slot][0] && stats.elementCount <= densityBands[slot][1];
                 const seamOk = stats.seamPixels === null || stats.seamPixels >= 40;
                 const isSaved = saved.has(cellKey(slot, sample.index));
                 const shape = conformanceOf?.(slot, sample.index);
