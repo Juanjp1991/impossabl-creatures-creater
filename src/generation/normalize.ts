@@ -1,5 +1,6 @@
 import type { AnimalPartType } from "../types";
 import type { AnimalDraft, AnatomyStylePlan, BlueprintConnectionProfile } from "./contracts";
+import { darkenFarLegGroups, physicalLegContractIds } from "./limbContract";
 import { isNearBlack, isNearWhite, parseHex, resolveRamp, type RampToken } from "./palette";
 import { STROKE } from "./metrics";
 
@@ -132,6 +133,7 @@ export function normalizeGeneratedSvgSyntax(input: AnimalDraft): { animal: Anima
         }
       }
       if (animal.layoutMetadata?.depthGroups) animal.layoutMetadata.depthGroups[part] = expected;
+      svg = darkenFarLegGroups(svg, part);
     }
     // Guarantee the required root group id (§5.1 deterministic enforcement). Some models wrap a
     // part in a differently-named group ("head-group") or, for legs, emit only the far/near depth
@@ -156,8 +158,8 @@ export function normalizeAnatomyPlanContract(input: AnatomyStylePlan): AnatomySt
     ...plan.requiredNamedGroups,
     head: [...new Set(["head-root", ...(plan.requiredNamedGroups?.head ?? [])])],
     body: [...new Set(["body-root", ...(plan.requiredNamedGroups?.body ?? [])])],
-    frontLegs: [...new Set(["frontLegs-root", "frontLegs-far", "frontLegs-near", ...(plan.requiredNamedGroups?.frontLegs ?? []).filter((group) => !/(?:far|near)/i.test(group))])],
-    backLegs: [...new Set(["backLegs-root", "backLegs-far", "backLegs-near", ...(plan.requiredNamedGroups?.backLegs ?? []).filter((group) => !/(?:far|near)/i.test(group))])],
+    frontLegs: [...new Set(["frontLegs-root", ...physicalLegContractIds("frontLegs"), ...(plan.requiredNamedGroups?.frontLegs ?? []).filter((group) => !/(?:far|near|front-(?:left|right)-leg)/i.test(group))])],
+    backLegs: [...new Set(["backLegs-root", ...physicalLegContractIds("backLegs"), ...(plan.requiredNamedGroups?.backLegs ?? []).filter((group) => !/(?:far|near|back-(?:left|right)-leg)/i.test(group))])],
     tail: [...new Set(["tail-root", ...(plan.requiredNamedGroups?.tail ?? [])])],
   };
   plan.layerPlan = [

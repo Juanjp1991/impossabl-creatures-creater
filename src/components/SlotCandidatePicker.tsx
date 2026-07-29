@@ -177,6 +177,11 @@ export function SlotCandidatePicker({ slot, samples, onPick, onCancel, variation
               {stats.hasArt && (
                 <div className="mt-1 flex flex-wrap gap-x-2 text-[9px] font-mono text-zinc-500">
                   {stats.seamPixels !== null && <span>seam {stats.seamPixels}</span>}
+                  {stats.legOverlapRatio !== null && <span>split {Math.round((1 - stats.legOverlapRatio) * 100)}%</span>}
+                  {stats.legOrderOk !== null && <span className={stats.legOrderOk ? "text-emerald-500" : "text-amber-500"}>order {stats.legOrderOk ? "✓" : "×"}</span>}
+                  {stats.legSimilarity !== null && <span>pair {Math.round(stats.legSimilarity * 100)}%</span>}
+                  {stats.legCollarOk !== null && <span className={stats.legCollarOk ? "text-emerald-500" : "text-amber-500"}>collar {stats.legCollarOk ? "✓" : "thin"}</span>}
+                  {stats.footElementCount !== null && <span>feet {stats.footElementCount}</span>}
                   <span>fill {Math.round(stats.fillRatio * 100)}%</span>
                   <span>el {stats.elementCount}</span>
                   {shape !== undefined && (

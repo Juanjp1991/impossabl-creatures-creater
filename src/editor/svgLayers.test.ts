@@ -10,14 +10,14 @@ test("generated layer IDs are deterministic, part-scoped and lowercase", () => {
 
 
 test("duplication density is reported against the part's own band", () => {
-  // Two visible drawables; tail's band is 3-10, so one more still leaves it short.
+  // Two visible drawables; tail's default medium band is 5-13, so one more is still short.
   const svg = '<g id="tail-root"><path d="M0 0L1 1"/><path d="M1 1L2 2"/></g>';
   const tail = densityAfterDuplication(svg, "tail");
   assert.equal(tail.count, 3);
-  assert.deepEqual([tail.min, tail.max], [3, 10]);
-  assert.equal(tail.withinBand, true);
+  assert.deepEqual([tail.min, tail.max], [5, 13]);
+  assert.equal(tail.withinBand, false);
 
-  // The same markup judged as a head (band 8-28) is well under.
+  // The same markup judged as a head (band 18-36) is well under.
   const head = densityAfterDuplication(svg, "head");
   assert.equal(head.withinBand, false);
 });
@@ -25,8 +25,8 @@ test("duplication density is reported against the part's own band", () => {
 test("adding several links at once is reported as one jump", () => {
   const svg = '<g id="tail-root">' + '<path d="M0 0L1 1"/>'.repeat(9) + '</g>';
   assert.equal(densityAfterDuplication(svg, "tail", 1).withinBand, true);
-  // 9 + 3 = 12, past the tail band's upper bound of 10.
-  assert.equal(densityAfterDuplication(svg, "tail", 3).withinBand, false);
+  // 9 + 5 = 14, past the tail band's upper bound of 13.
+  assert.equal(densityAfterDuplication(svg, "tail", 5).withinBand, false);
 });
 
 test("the DOM-backed layer operations no-op safely without a DOM", () => {
@@ -39,7 +39,10 @@ test("the DOM-backed layer operations no-op safely without a DOM", () => {
 
 test("the pipeline's required groups are protected from deletion", () => {
   for (const id of ["head-root", "body-root", "frontLegs-root", "backLegs-root", "tail-root",
-                    "frontLegs-far", "frontLegs-near", "backLegs-far", "backLegs-near"]) {
+                    "frontLegs-far", "frontLegs-near", "backLegs-far", "backLegs-near",
+                    "front-left-leg", "front-right-leg", "back-left-leg", "back-right-leg",
+                    "front-left-limb", "front-left-foot", "front-right-limb", "front-right-foot",
+                    "back-left-limb", "back-left-foot", "back-right-limb", "back-right-foot"]) {
     assert.equal(isProtectedLayer(id), true, id);
   }
   assert.equal(isProtectedLayer("head-path-2"), false);

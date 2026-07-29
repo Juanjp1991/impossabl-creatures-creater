@@ -112,7 +112,7 @@ test("fill-ratio and density are surfaced as warnings on real pipeline output, n
 });
 
 test("density validation follows the generated detail tier", () => {
-  const circles = Array.from({ length: 30 }, (_, index) => `<circle cx="${10 + index}" cy="80" r="2" fill="primary"/>`).join("");
+  const circles = Array.from({ length: 50 }, (_, index) => `<circle cx="${10 + index}" cy="80" r="2" fill="primary"/>`).join("");
   const medium = validDraft();
   medium.headSvg = tokenPart("head-root", circles);
   medium.layoutMetadata = {

@@ -8,7 +8,7 @@ Revised after tracing the reference-image path, which turned out to be effective
 
 ## The two structural causes
 
-**One call draws everything.** `/api/generate-animal` produces all five parts plus `layoutMetadata` in a single structured response, capped at `maxOutputTokens: 16384`. The prompt asks for roughly 59 shapes (head 18, body 17, each leg set 9, tail 6). Quality decays across a long structured output, and the fields generated last — tail is last, and is also asked for least — are the ones that come back thinnest. The same system instruction simultaneously carries per-slot coordinate spaces, attachment anchors, body-local connection ranges, limb collars, seam pixel minimums, ground contacts, layer order, depth group IDs, layout metadata, the colour ramp, stroke weights, density bands and the style guide. Every rule competes with the drawing task for the same attention.
+**One call draws everything.** `/api/generate-animal` produces all five parts plus `layoutMetadata` in a single structured response. The guided detail tier now asks for roughly 40, 102, 254 or 450 visible shapes from Low through Ultra, with the leg budgets raised specifically for separate limbs and feet. Quality can still decay across a long structured output, and the fields generated last — tail is last, and is also asked for least — are the ones most likely to come back thin. The same system instruction simultaneously carries per-slot coordinate spaces, attachment anchors, body-local connection ranges, limb collars, seam pixel minimums, ground contacts, layer order, depth group IDs, layout metadata, the colour ramp, stroke weights, density bands and the style guide. Every rule competes with the drawing task for the same attention.
 
 **The style is described, never shown.** `approvedStyleGuidePrompt()` emits six prose principles and a version string. Its `examples` field is the literal strings `["built-in bear", "built-in cheetah"]` — no actual SVG reaches the model. Prose is the weakest way to move style, and the nominal exemplars are poor: the built-in bear fails `validateAnimalDraft` with 16 errors (raw hex fills, missing `*-root` stable groups, off-standard stroke widths).
 
@@ -91,7 +91,7 @@ The largest lever. Replace the single mega-call with one focused call per slot.
 
 - Re-roll and "vary" stop generating whole animals to keep one slot — the compromise recorded in `docs/part-bank-v1.md`. A four-candidate head re-roll becomes four head calls instead of four whole animals.
 - The part bank becomes the natural unit of generation rather than a harvesting layer.
-- Each call gets the full token budget for one part, so the 16k cap stops being a ceiling on total detail.
+- Each call gets the full 32k output budget for one part, so one shared response no longer caps total detail across all five parts.
 
 **Cost.** Five calls instead of one, but each emits roughly a fifth of the SVG, so total output tokens are comparable. Latency becomes two waves (body, then four in parallel) rather than one long call. Per-slot re-rolls get substantially cheaper.
 

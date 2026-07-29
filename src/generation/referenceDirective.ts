@@ -23,8 +23,8 @@ export function referenceDirective(hasReference: boolean, mode: ReferenceMode): 
 export const PART_REFERENCE_CUES: Record<AnimalPartType, string> = {
   head: "skull shape and length, muzzle or beak profile, ear shape, size and set, eye size and placement, horn or antler presence, curve and length, jaw and cheek mass, and facial markings",
   body: "torso silhouette, back line, withers or hump, chest depth, belly line, shoulder and hip mass, and the coat markings across the trunk",
-  frontLegs: "foreleg length and thickness relative to the chest, shoulder and forearm mass, knee and pastern position, stance width, and hoof, paw or digit shape",
-  backLegs: "thigh and hip mass, hock height and angle, how crouched or straight the hind limb is, lower-leg length, and hoof, paw or digit shape",
+  frontLegs: "front-leg length and thickness relative to the chest, attachment shape, species-correct joint flow, stance width, and foot or terminal shape",
+  backLegs: "back-leg length and thickness relative to the rear body, attachment shape, species-correct joint flow, stance width, and foot or terminal shape",
   tail: "tail length relative to the body, thickness at the base versus the tip, how it is carried and curved, tuft, plume or fur density, and any banding or tip markings",
 };
 

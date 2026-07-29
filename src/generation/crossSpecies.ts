@@ -152,7 +152,7 @@ export function evaluateHybrid(index: number, draft: AnimalDraft, sources: Recor
   for (const slot of PART_TYPES) if (fillRatios[slot] < FILL_BAND[0] || fillRatios[slot] > FILL_BAND[1]) flags.push(`scale: ${slot} fills ${Math.round(fillRatios[slot] * 100)}% (band ${Math.round(FILL_BAND[0] * 100)}-${Math.round(FILL_BAND[1] * 100)}%)`);
   for (const [a, b] of ADJACENT) {
     // Compare each part's position WITHIN ITS OWN band, not raw counts. A raw ratio is the wrong
-    // measure because §5.2 already assigns different bands per slot (body 8-26 beside legs 5-14),
+    // measure because §5.2 already assigns different density bands per slot,
     // so a body and a leg set that both conform can still differ 3x — measured on the live roster
     // that made 87% of this flag's hits false alarms. Band position also handles out-of-band parts
     // for free: they fall below 0 or above 1, which widens the gap rather than hiding it.

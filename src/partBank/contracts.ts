@@ -20,6 +20,13 @@ import type {
   GeneratedLayoutMetadata,
   GenerationMetadata,
 } from "../generation/contracts";
+import {
+  LIMB_CONTRACT_VERSION,
+  PHYSICAL_LEGS,
+  physicalLegContractIds,
+  type LimbContractVersion,
+  type PhysicalLegId,
+} from "../generation/limbContract";
 
 /** Fixed local views, per slot. Identical for every animal — this is what makes parts interchangeable. */
 export const PART_VIEWS: Record<AnimalPartType, readonly [number, number]> = {
@@ -86,6 +93,9 @@ export interface PartBankEntry {
   groundContacts?: Array<{ x: number; y: number; raised?: boolean }>;
   /** Semantic near/far group ids inside `svg`. Remapped when ids are namespaced. */
   depthGroups?: { farGroupId: string; nearGroupId: string };
+  /** Strict per-leg identities retained so banked limbs remain animation-ready. */
+  limbContractVersion?: LimbContractVersion;
+  limbInstances?: GeneratedLayoutMetadata["limbInstances"];
   facing?: "left" | "right";
   groundY?: number;
   source: PartBankSource;
@@ -163,7 +173,16 @@ export function namespaceSvgIds(svg: string, prefix: string, keep?: ReadonlySet<
 
 /** Return a copy of `entry` whose SVG ids are unique to `prefix`, with depth groups remapped. */
 export function namespaceEntry(entry: PartBankEntry, prefix: string): PartBankEntry {
-  const { svg, mapping } = namespaceSvgIds(entry.svg, prefix);
+  const keep = new Set<string>([`${entry.slot}-root`]);
+  if (entry.slot === "frontLegs" || entry.slot === "backLegs") {
+    for (const id of physicalLegContractIds(entry.slot)) keep.add(id);
+  }
+  for (const instance of Object.values(entry.limbInstances ?? {})) {
+    if (!instance) continue;
+    keep.add(instance.groupId);
+    keep.add(instance.depthGroupId);
+  }
+  const { svg, mapping } = namespaceSvgIds(entry.svg, prefix, keep);
   return {
     ...entry,
     svg,
@@ -216,6 +235,19 @@ export function partEntryFromDraft(
       : { connection: layout?.connections?.find((entry) => entry.part === slot) }),
     ...(limb && layout?.groundContacts?.[limb] ? { groundContacts: layout.groundContacts[limb] } : {}),
     ...(limb && layout?.depthGroups?.[limb] ? { depthGroups: layout.depthGroups[limb] } : {}),
+    ...(limb && layout?.limbContractVersion === LIMB_CONTRACT_VERSION
+      ? {
+          limbContractVersion: LIMB_CONTRACT_VERSION,
+          limbInstances: Object.fromEntries(
+            PHYSICAL_LEGS
+              .filter((spec) => spec.part === limb)
+              .flatMap((spec) => {
+                const instance = layout.limbInstances?.[spec.id];
+                return instance ? [[spec.id, instance]] : [];
+              }),
+          ) as Partial<Record<PhysicalLegId, NonNullable<GeneratedLayoutMetadata["limbInstances"]>[PhysicalLegId]>>,
+        }
+      : {}),
     ...(layout?.facing ? { facing: layout.facing } : {}),
     ...(typeof layout?.groundY === "number" ? { groundY: layout.groundY } : {}),
     source: options.source ?? "generated",
@@ -253,6 +285,9 @@ export function entryToPartDraft(entry: PartBankEntry): AnimalDraft {
     connections: entry.connection ? [entry.connection] : [],
     groundContacts: limb && entry.groundContacts ? { [limb]: entry.groundContacts } : {},
     depthGroups: limb && entry.depthGroups ? { [limb]: entry.depthGroups } : {},
+    ...(limb && entry.limbContractVersion === LIMB_CONTRACT_VERSION
+      ? { limbContractVersion: LIMB_CONTRACT_VERSION, limbInstances: entry.limbInstances ?? {} }
+      : {}),
   };
   const draft: AnimalDraft = {
     name: entry.name,

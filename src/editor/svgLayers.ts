@@ -124,6 +124,9 @@ export function densityAfterDuplication(svg: string, part: AnimalPartType, added
 const PROTECTED_GROUP_IDS = new Set([
   "head-root", "body-root", "frontLegs-root", "backLegs-root", "tail-root",
   "frontLegs-far", "frontLegs-near", "backLegs-far", "backLegs-near",
+  "front-left-leg", "front-right-leg", "back-left-leg", "back-right-leg",
+  "front-left-limb", "front-right-limb", "back-left-limb", "back-right-limb",
+  "front-left-foot", "front-right-foot", "back-left-foot", "back-right-foot",
 ]);
 
 export const isProtectedLayer = (id: string) => PROTECTED_GROUP_IDS.has(id);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { createDefaultBrief } from "./brief";
 import { PART_TYPES } from "./contracts";
-import { DETAIL_LEVELS, detailDensityProfile, detailDensityTotal, wholeAnimalDensityInstruction } from "./detailDensity";
+import { DETAIL_LEVELS, detailDensityBandTotals, detailDensityProfile, detailDensityTotal, wholeAnimalDensityInstruction } from "./detailDensity";
 import { DENSITY_BANDS } from "./metrics";
 import { buildPartSystemInstruction, sharedHouseStyle, slotSection, SLOT_DENSITY_TARGET } from "./partPrompt";
 import { namespacePartSvg, partDraft } from "./partPipeline";
@@ -18,11 +18,21 @@ test("each slot is told about its own view and nothing else's", () => {
   assert.match(slotSection("frontLegs"), /0\.\.260 across by 0\.\.180 down/);
 });
 
-test("a head call is never told about hind-leg hock continuity", () => {
+test("a head call is never told about back-leg construction", () => {
   const head = instruction("head");
-  assert.ok(!/hock/.test(head), "the head prompt must not mention hocks");
+  assert.ok(!/BACK-LEG SET IDENTITY/.test(head), "the head prompt must not carry back-leg construction rules");
   assert.ok(!/bodyConnections/.test(head), "the head prompt must not carry body-local connection ranges");
-  assert.match(instruction("backLegs"), /hock/);
+  assert.match(instruction("backLegs"), /BACK-LEG SET IDENTITY/);
+});
+
+test("head calls strongly request the preferred tilted three-quarter expression", () => {
+  const head = instruction("head");
+  assert.match(head, /three-quarter head turned partly toward the viewer/i);
+  assert.match(head, /two distinct, fully visible eyes/i);
+  assert.match(head, /two distinct, fully visible ears/i);
+  assert.match(head, /muzzle or beak below and between the eyes/i);
+  assert.match(head, /complete readable mouth/i);
+  assert.match(head, /rear neck connection solid at local \(120,110\)/i);
 });
 
 test("only the body is asked for connections and only legs for depth groups", () => {
@@ -30,8 +40,29 @@ test("only the body is asked for connections and only legs for depth groups", ()
   for (const slot of ["head", "tail"] as const) {
     assert.ok(!/depth group/i.test(slotSection(slot)), `${slot} should not be asked for depth groups`);
   }
-  assert.match(slotSection("frontLegs"), /frontLegs-far and frontLegs-near/);
-  assert.match(slotSection("backLegs"), /backLegs-far and backLegs-near/);
+  assert.match(slotSection("frontLegs"), /frontLegs-near[\s\S]*frontLegs-far/);
+  assert.match(slotSection("backLegs"), /backLegs-near[\s\S]*backLegs-far/);
+});
+
+test("leg calls receive the strict physical identity, separation, order and shading contract", () => {
+  const front = instruction("frontLegs");
+  assert.match(front, /front-left-leg/);
+  assert.match(front, /front-right-leg/);
+  assert.match(front, /front-left-limb/);
+  assert.match(front, /front-left-foot/);
+  assert.match(front, /smooth rounded shoulder or hip collar/i);
+  assert.match(front, /Reserve about 3 meaningful drawable shapes for EACH foot subgroup/i);
+  assert.match(front, /frontLegs body attachment as their own species-correct construction/i);
+  assert.match(front, /never copy, mirror, translate, rename or reuse the main back-leg limb subgroup geometry/i);
+  assert.match(front, /Foot silhouette and construction may be reused when appropriate/i);
+  assert.match(front, /front-left leg and its foot are left of the front-right leg and its foot/i);
+  assert.match(front, /primary-dark and accent-dark/);
+  assert.match(front, /never stack one complete leg silhouette/i);
+  const back = instruction("backLegs");
+  assert.match(back, /back-left-leg/);
+  assert.match(back, /back-right-leg/);
+  assert.match(back, /backLegs body attachment as their own species-correct construction/i);
+  assert.match(back, /never copy, mirror, translate, rename or reuse the main front-leg limb subgroup geometry/i);
 });
 
 test("every slot is aimed at the middle of its own density band", () => {
@@ -61,18 +92,26 @@ test("every guided detail level produces its own numerical part targets", () => 
   }
 });
 
-test("Ultra has the largest per-part and whole-animal shape targets", () => {
-  for (const slot of PART_TYPES) {
-    assert.ok(
-      detailDensityProfile("ultra").targets[slot] > detailDensityProfile("high").targets[slot],
-      `${slot} Ultra target should exceed High`,
-    );
+test("guided detail tiers increase targets and keep every target inside its allowed band", () => {
+  for (const [index, detailLevel] of DETAIL_LEVELS.entries()) {
+    const profile = detailDensityProfile(detailLevel);
+    for (const slot of PART_TYPES) {
+      const [minimum, maximum] = profile.bands[slot];
+      assert.ok(profile.targets[slot] > minimum && profile.targets[slot] < maximum, `${detailLevel} ${slot} target should sit inside its band`);
+      if (index > 0) {
+        const previous = detailDensityProfile(DETAIL_LEVELS[index - 1]);
+        assert.ok(profile.targets[slot] > previous.targets[slot], `${detailLevel} ${slot} should exceed the previous tier`);
+        assert.ok(maximum > previous.bands[slot][1], `${detailLevel} ${slot} ceiling should exceed the previous tier`);
+      }
+    }
   }
-  assert.equal(detailDensityTotal("medium"), 59);
-  assert.equal(detailDensityTotal("high"), 112);
-  assert.equal(detailDensityTotal("ultra"), 174);
-  assert.match(wholeAnimalDensityInstruction("ultra"), /head 45 shapes/);
-  assert.match(wholeAnimalDensityInstruction("ultra"), /about 174 visible SVG shapes total/);
+  assert.equal(detailDensityTotal("medium"), 102);
+  assert.equal(detailDensityTotal("high"), 254);
+  assert.equal(detailDensityTotal("ultra"), 450);
+  assert.deepEqual(detailDensityBandTotals("ultra"), [338, 602]);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /head 100 shapes/);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /about 450 visible SVG shapes total/);
+  assert.match(wholeAnimalDensityInstruction("ultra"), /about 14 meaningful shapes for EACH front foot/);
 });
 
 test("the house-style block is byte-identical across every slot", () => {
@@ -93,6 +132,19 @@ test("the body SVG is passed to attached parts as context, and not to the body i
   assert.match(withBody, /The body this part must fit has already been drawn/);
   assert.match(withBody, /body-root/);
   assert.ok(!/has already been drawn/.test(instruction("body")));
+});
+
+test("a focused leg call uses the opposite set only as a negative comparison", () => {
+  const back = instruction("backLegs", {
+    oppositeLegContext: `<g id="frontLegs-root"><path id="front-shape" d="M0 0L20 20"/></g>`,
+  });
+  assert.match(back, /OPPOSITE LEG SET — NEGATIVE COMPARISON ONLY/);
+  assert.match(back, /do not copy, mirror, translate, rename or lightly edit its main limb silhouettes/i);
+  assert.match(back, /difference must be visible in the broad upper attachment, main limb contour and bend/i);
+  assert.match(back, /feet are the one exception/i);
+  assert.match(back, /silhouette and construction MAY match or be reused/i);
+  assert.match(back, /front-shape/);
+  assert.ok(!instruction("head", { oppositeLegContext: "<path/>" }).includes("OPPOSITE LEG SET"), "non-leg parts must ignore opposite-leg context");
 });
 
 test("partDraft puts the art in its own slot and leaves the others empty", () => {
@@ -138,10 +190,16 @@ test("part ids are namespaced by slot, so two independent calls cannot collide",
 });
 
 test("namespacing preserves the ids the validator matches by name", () => {
-  const svg = namespacePartSvg(`<g id="frontLegs-root"><g id="frontLegs-far"/><g id="frontLegs-near"/><path id="paw"/></g>`, "frontLegs");
+  const svg = namespacePartSvg(`<g id="frontLegs-root"><g id="frontLegs-far"><g id="front-right-leg"><g id="front-right-limb"/><g id="front-right-foot"/></g></g><g id="frontLegs-near"><g id="front-left-leg"><g id="front-left-limb"/><g id="front-left-foot"/></g></g><path id="paw"/></g>`, "frontLegs");
   assert.match(svg, /id="frontLegs-root"/);
   assert.match(svg, /id="frontLegs-far"/);
   assert.match(svg, /id="frontLegs-near"/);
+  assert.match(svg, /id="front-left-leg"/);
+  assert.match(svg, /id="front-right-leg"/);
+  assert.match(svg, /id="front-left-limb"/);
+  assert.match(svg, /id="front-left-foot"/);
+  assert.match(svg, /id="front-right-limb"/);
+  assert.match(svg, /id="front-right-foot"/);
   assert.match(svg, /id="frontlegs-paw"/);
 });
 

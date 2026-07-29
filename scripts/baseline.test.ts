@@ -38,9 +38,9 @@ test("median handles odd, even and empty inputs", () => {
 
 test("the table reports each slot against its density and fill bands", () => {
   const report = summarize(file([run(0), run(1)]));
-  assert.match(report, /\| head \| 2\/2 \| 12 \(8–28, in band\)/);
-  // The tail band tops out at 10, so the same 12 elements are above it.
-  assert.match(report, /\| tail \| 2\/2 \| 12 \(3–10, above\)/);
+  assert.match(report, /\| head \| 2\/2 \| 12 \(18–36, below\)/);
+  // The default medium tail band contains the same 12 elements.
+  assert.match(report, /\| tail \| 2\/2 \| 12 \(5–13, in band\)/);
   assert.match(report, /80\.0 \(in band\)/);
   assert.match(report, /No validation errors across the usable runs\./);
 });

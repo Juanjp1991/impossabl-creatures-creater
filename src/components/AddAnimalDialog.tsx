@@ -3,7 +3,7 @@ import { X, Sparkles, HelpCircle, Info, FileText, Wand2, Loader2, Compass, Move,
 import { Animal, type AnimalPartType } from "../types";
 import { parseSvgToReact, getSvgShapes, ShapeTransform } from "../utils/svgParser";
 import { applyPreset, createDefaultBrief, GENERATION_PRESETS, summarizeBrief } from "../generation/brief";
-import { detailDensityProfile, detailDensityTotal } from "../generation/detailDensity";
+import { detailDensityBandTotals, detailDensityProfile, detailDensityTotal } from "../generation/detailDensity";
 import { populateGuidedBrief } from "../generation/clientPipeline";
 import { PART_TYPES } from "../generation/contracts";
 import type { AnatomyStylePlan, AnimalDraft, BlueprintConnectionProfile, GenerationMetadata, GuidedAnimalBrief, ReferenceMode, ValidationIssue } from "../generation/contracts";
@@ -11,8 +11,8 @@ import { buildAssembledPreviewSvg, splitSvgDepthLayers } from "../generation/pre
 import { validateAnimalDraft } from "../generation/validation";
 import { normalizeGeneratedSvgSyntax } from "../generation/normalize";
 import { errorSignature, newErrorsSince } from "../editor/validationGate";
-import { DEFAULT_SAMPLE_CONCURRENCY, DEFAULT_SAMPLE_COUNT, runSampleGeneration, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
-import { runPartPipeline } from "../generation/partPipeline";
+import { briefForSample, DEFAULT_SAMPLE_COUNT, runSampleGeneration, sampleConcurrencyForModels, type GeneratedSample, type SampleProvenance } from "../generation/sampleSelection";
+import { redrawIndependentLegSets, runPartPipeline } from "../generation/partPipeline";
 import { buildExemplarBlock } from "../generation/exemplars";
 import { DEFAULT_VARIATION_CONCURRENCY, DEFAULT_VARIATION_COUNT, VARIATION_STRENGTHS, runPartVariations, type VariationStrength } from "../generation/partVariations";
 import { SVG_FIELD as PART_SVG_FIELD } from "../partBank/contracts";
@@ -325,6 +325,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
   const selectedDetailDensity = detailDensityProfile(guidedBrief.detailLevel);
   const selectedDetailTotal = detailDensityTotal(guidedBrief.detailLevel);
+  const selectedDetailBandTotals = detailDensityBandTotals(guidedBrief.detailLevel);
   const [generationMetadata, setGenerationMetadata] = useState<GenerationMetadata | undefined>();
   const [pipelinePreviews, setPipelinePreviews] = useState<{ cleanSvg: string; diagnosticSvg: string } | null>(null);
   // §5.3 parallel-sample-and-select state. When `samples` is set the contact sheet is shown.
@@ -740,7 +741,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setErrorMsg("");
     setSamples(null);
     setSampleProgress({ done: 0, total: sampleCount });
-    setGenerationStep(`Generating ${sampleCount} variations in parallel (concurrency ${DEFAULT_SAMPLE_CONCURRENCY})...`);
+    const concurrency = sampleConcurrencyForModels(sampleModelIds, modelId);
+    setGenerationStep(`Generating ${sampleCount} variations ${concurrency > 1 ? `${concurrency} at a time on fast models` : "one at a time for reliability"}...`);
     try {
       const results = await runSampleGeneration({
         prompt: brief.animalName,
@@ -750,13 +752,63 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         modelId,
         modelIds: sampleModelIds,
         sampleCount,
-        concurrency: DEFAULT_SAMPLE_CONCURRENCY,
+        concurrency,
         onProgress: (done, total) => setSampleProgress({ done, total }),
       });
       const usable = results.filter((sample) => sample.animal).length;
       if (!usable) throw new Error(results.find((sample) => sample.error)?.error || "Every sample failed to generate.");
-      setSamples(results);
-      setGenerationStep(`Generated ${usable}/${results.length} usable samples. Pick the best part for each slot.`);
+      setSampleProgress({ done: 0, total: usable });
+      setGenerationStep("Redrawing every candidate's front and back legs independently...");
+
+      const improved = [...results];
+      const usableIndexes = results.flatMap((sample, index) => sample.animal ? [index] : []);
+      let nextIndex = 0;
+      let completed = 0;
+      let redrawFailures = 0;
+      const workers = Array.from(
+        { length: Math.max(1, Math.min(concurrency, usableIndexes.length)) },
+        async () => {
+          while (nextIndex < usableIndexes.length) {
+            const resultIndex = usableIndexes[nextIndex++];
+            const sample = results[resultIndex];
+            if (!sample.animal) continue;
+            try {
+              const redrawn = await redrawIndependentLegSets(sample.animal, {
+                brief: briefForSample(brief, sample.index),
+                image: uploadedImage,
+                referenceMode,
+                imageForSlot: async (slot) => ({
+                  image: await referenceForPart(slot as EditablePart),
+                  cropped: isMeaningfulCrop(referenceCrops[slot as EditablePart]),
+                }),
+                modelId: sample.modelId ?? modelId,
+                exemplarsForSlot: (slot) => buildExemplarBlock(slot, bankEntries),
+              });
+              improved[resultIndex] = {
+                ...sample,
+                animal: redrawn.animal,
+                plan: redrawn.plan,
+                validation: redrawn.validation,
+                geometry: undefined,
+              };
+            } catch (error) {
+              redrawFailures += 1;
+              console.warn(`Independent leg redraw failed for sample ${sample.index + 1}:`, error);
+            } finally {
+              completed += 1;
+              setSampleProgress({ done: completed, total: usable });
+              setGenerationStep(`Redrew independent front and back legs for ${completed}/${usable} candidates...`);
+            }
+          }
+        },
+      );
+      await Promise.all(workers);
+
+      setSamples(improved);
+      const fallback = redrawFailures
+        ? ` ${redrawFailures} candidate${redrawFailures === 1 ? "" : "s"} kept the original legs because a focused redraw failed.`
+        : "";
+      setGenerationStep(`Generated ${usable}/${results.length} usable samples with separately drawn front and back legs.${fallback} Pick the best part for each slot.`);
     } catch (err: any) {
       console.error(err);
       setErrorMsg(err?.message || "Variation generation failed. Make sure the AI proxy or GEMINI_API_KEY is configured.");
@@ -1548,7 +1600,8 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     setErrorMsg("");
     setSlotRegen(null);
     setSampleProgress({ done: 0, total: sampleCount });
-    setGenerationStep(`Generating ${sampleCount} new ${part} candidates...`);
+    const concurrency = sampleConcurrencyForModels(sampleModelIds, modelId);
+    setGenerationStep(`Generating ${sampleCount} new ${part} candidates ${concurrency > 1 ? `${concurrency} at a time on fast models` : "one at a time"}...`);
     try {
       const results = await runSampleGeneration({
         prompt: brief.animalName,
@@ -1558,7 +1611,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
         modelId,
         modelIds: sampleModelIds,
         sampleCount,
-        concurrency: DEFAULT_SAMPLE_CONCURRENCY,
+        concurrency,
         onProgress: (done, total) => setSampleProgress({ done, total }),
       });
       const usable = results.filter((sample) => sample.animal).length;
@@ -3800,12 +3853,12 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           {[2, 3, 4, 6, 8].map((count) => <option key={count} value={count}>{count}</option>)}
                         </select>
                       </label>
-                      <span className="text-[9px] leading-snug text-zinc-500">Best part-per-slot from N parallel draws — no repair loop.</span>
+                      <span className="text-[9px] leading-snug text-zinc-500">Adaptive concurrency: fast models run two at a time; heavier models run sequentially.</span>
                     </div>
                     {/*
                       §P1: the per-part path, alongside the contact sheet rather than
                       replacing it. Five focused calls (body, then the rest in parallel)
-                      instead of one call that draws everything at a 16k output ceiling.
+                      instead of one call that draws everything at a shared output ceiling.
                     */}
                     <div className="flex flex-wrap items-center gap-2">
                       <button
@@ -3852,11 +3905,14 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                           {selectedDetailDensity.label} target · {selectedDetailTotal} visible SVG shapes total
                         </p>
                         <p className="mt-1 text-[8px] font-mono leading-relaxed text-zinc-400">
-                          Head {selectedDetailDensity.targets.head}
-                          {" · "}Body {selectedDetailDensity.targets.body}
-                          {" · "}Front legs {selectedDetailDensity.targets.frontLegs}
-                          {" · "}Back legs {selectedDetailDensity.targets.backLegs}
-                          {" · "}Tail {selectedDetailDensity.targets.tail}
+                          Allowed total range {selectedDetailBandTotals[0]}–{selectedDetailBandTotals[1]}
+                        </p>
+                        <p className="mt-1 text-[8px] font-mono leading-relaxed text-zinc-400">
+                          Head {selectedDetailDensity.targets.head} ({selectedDetailDensity.bands.head[0]}–{selectedDetailDensity.bands.head[1]})
+                          {" · "}Body {selectedDetailDensity.targets.body} ({selectedDetailDensity.bands.body[0]}–{selectedDetailDensity.bands.body[1]})
+                          {" · "}Front legs {selectedDetailDensity.targets.frontLegs} ({selectedDetailDensity.bands.frontLegs[0]}–{selectedDetailDensity.bands.frontLegs[1]})
+                          {" · "}Back legs {selectedDetailDensity.targets.backLegs} ({selectedDetailDensity.bands.backLegs[0]}–{selectedDetailDensity.bands.backLegs[1]})
+                          {" · "}Tail {selectedDetailDensity.targets.tail} ({selectedDetailDensity.bands.tail[0]}–{selectedDetailDensity.bands.tail[1]})
                         </p>
                       </div>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">

@@ -2,11 +2,18 @@ import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type ValidationIss
 import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry } from "./geometry";
 import { detailDensityProfile } from "./detailDensity";
+import {
+  LIMB_CONTRACT_VERSION,
+  LIMB_PAIR_SPECS,
+  extractSvgGroupMarkup,
+  farLegUsesDarkPalette,
+  physicalLegsForPart,
+} from "./limbContract";
 import { mapPoint, readCoordinateNormalization } from "./normalize";
 import { RAMP_TOKENS } from "./palette";
 import { DENSITY_BANDS, FILL_BAND, STROKE, classifyStrokeWidths, firstRawColour, localFillRatio, visibleElementCount } from "./metrics";
 
-export const VALIDATOR_VERSION = "p1-svg-validator-3.0.0";
+export const VALIDATOR_VERSION = "p1-svg-validator-3.1.0";
 
 const PART_CONFIG: Record<AnimalPartType, { width: number; height: number }> = {
   head: { width: 160, height: 160 },
@@ -174,6 +181,47 @@ export function validateAnimalDraft(candidate: unknown, _plan?: AnatomyStylePlan
       else for (const [name, id] of Object.entries(depth)) {
         const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         if ([...svg.matchAll(new RegExp(`<g\\b[^>]*\\bid=["']${escaped}["']`, "gi"))].length !== 1) issues.push(issue("layout.depthGroup", "error", part, `${part} ${name} '${id}' must exist exactly once in its SVG.`));
+      }
+      if (draft.layoutMetadata.limbContractVersion === LIMB_CONTRACT_VERSION) {
+        const pair = LIMB_PAIR_SPECS[part];
+        if (depth && (depth.nearGroupId !== pair.near.depthGroupId || depth.farGroupId !== pair.far.depthGroupId)) {
+          issues.push(issue("layout.leg.depthMapping", "error", part, `${part} must map left/foreground to '${pair.near.depthGroupId}' and right/background to '${pair.far.depthGroupId}'.`));
+        }
+        for (const spec of physicalLegsForPart(part)) {
+          const wrapper = extractSvgGroupMarkup(svg, spec.depthGroupId);
+          const physical = extractSvgGroupMarkup(svg, spec.groupId);
+          if (!wrapper || !physical || !new RegExp(`\\bid\\s*=\\s*["']${spec.groupId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`, "i").test(wrapper)) {
+            issues.push(issue("layout.leg.group", "error", part, `${spec.label} must exist once as '${spec.groupId}' inside '${spec.depthGroupId}'.`));
+            continue;
+          }
+          const limb = extractSvgGroupMarkup(svg, spec.limbGroupId);
+          const foot = extractSvgGroupMarkup(svg, spec.footGroupId);
+          const physicalContains = (groupId: string) =>
+            new RegExp(`\\bid\\s*=\\s*["']${groupId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`, "i").test(physical);
+          if (!limb || !foot || !physicalContains(spec.limbGroupId) || !physicalContains(spec.footGroupId)) {
+            issues.push(issue("layout.leg.subgroups", "error", part, `${spec.label} must contain separate '${spec.limbGroupId}' and '${spec.footGroupId}' groups for editable limb and foot artwork.`));
+            continue;
+          }
+          const wrapperElements = visibleElementCount(wrapper);
+          const physicalElements = visibleElementCount(physical);
+          const limbElements = visibleElementCount(limb);
+          const footElements = visibleElementCount(foot);
+          if (!physicalElements || wrapperElements !== physicalElements) {
+            issues.push(issue("layout.leg.ownership", "error", part, `Every visible shape in '${spec.depthGroupId}' must belong to its one physical leg group '${spec.groupId}'.`));
+          }
+          if (!limbElements || !footElements || physicalElements !== limbElements + footElements) {
+            issues.push(issue("layout.leg.subgroupOwnership", "error", part, `Every visible shape in '${spec.groupId}' must belong to either '${spec.limbGroupId}' or '${spec.footGroupId}', and both must contain artwork.`));
+          } else if (footElements < 2) {
+            issues.push(issue("density.foot", "warning", part, `${spec.footGroupId} has only ${footElements} visible shape; use multiple meaningful shapes for the paw, hoof, talon, toes, claws or pads.`));
+          }
+          const instance = draft.layoutMetadata.limbInstances?.[spec.id];
+          if (!instance || instance.groupId !== spec.groupId || instance.depthGroupId !== spec.depthGroupId || instance.depth !== spec.depth || !Number.isFinite(instance.footContact?.x) || !Number.isFinite(instance.footContact?.y)) {
+            issues.push(issue("layout.leg.metadata", "error", part, `${spec.label} must carry labeled group, depth and finite foot-contact metadata.`));
+          }
+        }
+        if (!farLegUsesDarkPalette(svg, part)) {
+          issues.push(issue("palette.legDepth", "warning", part, `${pair.far.label} must use primary-dark or accent-dark so the background leg reads behind the foreground leg.`));
+        }
       }
     }
   }

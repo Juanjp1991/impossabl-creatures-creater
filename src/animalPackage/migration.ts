@@ -1,4 +1,5 @@
 import type { Animal } from "../types";
+import { physicalLegsForPart } from "../generation/limbContract";
 import { ANIMAL_PACKAGE_FORMAT_VERSION, type AnimalPackageV1, type AnimalPartV1, type AnatomicalCategory, type PackageViewBox } from "./schema";
 import { validateAnimalPackageV1 } from "./validation";
 
@@ -48,13 +49,20 @@ export function migrateLegacyAnimalToV1(animal: LegacyAnimal, now = new Date().t
     const connection = socketKey ? generatedConnection(socketKey === "neck" ? "head" : socketKey) : undefined;
     const depthGroups = (oldKey === "frontLegs" || oldKey === "backLegs") ? generatedLayout?.depthGroups?.[oldKey] : undefined;
     const groundContacts = (oldKey === "frontLegs" || oldKey === "backLegs") ? generatedLayout?.groundContacts?.[oldKey] : undefined;
+    const physicalGroups = oldKey === "frontLegs" || oldKey === "backLegs"
+      ? physicalLegsForPart(oldKey)
+        .flatMap((spec) => generatedLayout?.limbInstances?.[spec.id]
+          ? [spec.groupId, spec.limbGroupId, spec.footGroupId]
+          : [])
+        .filter((groupId): groupId is string => Boolean(groupId && new RegExp(`\\bid\\s*=\\s*["']${groupId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`).test(svg)))
+      : [];
     return {
       id,
       name: legacyPart.name || `${animal.name} ${category}`,
       category,
       viewBox: parseViewBox(legacyPart.viewBox),
       svg: `<g id="${rootGroup}">${svg}</g>`,
-      namedGroups: [rootGroup, ...(depthGroups ? [depthGroups.farGroupId, depthGroups.nearGroupId] : [])],
+      namedGroups: [rootGroup, ...(depthGroups ? [depthGroups.farGroupId, depthGroups.nearGroupId] : []), ...physicalGroups],
       layerOrder,
       ...(socketKey ? { attachment: { socketId: `${animalId}-socket-${category}`, anchor: localAnchor(legacyPart, category), ...(connection ? { profile: { opposingNormal: connection.opposingNormal, seamWidth: connection.seamWidth, neutralConnectionDepth: connection.neutralConnectionDepth } } : {}) } } : {}),
       ...(groundContacts?.length ? { groundContacts } : {}),

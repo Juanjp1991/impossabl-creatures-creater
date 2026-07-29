@@ -19,6 +19,7 @@ import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry } from "./geometry";
 import { postJson } from "./apiClient";
 import type { GeneratedSample } from "./sampleSelection";
+import { limbSetAnatomyPrompt } from "./limbContract";
 
 export const DEFAULT_VARIATION_COUNT = 6;
 export const DEFAULT_VARIATION_CONCURRENCY = 2;
@@ -107,6 +108,7 @@ export function buildVariationPrompt({ slot, strength, index, instructions }: Va
   const noun = SLOT_NOUN[slot];
   return [
     `Produce one alternative version of the ${noun} only. Every other part of the creature is immutable.`,
+    slot === "frontLegs" || slot === "backLegs" ? limbSetAnatomyPrompt(slot) : "",
     VARIATION_STRENGTHS[strength].directive,
     variationAngle(index),
     `The result must be meaningfully different from the current ${noun} — returning it unchanged, or with only trivial coordinate noise, is a failure.`,

@@ -39,12 +39,13 @@ test("the part directive rules whole-animal properties out rather than leaving t
   assert.match(directive, /the overall pose or the ground stance is out of scope/);
 });
 
-test("part cues are distinct per slot, so a head call is not told about hocks", () => {
+test("part cues are distinct per slot without forcing one species' joint anatomy", () => {
   const cues = PART_TYPES.map((part) => partReferenceDirective(true, "match", part));
   assert.equal(new Set(cues).size, PART_TYPES.length);
   assert.match(partReferenceDirective(true, "match", "head"), /muzzle/);
-  assert.ok(!partReferenceDirective(true, "match", "head").includes("hock"));
-  assert.match(partReferenceDirective(true, "match", "backLegs"), /hock/);
+  assert.match(partReferenceDirective(true, "match", "frontLegs"), /relative to the chest/);
+  assert.match(partReferenceDirective(true, "match", "backLegs"), /relative to the rear body/);
+  assert.doesNotMatch(partReferenceDirective(true, "match", "backLegs"), /hock|wrist|forearm/i);
 });
 
 test("a cropped reference is described as a crop, not as an animal to search", () => {

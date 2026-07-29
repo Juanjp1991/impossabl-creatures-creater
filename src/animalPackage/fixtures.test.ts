@@ -164,13 +164,15 @@ test("invalid imports are rejected and official bundles serialize deterministica
 test("optional generated layout metadata transfers into Package V1 profiles and semantic limb groups", () => {
   const bear = ANIMALS.find((animal) => animal.id === "bear")!;
   const frontFar = "frontLegs-far"; const frontNear = "frontLegs-near"; const backFar = "backLegs-far"; const backNear = "backLegs-near";
+  const leg = (id: "front-left" | "front-right" | "back-left" | "back-right", content: string, x: number) =>
+    `<g id="${id}-leg"><g id="${id}-limb">${content}</g><g id="${id}-foot"><circle cx="${x}" cy="175" r="5" fill="primary"/><circle cx="${x + 6}" cy="175" r="3" fill="accent"/></g></g>`;
   const generated = {
     ...bear,
     id: "generated-profile-bear",
     parts: {
       ...bear.parts,
-      frontLegs: { ...bear.parts.frontLegs, rawContent: `<g id="${frontFar}">${bear.parts.frontLegs.rawContent}</g><g id="${frontNear}"><circle cx="120" cy="175" r="3" fill="primary"/></g>` },
-      backLegs: { ...bear.parts.backLegs, rawContent: `<g id="${backFar}">${bear.parts.backLegs.rawContent}</g><g id="${backNear}"><circle cx="220" cy="175" r="3" fill="primary"/></g>` },
+      frontLegs: { ...bear.parts.frontLegs, rawContent: `<g id="${frontFar}">${leg("front-right", bear.parts.frontLegs.rawContent, 90)}</g><g id="${frontNear}">${leg("front-left", '<ellipse cx="120" cy="90" rx="12" ry="70" fill="primary"/>', 120)}</g>` },
+      backLegs: { ...bear.parts.backLegs, rawContent: `<g id="${backFar}">${leg("back-right", bear.parts.backLegs.rawContent, 190)}</g><g id="${backNear}">${leg("back-left", '<ellipse cx="220" cy="90" rx="12" ry="70" fill="primary"/>', 220)}</g>` },
     },
     generationMetadata: {
       createdAt: "2026-07-21T00:00:00.000Z",
@@ -184,6 +186,13 @@ test("optional generated layout metadata transfers into Package V1 profiles and 
         ],
         groundContacts: { frontLegs: [{ x: 90, y: 175 }, { x: 120, y: 175 }], backLegs: [{ x: 190, y: 175 }, { x: 220, y: 175 }] },
         depthGroups: { frontLegs: { farGroupId: frontFar, nearGroupId: frontNear }, backLegs: { farGroupId: backFar, nearGroupId: backNear } },
+        limbContractVersion: "physical-four-v2",
+        limbInstances: {
+          frontLeft: { groupId: "front-left-leg", depthGroupId: frontNear, depth: "near", footContact: { x: 120, y: 175 } },
+          frontRight: { groupId: "front-right-leg", depthGroupId: frontFar, depth: "far", footContact: { x: 90, y: 175 } },
+          backLeft: { groupId: "back-left-leg", depthGroupId: backNear, depth: "near", footContact: { x: 220, y: 175 } },
+          backRight: { groupId: "back-right-leg", depthGroupId: backFar, depth: "far", footContact: { x: 190, y: 175 } },
+        },
       },
     } as any,
   };
@@ -191,6 +200,10 @@ test("optional generated layout metadata transfers into Package V1 profiles and 
   assert.deepEqual(compiled.compatibility, { facing: "left", groundY: 325 });
   assert.ok(compiled.sockets.every((socket) => socket.profile));
   assert.ok(compiled.parts.find((part) => part.category === "forelimbs")!.depthGroups?.farGroupId.includes("frontlegs-far"));
+  assert.ok(compiled.parts.find((part) => part.category === "forelimbs")!.namedGroups.some((group) => group.endsWith("front-left-leg")));
+  assert.ok(compiled.parts.find((part) => part.category === "forelimbs")!.namedGroups.some((group) => group.endsWith("front-left-foot")));
+  assert.ok(compiled.parts.find((part) => part.category === "hindlimbs")!.namedGroups.some((group) => group.endsWith("back-right-leg")));
+  assert.ok(compiled.parts.find((part) => part.category === "hindlimbs")!.namedGroups.some((group) => group.endsWith("back-right-limb")));
   assert.equal(validateAnimalPackageV1(compiled).valid, true);
 });
 

@@ -12,6 +12,7 @@ import {
 import { createGizmoDragHandler } from "../editor/useGizmo";
 import { GizmoOverlay } from "./GizmoOverlay";
 import { PartPreview } from "./PartPreview";
+import { splitSvgDepthLayers } from "../generation/preview";
 
 interface CreaturePreviewProps {
   creatureState: CreatureState;
@@ -68,6 +69,20 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
   const frontLegsPart = frontLegsAnimal.parts.frontLegs;
   const backLegsPart = backLegsAnimal.parts.backLegs;
   const tailPart = tailAnimal.parts.tail;
+  const frontDepthLayers = useMemo(
+    () => splitSvgDepthLayers(
+      frontLegsPart.rawContent,
+      frontLegsAnimal.generationMetadata?.generatedLayout?.depthGroups.frontLegs,
+    ),
+    [frontLegsPart.rawContent, frontLegsAnimal.generationMetadata?.generatedLayout?.depthGroups.frontLegs],
+  );
+  const backDepthLayers = useMemo(
+    () => splitSvgDepthLayers(
+      backLegsPart.rawContent,
+      backLegsAnimal.generationMetadata?.generatedLayout?.depthGroups.backLegs,
+    ),
+    [backLegsPart.rawContent, backLegsAnimal.generationMetadata?.generatedLayout?.depthGroups.backLegs],
+  );
 
   // Base translation of the body in our 600x500 combined viewport
   const bodyTranslate = { x: 150, y: 150 };
@@ -443,7 +458,7 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             </g>
           </g>
 
-          {/* BACK LEGS LAYER (Renders behind body for 3D depth) */}
+          {/* FAR HIND LEG (or complete legacy hind-leg set) */}
           <g 
             className="cursor-pointer transition-all duration-200"
             onClick={(e) => {
@@ -452,14 +467,14 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             }}
           >
             {/* Back Legs placement */}
-            <g data-editor-part="backLegs" transform={toSvgTransform(partTransforms.backLegs.placement)}>
+            <g data-editor-part={backDepthLayers ? "backLegs-far" : "backLegs"} transform={toSvgTransform(partTransforms.backLegs.placement)}>
               <motion.g
                 animate={isAnimating ? currentPreset.backLegs : { scaleY: 1, y: 0 }}
                 style={{ transformOrigin: "0px 0px" }}
               >
                 <g transform={sizingTransform("backLegs", backLegsLocalBody)}>
                   <PartPreview
-                    svg={backLegsPart.rawContent}
+                    svg={backDepthLayers?.far ?? backLegsPart.rawContent}
                     color={backLegsColor}
                     accentColor={backLegsAnimal.accentColor}
                     originalColor={backLegsAnimal.color}
@@ -471,6 +486,36 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
               </motion.g>
             </g>
           </g>
+
+          {/* FAR FORELEG. Generated semantic legs straddle the body; legacy sets remain whole. */}
+          {frontDepthLayers && (
+            <g
+              className="cursor-pointer transition-all duration-200"
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectPart("frontLegs");
+              }}
+            >
+              <g data-editor-part="frontLegs-far" transform={toSvgTransform(partTransforms.frontLegs.placement)}>
+                <motion.g
+                  animate={isAnimating ? currentPreset.frontLegs : { scaleY: 1, y: 0 }}
+                  style={{ transformOrigin: "0px 0px" }}
+                >
+                  <g transform={sizingTransform("frontLegs", frontLegsLocalBody)}>
+                    <PartPreview
+                      svg={frontDepthLayers.far}
+                      color={frontLegsColor}
+                      accentColor={frontLegsAnimal.accentColor}
+                      originalColor={frontLegsAnimal.color}
+                      originalAccentColor={frontLegsAnimal.accentColor}
+                      shapeTransforms={frontLegsShapeTransforms}
+                      highlightId={frontLegsHighlight}
+                    />
+                  </g>
+                </motion.g>
+              </g>
+            </g>
+          )}
 
           {/* BODY LAYER */}
           <g 
@@ -501,7 +546,37 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
             </g>
           </g>
 
-          {/* FRONT LEGS LAYER (Renders in front of body) */}
+          {/* NEAR HIND LEG. The far hind leg was already rendered behind the body. */}
+          {backDepthLayers && (
+            <g
+              className="cursor-pointer transition-all duration-200"
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectPart("backLegs");
+              }}
+            >
+              <g data-editor-part="backLegs" transform={toSvgTransform(partTransforms.backLegs.placement)}>
+                <motion.g
+                  animate={isAnimating ? currentPreset.backLegs : { scaleY: 1, y: 0 }}
+                  style={{ transformOrigin: "0px 0px" }}
+                >
+                  <g transform={sizingTransform("backLegs", backLegsLocalBody)}>
+                    <PartPreview
+                      svg={backDepthLayers.near}
+                      color={backLegsColor}
+                      accentColor={backLegsAnimal.accentColor}
+                      originalColor={backLegsAnimal.color}
+                      originalAccentColor={backLegsAnimal.accentColor}
+                      shapeTransforms={backLegsShapeTransforms}
+                      highlightId={backLegsHighlight}
+                    />
+                  </g>
+                </motion.g>
+              </g>
+            </g>
+          )}
+
+          {/* NEAR FORELEG (or complete legacy foreleg set) */}
           <g 
             className="cursor-pointer transition-all duration-200"
             onClick={(e) => {
@@ -517,7 +592,7 @@ export const CreaturePreview: React.FC<CreaturePreviewProps> = ({
               >
                 <g transform={sizingTransform("frontLegs", frontLegsLocalBody)}>
                   <PartPreview
-                    svg={frontLegsPart.rawContent}
+                    svg={frontDepthLayers?.near ?? frontLegsPart.rawContent}
                     color={frontLegsColor}
                     accentColor={frontLegsAnimal.accentColor}
                     originalColor={frontLegsAnimal.color}

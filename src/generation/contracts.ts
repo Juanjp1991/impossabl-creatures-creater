@@ -1,5 +1,6 @@
 import type { AnimalPartType, BodyConnectionPoints } from "../types";
 import type { DetailLevel } from "./detailDensity";
+import type { LimbContractVersion, LimbDepth, PhysicalLegId } from "./limbContract";
 
 export const PART_TYPES: AnimalPartType[] = ["head", "body", "frontLegs", "backLegs", "tail"];
 
@@ -91,10 +92,18 @@ export interface GeneratedLayoutMetadata {
   facing: "left" | "right";
   /** The selected generation density tier, used to judge shape counts after generation. */
   detailLevel?: DetailLevel;
+  /** Present on newly generated animals that use four strict physical leg groups. */
+  limbContractVersion?: LimbContractVersion;
   groundY: number;
   connections: BlueprintConnectionProfile[];
   groundContacts: Partial<Record<"frontLegs" | "backLegs", Array<{ x: number; y: number; raised?: boolean }>>>;
   depthGroups: Partial<Record<"frontLegs" | "backLegs", { farGroupId: string; nearGroupId: string }>>;
+  limbInstances?: Partial<Record<PhysicalLegId, {
+    groupId: string;
+    depthGroupId: string;
+    depth: LimbDepth;
+    footContact: { x: number; y: number; raised?: boolean };
+  }>>;
 }
 
 export interface AnimalDraft {

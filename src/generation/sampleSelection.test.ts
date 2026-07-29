@@ -4,15 +4,20 @@ import type { AnimalDraft, GeneratedLayoutMetadata } from "./contracts";
 import {
   briefForSample,
   composeSelectedAnimal,
+  candidateRank,
+  DEFAULT_SAMPLE_CONCURRENCY,
   defaultSelection,
   emphasisForSample,
   modelForSample,
   partCandidateStats,
   SAMPLE_EMPHASES,
+  sampleConcurrencyForModels,
   type GeneratedSample,
   type SlotSelection,
 } from "./sampleSelection";
 import { createDefaultBrief } from "./brief";
+import { synchronizeLimbContract } from "./geometry";
+import { normalizeGeneratedSvgSyntax } from "./normalize";
 
 const layout = (tag: string): GeneratedLayoutMetadata => ({
   facing: "left",
@@ -89,11 +94,52 @@ test("partCandidateStats: a failed sample yields non-usable stats", () => {
   assert.equal(stats.errorCount, Infinity);
 });
 
+test("limb candidate stats expose separation, order and silhouette quality", () => {
+  const animal = draft("A");
+  animal.frontLegsSvg = `<g id="frontLegs-root"><g id="frontLegs-far"><g id="front-right-leg"><g id="front-right-limb"><ellipse cx="110" cy="20" rx="18" ry="15" fill="primary"/><rect x="100" y="20" width="20" height="135" fill="primary"/></g><g id="front-right-foot"><ellipse cx="110" cy="160" rx="15" ry="8" fill="primary"/><circle cx="118" cy="163" r="4" fill="accent"/></g></g></g><g id="frontLegs-near"><g id="front-left-leg"><g id="front-left-limb"><ellipse cx="70" cy="20" rx="18" ry="15" fill="primary"/><rect x="60" y="20" width="20" height="135" fill="primary"/></g><g id="front-left-foot"><ellipse cx="70" cy="160" rx="15" ry="8" fill="primary"/><circle cx="78" cy="163" r="4" fill="accent"/></g></g></g></g>`;
+  animal.layoutMetadata!.depthGroups.frontLegs = { farGroupId: "frontLegs-far", nearGroupId: "frontLegs-near" };
+  const strict = synchronizeLimbContract(normalizeGeneratedSvgSyntax(animal).animal);
+  const stats = partCandidateStats({ index: 2, emphasis: "", animal: strict }, "frontLegs");
+  assert.equal(stats.legOverlapRatio, 0);
+  assert.equal(stats.legOrderOk, true);
+  assert.ok((stats.legSimilarity ?? 0) > 0.9);
+  assert.equal(stats.legCollarOk, true);
+  assert.equal(stats.footElementCount, 4);
+});
+
+test("candidate ranking strongly prefers separated, correctly ordered leg pairs", () => {
+  const base = {
+    hasArt: true,
+    seamPixels: 60,
+    fillRatio: 0.8,
+    elementCount: 20,
+    errorCount: 0,
+    legOverlapRatio: 0,
+    legOrderOk: true,
+    legSimilarity: 0.9,
+    legCollarOk: true,
+    footElementCount: 4,
+  };
+  assert.ok(candidateRank(base, "frontLegs") < candidateRank({ ...base, legOrderOk: false }, "frontLegs"));
+  assert.ok(candidateRank(base, "frontLegs") < candidateRank({ ...base, legOverlapRatio: 0.8 }, "frontLegs"));
+  assert.ok(candidateRank(base, "frontLegs") < candidateRank({ ...base, legCollarOk: false }, "frontLegs"));
+  assert.ok(candidateRank(base, "frontLegs") < candidateRank({ ...base, footElementCount: 1 }, "frontLegs"));
+});
+
 test("defaultSelection returns a concrete sample index for every slot", () => {
   const selection = defaultSelection(samples);
   for (const slot of ["head", "body", "frontLegs", "backLegs", "tail"] as const) {
     assert.ok(selection[slot] === 0 || selection[slot] === 1, `${slot} resolved to a real sample`);
   }
+});
+
+test("whole-animal sampling runs fast models in parallel and heavy models serially", () => {
+  assert.equal(DEFAULT_SAMPLE_CONCURRENCY, 2);
+  assert.equal(sampleConcurrencyForModels(["proxy:gemini-3.6-flash-high"], undefined), 2);
+  assert.equal(sampleConcurrencyForModels(["proxy:grok-4.5"], undefined), 2);
+  assert.equal(sampleConcurrencyForModels(["proxy:gpt-5.6-sol"], undefined), 1);
+  assert.equal(sampleConcurrencyForModels(["proxy:grok-4.5", "proxy:gpt-5.6-sol"], undefined), 1);
+  assert.equal(sampleConcurrencyForModels(undefined, "gemini:gemini-3.6-flash"), 2);
 });
 
 test("briefForSample appends a distinct emphasis without mutating the original", () => {

@@ -1,20 +1,32 @@
 // §P1 prompt split: one shared house-style core, one slot-specific section.
 //
-// The single mega-call asks for ~59 shapes across five parts while the same system
+// The single mega-call can ask for hundreds of shapes across five parts while the same system
 // instruction carries every slot's coordinate space, anchors, collars, seam minimums, ground
-// contacts, layer order, depth groups, layout metadata, palette, stroke weights, density
-// bands and the style guide. Every rule competes with the drawing task for attention, and the
-// fields generated last come back thinnest.
+// contacts, layer order, depth groups, layout metadata, palette, stroke weights, density bands
+// and the style guide. Every rule competes with the drawing task for attention, and the fields
+// generated last tend to come back thinnest.
 //
-// Splitting it means a head call is never told about hind-leg hock continuity. The shared
+// Splitting it means a head call is never told about back-leg construction. The shared
 // block is byte-identical across all five calls on purpose — it is the only thing holding
 // five independent drawings to one style.
 
 import type { AnimalPartType } from "../types";
 import type { GuidedAnimalBrief } from "./contracts";
 import { DETAIL_DENSITY_PROFILES, detailDensityProfile, resolveDetailLevel } from "./detailDensity";
+import { physicalLegPrompt } from "./limbContract";
 
-export const PART_PROMPT_VERSION = "p1-part-1.0.0";
+export const PART_PROMPT_VERSION = "p1-part-1.7.0";
+
+/**
+ * Preferred head composition: a readable three-quarter face keeps the charm of a
+ * side-view creature while making the full expression visible.
+ */
+export const HEAD_COMPOSITION_PROMPT = [
+  "HEAD COMPOSITION — REQUIRED: draw a friendly three-quarter head turned partly toward the viewer with a clear gentle tilt; never use a flat one-eye side profile.",
+  "Show two distinct, fully visible eyes and two distinct, fully visible ears, with the far eye and far ear slightly smaller or darker for depth.",
+  "Place the muzzle or beak below and between the eyes, show the nose or nostrils clearly, and draw one complete readable mouth beneath it.",
+  "Build the tilt into the head geometry while keeping the rear neck connection solid at local (120,110). Preserve the species' real anatomy and recognizable features.",
+].join(" ");
 
 /** Fixed local view per slot, matching `VIEW` in geometry.ts. */
 export const SLOT_VIEW: Record<AnimalPartType, { width: number; height: number }> = {
@@ -37,10 +49,10 @@ export const SLOT_ATTACHMENT: Record<Exclude<AnimalPartType, "body">, { x: numbe
 export const SLOT_DENSITY_TARGET: Record<AnimalPartType, number> = DETAIL_DENSITY_PROFILES.medium.targets;
 
 const SLOT_ANATOMY: Record<AnimalPartType, string> = {
-  head: "skull mass, muzzle or beak, jaw and cheek, both ears (near and far), the visible eye with a highlight, nostril and mouth line, any horns or antlers, and the species' facial markings",
+  head: "skull mass, muzzle or beak, jaw and cheek, both ears (near and far), both eyes with highlights, nose and nostrils, a complete mouth line, any horns or antlers, and the species' facial markings",
   body: "distinct shoulder, ribcage, chest, belly and haunch masses, the back line and its withers or hump, and the species' signature trunk markings",
-  frontLegs: "the near and far foreleg each with shoulder mass, forearm, knee, pastern and a paw or hoof with visible digits where the species has them",
-  backLegs: "the near and far hind leg each with thigh and hip mass, a clearly angled hock, lower leg, and a paw or hoof with visible digits where the species has them",
+  frontLegs: "two complete, species-correct front legs with natural attachment mass, readable leg structure, and separate front feet with visible terminal anatomy where the species has it",
+  backLegs: "two complete, species-correct back legs with natural attachment mass, readable leg structure, and separate back feet with visible terminal anatomy where the species has it",
   tail: "the base where it leaves the body, the length with its curve, and the tip with any tuft, plume or banding",
 };
 
@@ -82,13 +94,16 @@ export function slotSection(slot: AnimalPartType, detailLevel: GuidedAnimalBrief
     );
   }
   if (slot === "frontLegs" || slot === "backLegs") {
+    const perFootTarget = Math.max(2, Math.round(target * 0.15));
     lines.push(
       "Create a broad 24-40px upper-limb collar spanning local y=0..35 so 10-18px of the limb visibly enters the torso.",
-      `Every ${slot === "frontLegs" ? "foreleg silhouette is continuous from shoulder to paw" : "hind-leg silhouette is continuous from hip through hock to paw"}, never floating fragments.`,
-      `Put every visible limb shape under a semantic depth group and emit the exact far/near group IDs ${slot}-far and ${slot}-near.`,
-      "Grounded paws stay within 10px of a common ground line; return that line and the ground contact points."
+      `Every ${slot === "frontLegs" ? "front-leg silhouette" : "back-leg silhouette"} is continuous from its broad body attachment to its separate foot, never floating fragments.`,
+      physicalLegPrompt(slot),
+      `Reserve about ${perFootTarget} meaningful drawable shapes for EACH foot subgroup at this detail level; use the remaining leg-set budget for the two rounded collars, upper limbs, joints and lower limbs.`,
+      "Grounded paws stay within 10px of a common ground line; return two ground contact points in left-leg then right-leg order."
     );
   }
+  if (slot === "head") lines.push(HEAD_COMPOSITION_PROMPT);
   lines.push(
     `DETAIL DENSITY — ${profile.label.toUpperCase()}: target about ${target} visible SVG shapes, permitted range ${band[0]}-${band[1]}. Count drawable path, circle, rect, ellipse, polygon, polyline and line elements. Every shape must describe silhouette, anatomy, shading, markings or a species-defining feature; never pad the count with random decoration. Under-detailing is the most common failure and is worse than slight over-detailing.`,
     `Draw ${SLOT_ANATOMY[slot]}.`,
@@ -104,6 +119,11 @@ export interface PartPromptInput {
   palette?: { color: string; accentColor: string };
   /** The chosen body SVG, so attached parts are drawn to fit what they will sit on. */
   bodyContext?: string;
+  /**
+   * The other leg set, supplied only as a negative comparison. This prevents a model from
+   * solving the front legs once and then cloning that solution into the back-leg field.
+   */
+  oppositeLegContext?: string;
   /** Reference-image directive from `referenceDirective`/`partReferenceDirective`. */
   referenceRules: string;
   /** House-style exemplars (§P2), already formatted. */
@@ -113,9 +133,12 @@ export interface PartPromptInput {
 
 /** Assemble the full system instruction for one part call. */
 export function buildPartSystemInstruction(input: PartPromptInput): string {
-  const { slot, brief, palette, bodyContext, referenceRules, exemplars, styleGuide } = input;
+  const { slot, brief, palette, bodyContext, oppositeLegContext, referenceRules, exemplars, styleGuide } = input;
+  const isLegSlot = slot === "frontLegs" || slot === "backLegs";
   return [
-    `You draw ONE part of a left-facing, side-view SVG animal: the ${slot}. You draw nothing else — no other body part appears in your output.`,
+    slot === "head"
+      ? "You draw ONLY the head of a left-facing SVG animal. The body remains side-view, but the head turns three-quarter toward the viewer. No other body part appears in your output."
+      : `You draw ONE part of a left-facing, side-view SVG animal: the ${slot}. You draw nothing else — no other body part appears in your output.`,
     referenceRules,
     `The animal is: ${brief.summary || brief.animalName}.`,
     "Plan recognizable, species-specific proportions before drawing; use purposeful organic contour, marking and shading shapes rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill the local view.",
@@ -123,6 +146,15 @@ export function buildPartSystemInstruction(input: PartPromptInput): string {
     sharedHouseStyle(palette),
     bodyContext
       ? `The body this part must fit has already been drawn. Match its proportion, line weight and shading language exactly; this is the same animal, not a second one. BODY SVG:\n${bodyContext}`
+      : "",
+    isLegSlot && oppositeLegContext
+      ? [
+          "OPPOSITE LEG SET — NEGATIVE COMPARISON ONLY:",
+          `The SVG below is the already drawn ${slot === "frontLegs" ? "back" : "front"} leg set. Do not treat it as an exemplar and do not copy, mirror, translate, rename or lightly edit its main limb silhouettes or path geometry.`,
+          `Draw a genuinely independent, species-correct ${slot === "frontLegs" ? "front" : "back"} load-bearing limb construction and pose. The difference must be visible in the broad upper attachment, main limb contour and bend—not merely in one marking, highlight or toe.`,
+          "The feet are the one exception: their silhouette and construction MAY match or be reused when that is anatomically appropriate, but each foot must still be drawn as its own separate subgroup with its own drawable shapes and never through <use>.",
+          `OPPOSITE LEG SVG:\n${oppositeLegContext}`,
+        ].join("\n")
       : "",
     exemplars ?? "",
     styleGuide,

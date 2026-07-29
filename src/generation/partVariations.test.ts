@@ -54,9 +54,19 @@ test("angles wrap rather than going undefined past the list", () => {
 test("the prompt names the slot, the strength and the angle", () => {
   const prompt = buildVariationPrompt({ slot: "frontLegs", strength: "tight", index: 2 });
   assert.match(prompt, /front legs only/);
+  assert.match(prompt, /own species-correct construction/i);
   assert.ok(prompt.includes(VARIATION_STRENGTHS.tight.directive));
   assert.ok(prompt.includes(variationAngle(2)));
   assert.match(prompt, /meaningfully different/);
+});
+
+test("front- and back-leg variation prompts demand different anatomy", () => {
+  const front = buildVariationPrompt({ slot: "frontLegs", strength: "moderate", index: 0 });
+  const back = buildVariationPrompt({ slot: "backLegs", strength: "moderate", index: 0 });
+  assert.notEqual(front, back);
+  assert.match(front, /never copy, mirror, translate, rename or reuse the main back-leg limb subgroup geometry/i);
+  assert.match(back, /never copy, mirror, translate, rename or reuse the main front-leg limb subgroup geometry/i);
+  assert.match(front, /Foot silhouette and construction may be reused when appropriate/i);
 });
 
 test("the three strengths produce materially different directives", () => {

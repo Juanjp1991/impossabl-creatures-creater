@@ -15,6 +15,7 @@ import { PART_TYPES, type AnimalDraft, type AnatomyStylePlan, type BlueprintConn
 import { assembleFromPartDrafts } from "./sampleSelection";
 import { namespaceSvgIds } from "../partBank/contracts";
 import type { AnimalPartType } from "../types";
+import { physicalLegContractIds } from "./limbContract";
 
 export interface PartCallResult {
   slot: AnimalPartType;
@@ -49,6 +50,13 @@ export interface PartPipelineResult {
   failedSlots: AnimalPartType[];
 }
 
+export interface IndependentLegRedrawResult {
+  animal: AnimalDraft;
+  plan: AnatomyStylePlan;
+  validation: ValidationResult;
+  parts: [PartCallResult, PartCallResult];
+}
+
 const FIELD: Record<AnimalPartType, keyof AnimalDraft> = {
   head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg",
 };
@@ -61,7 +69,12 @@ const FALLBACK_PALETTE = { color: "#8B5A2B", accentColor: "#F5E6C8" };
  * Ids the validator matches by name, which must survive namespacing verbatim.
  */
 const contractIds = (slot: AnimalPartType): ReadonlySet<string> =>
-  new Set([`${slot}-root`, `${slot}-far`, `${slot}-near`]);
+  new Set([
+    `${slot}-root`,
+    `${slot}-far`,
+    `${slot}-near`,
+    ...(slot === "frontLegs" || slot === "backLegs" ? physicalLegContractIds(slot) : []),
+  ]);
 
 /**
  * Prefix every non-contract id in a part with its slot.
@@ -191,5 +204,58 @@ export async function runPartPipeline(input: PartPipelineInput): Promise<PartPip
     validation: finished.validation as ValidationResult,
     parts,
     failedSlots,
+  };
+}
+
+/**
+ * Replace both leg sets from a whole-animal sample with two focused calls.
+ *
+ * The calls are deliberately sequential. The front-leg call sees the old back legs only as a
+ * negative comparison; the back-leg call then sees the newly drawn front legs. This makes the
+ * model solve two distinct limb constructions while still allowing species-appropriate feet to
+ * share a silhouette.
+ */
+export async function redrawIndependentLegSets(
+  seed: AnimalDraft,
+  input: PartPipelineInput,
+): Promise<IndependentLegRedrawResult> {
+  const palette = { color: seed.color, accentColor: seed.accentColor };
+  const base = {
+    name: seed.name,
+    color: seed.color,
+    accentColor: seed.accentColor,
+    description: seed.description,
+    bodyConnections: seed.bodyConnections,
+    groundY: seed.layoutMetadata?.groundY ?? 178,
+    detailLevel: input.brief.detailLevel,
+  };
+
+  const frontPart = await callPart(input, "frontLegs", {
+    palette,
+    bodyContext: seed.bodySvg,
+    oppositeLegContext: seed.backLegsSvg,
+  });
+  const frontDraft = partDraft("frontLegs", frontPart, base);
+
+  const backPart = await callPart(input, "backLegs", {
+    palette,
+    bodyContext: seed.bodySvg,
+    oppositeLegContext: frontDraft.frontLegsSvg,
+  });
+  const backDraft = partDraft("backLegs", backPart, base);
+
+  const assembled = assembleFromPartDrafts({
+    head: seed,
+    body: seed,
+    frontLegs: frontDraft,
+    backLegs: backDraft,
+    tail: seed,
+  });
+  const finished = await postJson("/api/assemble-parts", { brief: input.brief, animal: assembled });
+  return {
+    animal: finished.animal as AnimalDraft,
+    plan: finished.plan as AnatomyStylePlan,
+    validation: finished.validation as ValidationResult,
+    parts: [frontPart, backPart],
   };
 }

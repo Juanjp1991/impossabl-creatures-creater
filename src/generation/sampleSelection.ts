@@ -19,11 +19,36 @@ import {
 } from "./contracts";
 import type { AnimalPartType } from "../types";
 import { analyzeDraftGeometry, type DraftGeometryReport } from "./geometry";
+import {
+  LIMB_CONTRACT_VERSION,
+  MAX_LOWER_LEG_OVERLAP_RATIO,
+  MIN_PAIRED_SILHOUETTE_SIMILARITY,
+  PHYSICAL_LEGS,
+  extractSvgGroupMarkup,
+  physicalLegsForPart,
+} from "./limbContract";
 import { localFillRatio, visibleElementCount } from "./metrics";
 import { postJson } from "./apiClient";
 
 export const DEFAULT_SAMPLE_COUNT = 4;
 export const DEFAULT_SAMPLE_CONCURRENCY = 2;
+
+/** Fast providers can safely draw two samples at once; large reasoning models stay serial. */
+export function isFastParallelModel(modelId: string): boolean {
+  return /(?:gemini[^:]*flash|grok)/i.test(modelId);
+}
+
+export function sampleConcurrencyForModels(
+  modelIds: string[] | undefined,
+  fallbackModelId?: string,
+  requested = DEFAULT_SAMPLE_CONCURRENCY,
+): number {
+  const selected = (modelIds ?? []).filter(Boolean);
+  const usable = selected.length ? selected : fallbackModelId ? [fallbackModelId] : [];
+  return usable.length > 0 && usable.every(isFastParallelModel)
+    ? Math.max(1, Math.min(2, requested))
+    : 1;
+}
 
 const SVG_FIELD: Record<AnimalPartType, keyof AnimalDraft> = {
   head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg",
@@ -89,6 +114,16 @@ export interface PartCandidateStats {
   elementCount: number;
   /** Validation errors from this sample that name this slot. */
   errorCount: number;
+  /** Lower-leg overlap / smaller lower-leg area. Null outside limb slots or without strict groups. */
+  legOverlapRatio: number | null;
+  /** Whether the foreground-left foot is visibly left of the background-right foot. */
+  legOrderOk: boolean | null;
+  /** Normalized silhouette IoU for the near/far pair. */
+  legSimilarity: number | null;
+  /** Whether both upper leg collars are broad relative to their shafts. */
+  legCollarOk: boolean | null;
+  /** Drawable shapes assigned specifically to the two foot subgroups. */
+  footElementCount: number | null;
 }
 
 /** Run analyzeDraftGeometry defensively — a malformed draft must not abort the batch. */
@@ -141,7 +176,11 @@ export interface SampleGenerationInput {
  */
 export async function runSampleGeneration(input: SampleGenerationInput): Promise<GeneratedSample[]> {
   const total = Math.max(1, input.sampleCount ?? DEFAULT_SAMPLE_COUNT);
-  const concurrency = input.concurrency ?? DEFAULT_SAMPLE_CONCURRENCY;
+  const concurrency = sampleConcurrencyForModels(
+    input.modelIds,
+    input.modelId,
+    input.concurrency ?? DEFAULT_SAMPLE_CONCURRENCY,
+  );
   let done = 0;
   const tasks = Array.from({ length: total }, (_unused, index) => async (): Promise<GeneratedSample> => {
     const emphasis = emphasisForSample(index);
@@ -172,12 +211,46 @@ export async function runSampleGeneration(input: SampleGenerationInput): Promise
 export function partCandidateStats(sample: GeneratedSample, slot: AnimalPartType): PartCandidateStats {
   const svg = sample.animal?.[SVG_FIELD[slot]];
   if (!sample.animal || typeof svg !== "string" || !svg.trim()) {
-    return { hasArt: false, seamPixels: null, fillRatio: 0, elementCount: 0, errorCount: Infinity };
+    return {
+      hasArt: false,
+      seamPixels: null,
+      fillRatio: 0,
+      elementCount: 0,
+      errorCount: Infinity,
+      legOverlapRatio: null,
+      legOrderOk: null,
+      legSimilarity: null,
+      legCollarOk: null,
+      footElementCount: null,
+    };
   }
   const geometry = sample.geometry ?? safeGeometry(sample.animal);
   const seam = slot === "body" ? null : geometry?.seams.find((entry) => entry.part === slot)?.jointZoneOverlapPixels ?? 0;
   const errorCount = (sample.validation?.issues ?? []).filter((entry) => entry.severity === "error" && entry.part === slot).length;
-  return { hasArt: true, seamPixels: seam, fillRatio: localFillRatio(svg, slot), elementCount: visibleElementCount(svg), errorCount };
+  const pair = slot === "frontLegs" || slot === "backLegs" ? geometry?.limbPairs[slot] : undefined;
+  const physical = slot === "frontLegs" || slot === "backLegs"
+    ? physicalLegsForPart(slot).map((spec) => geometry?.physicalLegs[spec.id])
+    : [];
+  const footElementCount = slot === "frontLegs" || slot === "backLegs"
+    ? physicalLegsForPart(slot).reduce((count, spec) => {
+        const markup = extractSvgGroupMarkup(svg, spec.footGroupId);
+        return count + (markup ? visibleElementCount(markup) : 0);
+      }, 0)
+    : null;
+  return {
+    hasArt: true,
+    seamPixels: seam,
+    fillRatio: localFillRatio(svg, slot),
+    elementCount: visibleElementCount(svg),
+    errorCount,
+    legOverlapRatio: pair?.complete ? pair.lowerOverlapRatio : null,
+    legOrderOk: pair?.complete ? pair.ordered : null,
+    legSimilarity: pair?.complete ? pair.silhouetteSimilarity : null,
+    legCollarOk: physical.length === 2 && physical.every(Boolean)
+      ? physical.every((entry) => entry?.collarNatural)
+      : null,
+    footElementCount,
+  };
 }
 
 /**
@@ -193,7 +266,18 @@ export function candidateRank(stats: PartCandidateStats, slot: AnimalPartType, c
   const seamPenalty = slot === "body" ? 0 : stats.seamPixels !== null && stats.seamPixels >= 40 ? 0 : 1;
   const fillPenalty = Math.abs(stats.fillRatio - 0.8); // band centre from §5.2 (65-95%)
   const shapePenalty = conformance === undefined ? 0 : (1 - conformance) * 5;
-  return stats.errorCount * 100 + seamPenalty * 10 + shapePenalty + fillPenalty;
+  const legOrderPenalty = stats.legOrderOk === false ? 50 : 0;
+  const legOverlapPenalty = stats.legOverlapRatio !== null && stats.legOverlapRatio > MAX_LOWER_LEG_OVERLAP_RATIO
+    ? 30 + (stats.legOverlapRatio - MAX_LOWER_LEG_OVERLAP_RATIO) * 20
+    : 0;
+  const legSimilarityPenalty = stats.legSimilarity !== null && stats.legSimilarity < MIN_PAIRED_SILHOUETTE_SIMILARITY
+    ? (MIN_PAIRED_SILHOUETTE_SIMILARITY - stats.legSimilarity) * 10
+    : 0;
+  const collarPenalty = stats.legCollarOk === false ? 25 : 0;
+  const footPenalty = stats.footElementCount !== null && stats.footElementCount < 4
+    ? (4 - stats.footElementCount) * 5
+    : 0;
+  return stats.errorCount * 100 + legOrderPenalty + legOverlapPenalty + collarPenalty + footPenalty + seamPenalty * 10 + shapePenalty + legSimilarityPenalty + fillPenalty;
 }
 
 /**
@@ -270,6 +354,16 @@ export function assembleFromPartDrafts(bySlot: Record<AnimalPartType, AnimalDraf
 
   const connectionFor = (slot: Exclude<AnimalPartType, "body">, source: AnimalDraft) =>
     source.layoutMetadata?.connections?.find((entry) => entry.part === slot);
+  const strictLimbs =
+    frontLegs.layoutMetadata?.limbContractVersion === LIMB_CONTRACT_VERSION
+    && backLegs.layoutMetadata?.limbContractVersion === LIMB_CONTRACT_VERSION;
+  const limbInstances = Object.fromEntries(
+    PHYSICAL_LEGS.flatMap((spec) => {
+      const source = spec.part === "frontLegs" ? frontLegs : backLegs;
+      const instance = source.layoutMetadata?.limbInstances?.[spec.id];
+      return instance ? [[spec.id, instance]] : [];
+    }),
+  );
 
   const layoutMetadata: GeneratedLayoutMetadata = {
     facing: body.layoutMetadata?.facing ?? "left",
@@ -289,6 +383,7 @@ export function assembleFromPartDrafts(bySlot: Record<AnimalPartType, AnimalDraf
       frontLegs: frontLegs.layoutMetadata?.depthGroups?.frontLegs,
       backLegs: backLegs.layoutMetadata?.depthGroups?.backLegs,
     },
+    ...(strictLimbs ? { limbContractVersion: LIMB_CONTRACT_VERSION, limbInstances } : {}),
   };
 
   return {

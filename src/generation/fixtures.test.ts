@@ -3,7 +3,7 @@ import test from "node:test";
 import type { AnimalDraft, AnatomyStylePlan, BlueprintConnectionProfile, GenerationMetadata } from "./contracts";
 import { createDefaultBrief } from "./brief";
 import { buildAssembledPreviewSvg } from "./preview";
-import { analyzeDraftGeometry } from "./geometry";
+import { analyzeDraftGeometry, synchronizeLimbContract } from "./geometry";
 import { extractSvgBounds, normalizeAnimalDraftCoordinates, normalizeAnatomyPlanContract, normalizeGeneratedSvgSyntax, readCoordinateNormalization, snapAttachedPartsToAnchors } from "./normalize";
 import { mergeTargetedModification, mergeTargetedRepair } from "./repair";
 import { technicalFailingParts, validateAnimalDraft } from "./validation";
@@ -61,6 +61,15 @@ const modernDraft: AnimalDraft = {
   },
 };
 
+const strictLegDraft = (): AnimalDraft => {
+  const raw = structuredClone(modernDraft);
+  const leg = (id: "front-left" | "front-right" | "back-left" | "back-right", center: number) =>
+    `<g id="${id}-leg"><g id="${id}-limb"><ellipse cx="${center}" cy="20" rx="18" ry="15" fill="primary"/><rect x="${center - 10}" y="20" width="20" height="138" fill="primary"/></g><g id="${id}-foot"><ellipse cx="${center}" cy="166" rx="15" ry="10" fill="primary"/><circle cx="${center + 8}" cy="168" r="4" fill="accent"/></g></g>`;
+  raw.frontLegsSvg = `<g id="frontLegs-root"><g id="frontLegs-far">${leg("front-right", 115)}</g><g id="frontLegs-near">${leg("front-left", 75)}</g></g>`;
+  raw.backLegsSvg = `<g id="backLegs-root"><g id="backLegs-far">${leg("back-right", 235)}</g><g id="backLegs-near">${leg("back-left", 195)}</g></g>`;
+  return synchronizeLimbContract(normalizeGeneratedSvgSyntax(raw).animal);
+};
+
 test("guided cow brief expands useful defaults", () => {
   const brief = createDefaultBrief("cow");
   assert.equal(brief.animalName, "cow");
@@ -107,6 +116,58 @@ test("semantic limb depth groups straddle the body in canonical order", () => {
   assert.ok(body < backNear && backNear < frontNear && frontNear < head);
   assert.match(preview.slice(backFar, frontFar), /id="backLegs-near"[^>]*display="none"/);
   assert.match(preview.slice(frontNear, head), /id="frontLegs-far"[^>]*display="none"/);
+});
+
+test("new generation enforces four separated physical legs in animation-ready order", () => {
+  const animal = strictLegDraft();
+  const geometry = analyzeDraftGeometry(animal);
+  assert.equal(animal.layoutMetadata?.limbContractVersion, "physical-four-v2");
+  assert.deepEqual(Object.keys(animal.layoutMetadata?.limbInstances ?? {}).sort(), ["backLeft", "backRight", "frontLeft", "frontRight"]);
+  assert.equal(geometry.legOrder.complete, true);
+  assert.equal(geometry.legOrder.valid, true);
+  assert.ok(geometry.legOrder.minimumGap >= 12);
+  for (const part of ["frontLegs", "backLegs"] as const) {
+    assert.equal(geometry.limbPairs[part]?.ordered, true);
+    assert.equal(geometry.limbPairs[part]?.lowerOverlapRatio, 0);
+    assert.ok((geometry.limbPairs[part]?.silhouetteSimilarity ?? 0) >= 0.42);
+  }
+  assert.ok(Object.values(geometry.physicalLegs).every((leg) => leg?.collarNatural));
+  assert.match(animal.frontLegsSvg, /id="frontLegs-far"[\s\S]*fill="primary-dark"/);
+  assert.match(animal.backLegsSvg, /id="backLegs-far"[\s\S]*fill="primary-dark"/);
+  const validation = validateAnimalDraft(animal);
+  assert.ok(!validation.issues.some((entry) => entry.code.startsWith("layout.leg.") || entry.code.startsWith("geometry.leg.")), validation.issues.map((entry) => entry.message).join("\n"));
+});
+
+test("strict leg geometry reports swapped feet and overlapping lower silhouettes", () => {
+  const swapped = strictLegDraft();
+  swapped.frontLegsSvg = swapped.frontLegsSvg
+    .replace(/cx="75"/g, 'cx="125"').replace(/x="65"/g, 'x="115"')
+    .replace(/cx="115"/g, 'cx="75"').replace(/x="105"/g, 'x="65"');
+  const swappedIssues = analyzeDraftGeometry(swapped).issues;
+  assert.ok(swappedIssues.some((entry) => entry.code === "geometry.leg.order" && entry.part === "frontLegs"));
+  assert.ok(swappedIssues.some((entry) => entry.code === "geometry.leg.globalOrder"));
+
+  const overlapping = strictLegDraft();
+  overlapping.frontLegsSvg = overlapping.frontLegsSvg
+    .replace(/cx="115"/g, 'cx="75"')
+    .replace(/x="105"/g, 'x="65"');
+  assert.ok(analyzeDraftGeometry(overlapping).issues.some((entry) => entry.code === "geometry.leg.overlap" && entry.part === "frontLegs"));
+});
+
+test("strict leg geometry reports thin pointed upper attachments", () => {
+  const thin = strictLegDraft();
+  thin.frontLegsSvg = thin.frontLegsSvg
+    .replace('<ellipse cx="75" cy="20" rx="18" ry="15" fill="primary"/>', '<path d="M75 5 L80 35 L70 35 Z" fill="primary"/>')
+    .replace('x="65" y="20" width="20"', 'x="70" y="20" width="10"');
+  assert.ok(analyzeDraftGeometry(thin).issues.some((entry) => entry.code === "geometry.leg.collar" && entry.part === "frontLegs"));
+});
+
+test("strict leg validation rejects missing physical animation groups", () => {
+  const broken = strictLegDraft();
+  broken.frontLegsSvg = broken.frontLegsSvg.replace('id="front-right-leg"', 'id="unlabelled-leg"');
+  const validation = validateAnimalDraft(broken);
+  assert.equal(validation.valid, false);
+  assert.ok(validation.issues.some((entry) => entry.code === "layout.leg.group" && entry.part === "frontLegs"));
 });
 
 test("assembled preview resolves CSS-variable and inline-style palette placeholders", () => {

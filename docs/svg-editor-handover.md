@@ -41,7 +41,7 @@ to violate them, and a violated part is silently degraded rather than loudly bro
    Parts are snapped onto anchors in code (`snapAttachedPartsToAnchors`), and interchangeability
    across species depends entirely on every part honouring the same view + anchor.
 5. **Old-phone budget** — no gradients, filters, masks or clipPaths (whitelist in `validation.ts`);
-   element counts per part roughly head 8–28, body 8–26, each leg set 5–14, tail 3–10
+   element counts per part against the selected Low, Medium, High or Ultra density band
    (`DENSITY_BANDS`); occupied height 65–95% of the local view (`FILL_BAND`).
 
 ## Recommended approach

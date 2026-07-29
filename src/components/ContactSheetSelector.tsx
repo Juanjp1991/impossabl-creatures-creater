@@ -170,6 +170,7 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                 const inFill = stats.fillRatio >= FILL_BAND[0] && stats.fillRatio <= FILL_BAND[1];
                 const inDensity = stats.elementCount >= densityBands[slot][0] && stats.elementCount <= densityBands[slot][1];
                 const seamOk = stats.seamPixels === null || stats.seamPixels >= 40;
+                const legPair = slot === "frontLegs" || slot === "backLegs";
                 const isSaved = saved.has(cellKey(slot, sample.index));
                 const shape = conformanceOf?.(slot, sample.index);
                 return (
@@ -231,6 +232,21 @@ export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, c
                     {stats.hasArt && (
                       <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
                         {stats.seamPixels !== null && <StatChip label="seam" value={`${stats.seamPixels}`} tone={seamOk ? "ok" : "warn"} />}
+                        {legPair && stats.legOverlapRatio !== null && (
+                          <StatChip label="split" value={`${Math.round((1 - stats.legOverlapRatio) * 100)}%`} tone={stats.legOverlapRatio <= 0.3 ? "ok" : "warn"} />
+                        )}
+                        {legPair && stats.legOrderOk !== null && (
+                          <StatChip label="order" value={stats.legOrderOk ? "✓" : "×"} tone={stats.legOrderOk ? "ok" : "warn"} />
+                        )}
+                        {legPair && stats.legSimilarity !== null && (
+                          <StatChip label="pair" value={`${Math.round(stats.legSimilarity * 100)}%`} tone={stats.legSimilarity >= 0.42 ? "ok" : "warn"} />
+                        )}
+                        {legPair && stats.legCollarOk !== null && (
+                          <StatChip label="collar" value={stats.legCollarOk ? "✓" : "thin"} tone={stats.legCollarOk ? "ok" : "warn"} />
+                        )}
+                        {legPair && stats.footElementCount !== null && (
+                          <StatChip label="feet" value={`${stats.footElementCount}`} tone={stats.footElementCount >= 4 ? "ok" : "warn"} />
+                        )}
                         <StatChip label="fill" value={`${Math.round(stats.fillRatio * 100)}%`} tone={inFill ? "ok" : "warn"} />
                         <StatChip label="el" value={`${stats.elementCount}`} tone={inDensity ? "ok" : "warn"} />
                         <StatChip label="err" value={`${stats.errorCount}`} tone={stats.errorCount ? "warn" : "ok"} />

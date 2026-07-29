@@ -7,8 +7,10 @@ import { validateAnimalDraft } from "./src/generation/validation";
 import { mergeTargetedModification, type ModificationTarget } from "./src/generation/repair";
 import { approvedStyleGuidePrompt } from "./src/generation/styleGuide";
 import { partReferenceDirective, referenceDirective } from "./src/generation/referenceDirective";
-import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
+import { buildPartSystemInstruction, HEAD_COMPOSITION_PROMPT, PART_PROMPT_VERSION } from "./src/generation/partPrompt";
 import { detailDensityProfile, resolveDetailLevel, wholeAnimalDensityInstruction } from "./src/generation/detailDensity";
+import { physicalLegContractIds, physicalLegPrompt } from "./src/generation/limbContract";
+import { synchronizeLimbContract } from "./src/generation/geometry";
 import { parseModelJson } from "./src/generation/parseModelJson";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
 
@@ -26,6 +28,11 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 // output); otherwise it calls Google Gemini directly with GEMINI_API_KEY.
 const AI_PROXY_URL = (process.env.AI_PROXY_URL || "").trim().replace(/\/+$/, "");
 const AI_PROXY_KEY = (process.env.AI_PROXY_KEY || "").trim();
+const configuredProxyTimeout = Number(process.env.AI_PROXY_TIMEOUT_MS);
+/** Ten minutes by default for large High/Ultra SVG responses; configurable for local proxies. */
+const AI_PROXY_TIMEOUT_MS = Number.isFinite(configuredProxyTimeout) && configuredProxyTimeout > 0
+  ? configuredProxyTimeout
+  : 600_000;
 // Reasoning effort for proxied reasoning models (e.g. gpt-5.6-sol). Lower effort is
 // faster and far less likely to hit upstream stream timeouts on big generations; the
 // model is highly capable at low effort. Raise to "medium"/"high" for harder jobs.
@@ -39,9 +46,10 @@ const AI_PROXY_REASONING = (process.env.AI_PROXY_REASONING || "low").trim();
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high"]);
 const requestedReasoningEffort = (value: unknown) =>
   typeof value === "string" && REASONING_EFFORTS.has(value.trim()) ? value.trim() : undefined;
-const PROMPT_VERSIONS = { planner: "p1-plan-3.0.0", generator: "p1-svg-3.0.0", reviewer: "p1-review-3.0.0", repair: "p1-repair-3.0.0" };
+const PROMPT_VERSIONS = { planner: "p1-plan-3.0.0", generator: "p1-svg-3.7.0", reviewer: "p1-review-3.0.0", repair: "p1-repair-3.0.0" };
 const MODEL_VERSIONS = { planner: GEMINI_MODEL, generator: GEMINI_MODEL, reviewer: GEMINI_MODEL, repair: GEMINI_MODEL };
 const REPAIR_FIELD_BY_PART = { head: "headSvg", body: "bodySvg", frontLegs: "frontLegsSvg", backLegs: "backLegsSvg", tail: "tailSvg" } as const;
+const SVG_OUTPUT_TOKEN_BUDGET = 32768;
 
 // Set up body parsers
 app.use(express.json({ limit: "15mb" }));
@@ -148,6 +156,10 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
         messages.push({ role: "user", content: geminiContentsToOpenAi(contents) });
 
         const body: any = { model, messages };
+        if (config?.maxOutputTokens) {
+          if (proxyModelHonorsJsonSchema(model)) body.max_completion_tokens = config.maxOutputTokens;
+          else body.max_tokens = config.maxOutputTokens;
+        }
         // Per-request effort wins over the server-wide default. Measured to have little effect on
         // drawing quality (see AI_PROXY_REASONING) — exposed so a stubborn species can be retried
         // with more deliberation, not as a routine quality knob.
@@ -180,9 +192,9 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
           }
         }
 
-        // Reasoning models can be slow on large generations; default to 5 min unless
+        // Reasoning models can be slow on large generations; default to 10 min unless
         // the caller pinned a shorter per-request timeout (e.g. repair).
-        const timeout = config?.httpOptions?.timeout ?? 300000;
+        const timeout = config?.httpOptions?.timeout ?? AI_PROXY_TIMEOUT_MS;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
         let resp: Response;
@@ -307,6 +319,7 @@ async function generateContentWithRetry(
       const errorMsg = typeof error === "string" ? error : (error?.message || JSON.stringify(error) || "");
       const isTimeout = /timeout|timed out|deadline|DEADLINE_EXCEEDED/i.test(errorMsg);
       const isTransient =
+        errorMsg.includes("502") ||
         errorMsg.includes("503") ||
         errorMsg.includes("504") ||
         errorMsg.includes("UNAVAILABLE") ||
@@ -343,6 +356,11 @@ function getFriendlyErrorMessage(error: any): string {
     (errorStr.includes("INVALID_ARGUMENT") && (errorStr.toLowerCase().includes("key") || errorStr.toLowerCase().includes("api")))
   ) {
     return "Your Gemini API key is invalid or has expired. Please configure a valid GEMINI_API_KEY inside the 'Settings > Secrets' menu (top-right of your screen in Google AI Studio). Double-check that you copied the key correctly and didn't include any extra quotes or trailing spaces.";
+  }
+  if (
+    /Proxy request failed \(50[234]\)|server_error|stream disconnected|stream closed|DEADLINE_EXCEEDED|timed out/i.test(errorStr)
+  ) {
+    return "The AI provider was temporarily unavailable or took too long to finish the drawing. Please retry the generation; the app now sends whole-animal variations one at a time and automatically retries fast 502 errors.";
   }
   return errorStr;
 }
@@ -421,10 +439,10 @@ const animalDraftSchema = {
     accentColor: { type: Type.STRING, description: "The creature's ACCENT palette colour as a concrete 6-digit hex (e.g. \"#F5E6C8\") — a real, species-appropriate marking colour, NOT the word \"accent\". The ramp tokens accent/accent-dark used inside the SVGs are computed from this hex at render time." },
     description: { type: Type.STRING },
     bodyConnections: bodyConnectionsSchema,
-    headSvg: { type: Type.STRING, description: "Inner SVG using HEAD-LOCAL coordinates only, all geometry inside 0..160 x 0..160, joined at local (120,110). Never use assembled-canvas coordinates." },
+    headSvg: { type: Type.STRING, description: "Inner SVG using HEAD-LOCAL coordinates only, all geometry inside 0..160 x 0..160, joined at local (120,110). Draw a gently tilted three-quarter face with two visible eyes, two visible ears, a centered muzzle or beak, visible nose or nostrils and one complete mouth. Never use assembled-canvas coordinates." },
     bodySvg: { type: Type.STRING, description: "Inner SVG using BODY-LOCAL coordinates only, all geometry inside 0..300 x 0..220. Never use assembled-canvas coordinates." },
-    frontLegsSvg: { type: Type.STRING, description: "Inner SVG using FORELIMB-LOCAL coordinates only, all geometry inside 0..260 x 0..180, joined at local (75,15)." },
-    backLegsSvg: { type: Type.STRING, description: "Inner SVG using HINDLIMB-LOCAL coordinates only, all geometry inside 0..260 x 0..180, joined at local (195,15)." },
+    frontLegsSvg: { type: Type.STRING, description: "Inner SVG using FRONT-LEG-LOCAL coordinates only, all geometry inside 0..260 x 0..180, joined at local (75,15). Must contain front-left-leg inside frontLegs-near and front-right-leg inside frontLegs-far. Each physical leg contains separate *-limb and *-foot groups, with broad rounded body attachments and the left foot left of the right foot. Draw the main limb geometry independently from backLegs; foot design may repeat when species-appropriate, but each foot remains its own group." },
+    backLegsSvg: { type: Type.STRING, description: "Inner SVG using BACK-LEG-LOCAL coordinates only, all geometry inside 0..260 x 0..180, joined at local (195,15). Must contain back-left-leg inside backLegs-near and back-right-leg inside backLegs-far. Each physical leg contains separate *-limb and *-foot groups, with broad rounded body attachments and the left foot left of the right foot. Draw the main limb geometry independently from frontLegs; foot design may repeat when species-appropriate, but each foot remains its own group." },
     tailSvg: { type: Type.STRING, description: "Inner SVG using TAIL-LOCAL coordinates only, all geometry inside 0..160 x 0..160, joined at local (15,15)." },
     layoutMetadata: layoutMetadataSchema,
   },
@@ -512,8 +530,8 @@ function quadrupedPlan(brief: GuidedAnimalBrief): AnatomyStylePlan {
     attachmentStrategy: [],
     requiredNamedGroups: {
       head: ["head-root"], body: ["body-root"],
-      frontLegs: ["frontLegs-root", "frontLegs-far", "frontLegs-near"],
-      backLegs: ["backLegs-root", "backLegs-far", "backLegs-near"],
+      frontLegs: ["frontLegs-root", ...physicalLegContractIds("frontLegs")],
+      backLegs: ["backLegs-root", ...physicalLegContractIds("backLegs")],
       tail: ["tail-root"],
     },
     suggestedJoints: [],
@@ -536,11 +554,11 @@ app.post("/api/generate-animal", async (req, res) => {
         ? { role: "user", parts: [reference, { text: `Draw a faithful five-part vector decomposition of image 1. Reference mode: ${referenceMode}. Guided brief: ${JSON.stringify(brief)}` }] }
         : `Design and draw this animal from the guided brief: ${JSON.stringify(brief)}`,
       config: {
-        systemInstruction: `You design and draw one polished, richly-detailed, left-facing five-part SVG animal in a single structured response. ${referenceRules} The five parts are head, body, frontLegs, backLegs and tail, each authored in ITS OWN fixed local coordinate space, never one shared canvas. Restart coordinates near zero for every field: headSvg and tailSvg inside 0..160 x 0..160; bodySvg inside 0..300 x 0..220; both leg SVGs inside 0..260 x 0..180. Do not add an assembled-canvas offset to any path or anchor. Plan recognizable, species-specific proportions and silhouette before drawing; use purposeful organic contour, facial, marking and shading groups rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill a local view. Give the body opaque geometry around all four socket anchors. Attachment regions are approximate because exact placement is corrected in code, so you need not hit them pixel-perfectly: head meets the body near local (120,110); frontLegs near (75,15); backLegs near (195,15); tail near (15,15). bodyConnections are BODY-LOCAL: neck x40-120 y50-130, tail x200-280 y80-160, frontLegs x70-140 y130-190, backLegs x180-250 y130-190, with the neck left of the tail. Around each limb attachment create a broad 24-40px upper-limb collar spanning local y=0..35 so 10-18px of the limb visibly enters the torso. Every foreleg silhouette is continuous from shoulder to paw and every hind-leg silhouette continuous from hip through hock to paw, never floating fragments. Every seam needs both opaque silhouettes inside the joint zone and at least 40 overlapping opaque pixels. Grounded paws stay within 10px of a common groundY. Layer order is tail, far hind, far fore, body, near hind, near fore, head. Put every visible limb shape under a semantic depth group and emit exact far/near group IDs frontLegs-far, frontLegs-near, backLegs-far and backLegs-near. Emit local layoutMetadata with facing "left", groundY, per-leg ground contacts, depth groups and one connection profile per attached part whose attachmentAnchor is the local point that meets the body. COLOUR: use ONLY these shared ramp tokens as fill and stroke values inside the SVGs, never raw hex or rgb — primary with primary-light and primary-dark for the main silhouette and its shading, accent with accent-dark for markings, the fixed token outline for dark outlines and highlight for light glints. Separately, the top-level color and accentColor fields MUST be two concrete 6-digit hex values (e.g. "#8B5A2B" and "#F5E6C8") — the real, species-appropriate colours this creature is painted in — NOT the words "primary"/"accent"; every ramp token above is computed from those two hexes at render time, so a wrong or missing hex makes the whole creature render grey. STROKE WEIGHT: use stroke-width 3 for silhouette outlines and 1 to 1.5 for fine internal detail; never below 1. DETAIL DENSITY — AIM FOR THE MIDDLE OF EACH BAND, NEVER THE MINIMUM: target about head 18, body 17, each leg set 9 and tail 6 visible shapes; the permitted range is head 8-28, body 8-26, each leg set 5-14 and tail 3-10. UNDER-DETAILING IS THE MOST COMMON FAILURE and is worse than slight over-detailing: a torso built from three flat shapes reads as a featureless blob, not an animal. Give the body distinct shoulder, haunch, ribcage, chest and belly masses plus the species' signature markings; give each limb its upper mass, lower mass and a paw or hoof; give the tail its base, length and tip. Let each part fill about 65-95% of its own local view height. Every group ID appears once and all IDs are globally unique; include each root group head-root, body-root, frontLegs-root, backLegs-root and tail-root. Use compact valid inner SVG only: no <svg> wrapper and no gradients, filters, masks or clipPaths. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.generator}.`,
+        systemInstruction: `You design and draw one polished, richly-detailed, left-facing five-part SVG animal in a single structured response. ${referenceRules} The five parts are head, body, frontLegs, backLegs and tail, each authored in ITS OWN fixed local coordinate space, never one shared canvas. Restart coordinates near zero for every field: headSvg and tailSvg inside 0..160 x 0..160; bodySvg inside 0..300 x 0..220; both leg SVGs inside 0..260 x 0..180. Do not add an assembled-canvas offset to any path or anchor. ${HEAD_COMPOSITION_PROMPT} Plan recognizable, species-specific proportions and silhouette before drawing; use purposeful organic contour, facial, marking and shading groups rather than generic rectangles, simple ellipses or disconnected decoration. Preserve a crouched, seated, swimming or folded-limb pose where the species calls for it; do not straighten limbs merely to fill a local view. Give the body opaque geometry around all four socket anchors. Attachment regions are approximate because exact placement is corrected in code, so you need not hit them pixel-perfectly: head meets the body near local (120,110); frontLegs near (75,15); backLegs near (195,15); tail near (15,15). bodyConnections are BODY-LOCAL: neck x40-120 y50-130, tail x200-280 y80-160, frontLegs x70-140 y130-190, backLegs x180-250 y130-190, with the neck left of the tail. Around each leg attachment create a broad 24-40px rounded collar spanning local y=0..35 so 10-18px of the leg visibly enters the torso. Every leg silhouette is continuous from its body attachment to its separate foot or species-equivalent terminal anatomy, never floating fragments. Every seam needs both opaque silhouettes inside the joint zone and at least 40 overlapping opaque pixels. Grounded feet stay within 10px of a common groundY. Layer order is tail, far back leg, far front leg, body, near back leg, near front leg, head. ${physicalLegPrompt()} Emit local layoutMetadata with facing "left", groundY, exactly two ground contacts per leg set in left-leg then right-leg order, depth groups and one connection profile per attached part whose attachmentAnchor is the local point that meets the body. COLOUR: use ONLY these shared ramp tokens as fill and stroke values inside the SVGs, never raw hex or rgb — primary with primary-light and primary-dark for the main silhouette and its shading, accent with accent-dark for markings, the fixed token outline for dark outlines and highlight for light glints. Separately, the top-level color and accentColor fields MUST be two concrete 6-digit hex values (e.g. "#8B5A2B" and "#F5E6C8") — the real, species-appropriate colours this creature is painted in — NOT the words "primary"/"accent"; every ramp token above is computed from those two hexes at render time, so a wrong or missing hex makes the whole creature render grey. STROKE WEIGHT: use stroke-width 3 for silhouette outlines and 1 to 1.5 for fine internal detail; never below 1. ${wholeAnimalDensityInstruction(brief.detailLevel)} UNDER-DETAILING IS THE MOST COMMON FAILURE and is worse than slight over-detailing: a torso built from three flat shapes reads as a featureless blob, not an animal. Give the body distinct structural masses plus the species' signature markings; give each leg species-correct structure and a separate detailed foot or equivalent terminal shape; give the tail its base, length and tip. Let each part fill about 65-95% of its own local view height. Every group ID appears once and all IDs are globally unique; include each root group head-root, body-root, frontLegs-root, backLegs-root and tail-root. Use compact valid inner SVG only: no <svg> wrapper and no gradients, filters, masks or clipPaths. ${approvedStyleGuidePrompt()} Prompt version ${PROMPT_VERSIONS.generator}.`,
         responseMimeType: "application/json", responseSchema: animalDraftSchema,
-        contentReminder: `${wholeAnimalDensityInstruction(brief.detailLevel)} Every one of the five SVG fields must be a fully drawn part, not a placeholder. The torso in particular needs distinct shoulder, ribcage, chest, belly and haunch masses plus markings. Every fill and stroke inside the SVGs is a ramp token (primary, primary-light, primary-dark, accent, accent-dark, outline, highlight) and never a raw hex; color and accentColor at the top level are the only concrete hex values. Each part fills 65-95% of its own local view, and every attached part overlaps the body opaquely at its anchor.`,
+        contentReminder: `${wholeAnimalDensityInstruction(brief.detailLevel)} ${HEAD_COMPOSITION_PROMPT} ${physicalLegPrompt()} Every one of the five SVG fields must be a fully drawn part, not a placeholder. The torso in particular needs distinct shoulder, ribcage, chest, belly and haunch masses plus markings. Every fill and stroke inside the SVGs is a ramp token (primary, primary-light, primary-dark, accent, accent-dark, outline, highlight) and never a raw hex; color and accentColor at the top level are the only concrete hex values. Each part fills 65-95% of its own local view, and every attached part overlaps the body opaquely at its anchor.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
-        maxOutputTokens: 16384,
+        maxOutputTokens: SVG_OUTPUT_TOKEN_BUDGET,
       },
     });
     if (!generationResponse.text) throw new Error("The model returned an empty SVG response.");
@@ -548,7 +566,7 @@ app.post("/api/generate-animal", async (req, res) => {
     const plan = quadrupedPlan(brief);
     const syntaxNormalization = normalizeGeneratedSvgSyntax(rawAnimal);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
-    const animal = snapAttachedPartsToAnchors(normalization.animal);
+    const animal = synchronizeLimbContract(snapAttachedPartsToAnchors(normalization.animal));
     if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
     const validation = validateAnimalDraft(animal);
     const models = { ...MODEL_VERSIONS, planner: resolved.model, generator: resolved.model };
@@ -578,6 +596,12 @@ app.post("/api/generate-part", async (req, res) => {
       ? { color: req.body.palette.color, accentColor: req.body.palette.accentColor }
       : undefined;
     const bodyContext = typeof req.body?.bodyContext === "string" && req.body.bodyContext.trim() ? req.body.bodyContext.trim() : undefined;
+    const oppositeLegContext =
+      (slot === "frontLegs" || slot === "backLegs")
+      && typeof req.body?.oppositeLegContext === "string"
+      && req.body.oppositeLegContext.trim()
+        ? req.body.oppositeLegContext.trim()
+        : undefined;
 
     // A part-targeted call reads the reference for that part alone (§R2/§R3).
     const referenceRules = slot === "body"
@@ -589,6 +613,7 @@ app.post("/api/generate-part", async (req, res) => {
       brief,
       palette,
       bodyContext,
+      oppositeLegContext,
       referenceRules,
       exemplars: typeof req.body?.exemplars === "string" ? req.body.exemplars : undefined,
       styleGuide: approvedStyleGuidePrompt(),
@@ -622,7 +647,7 @@ app.post("/api/generate-part", async (req, res) => {
         responseSchema: { type: Type.OBJECT, properties, required: ["svg"] },
         contentReminder: `The ${slot} must be fully drawn at ${density.label} detail: target about ${density.targets[slot]} visible SVG shapes in the selected range ${density.bands[slot][0]}-${density.bands[slot][1]}, filling 65-95% of its own local view. Every shape must carry silhouette, anatomy, shading, markings or species identity. Every fill and stroke is a ramp token, never a raw hex.`,
         reasoningEffort: requestedReasoningEffort(req.body?.reasoningEffort),
-        maxOutputTokens: 16384,
+        maxOutputTokens: SVG_OUTPUT_TOKEN_BUDGET,
       },
     });
     if (!response.text) throw new Error(`The model returned an empty ${slot} response.`);
@@ -647,7 +672,7 @@ app.post("/api/assemble-parts", async (req, res) => {
     const plan = quadrupedPlan(brief);
     const syntaxNormalization = normalizeGeneratedSvgSyntax(draft as AnimalDraft);
     const normalization = normalizeAnimalDraftCoordinates(syntaxNormalization.animal, plan);
-    const animal = snapAttachedPartsToAnchors(normalization.animal);
+    const animal = synchronizeLimbContract(snapAttachedPartsToAnchors(normalization.animal));
     if (animal.layoutMetadata) animal.layoutMetadata.detailLevel = brief.detailLevel;
     const validation = validateAnimalDraft(animal);
     return res.json({
@@ -702,6 +727,11 @@ app.post("/api/modify-animal", async (req, res) => {
       }
     }
 
+    const limbModificationRules = modificationTarget === "all"
+      ? physicalLegPrompt()
+      : modificationTarget === "frontLegs" || modificationTarget === "backLegs"
+        ? physicalLegPrompt(modificationTarget)
+        : "";
     const systemInstruction = `You are an expert vector designer and master illustrator who designs clean, adorable, and highly-detailed SVG illustrations for animals and mythological creatures. 
 
 Your task is to modify an EXISTING custom animal/creature template based on the user's prompt or provided visual reference. ${modificationTarget === "all"
@@ -712,6 +742,7 @@ You can modify the whole creature, or focus your modifications on a specific bod
 The targeted body part to modify is: "${modificationTarget}".
 If targetPart is specific, return ONLY that part's SVG field. Every non-target SVG, name, colour, description and body connection is immutable and must not be returned or adjusted, even subtly.
 If targetPart is "all", you can modify any or all parts, colors, description, name, or connections.
+${limbModificationRules}
 
 CRITICAL SVG COORDINATE SPACE AND CONNECTION AGREEMENTS (KEEP CONSISTENT WITH CURRENT CREATURE):
 1. HEAD: viewBox is "0 0 160 160".
@@ -793,7 +824,9 @@ Apply the requested modification: "${prompt || "Modify creature using the provid
     if (targetField && !changedParts.includes(modificationTarget as typeof PART_TYPES[number])) {
       return res.status(422).json({ error: `Gemini did not return a changed ${targetField}. The original animal was preserved; try a more specific instruction.` });
     }
-    return res.json({ ...mergedAnimal, modifiedParts: changedParts });
+    const normalizedAnimal = normalizeGeneratedSvgSyntax(mergedAnimal).animal;
+    const animal = synchronizeLimbContract(normalizedAnimal);
+    return res.json({ ...animal, modifiedParts: changedParts });
   } catch (error: any) {
     console.error("Error modifying custom animal via AI:", error);
     return res.status(500).json({

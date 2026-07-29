@@ -14,6 +14,8 @@ import {
   usesRampTokens,
   type PartBankEntry,
 } from "./contracts";
+import { synchronizeLimbContract } from "../generation/geometry";
+import { normalizeGeneratedSvgSyntax } from "../generation/normalize";
 import {
   addPartEntry,
   deletePartEntry,
@@ -193,6 +195,22 @@ test("namespaceEntry remaps depth group ids so they still resolve", () => {
   assert.equal(namespaced.depthGroups?.farGroupId, "pb-1-wolf-fl-far");
   assert.ok(namespaced.svg.includes(`id="pb-1-wolf-fl-far"`));
   assert.ok(namespaced.svg.includes(`id="pb-1-wolf-fl-near"`));
+});
+
+test("banked strict limbs preserve canonical physical animation groups and metadata", () => {
+  const animal = draft("wolf");
+  animal.frontLegsSvg = `<g id="frontLegs-root"><g id="frontLegs-far"><g id="front-right-leg"><g id="front-right-limb"><ellipse cx="110" cy="20" rx="18" ry="15" fill="primary"/><rect x="100" y="20" width="20" height="135" fill="primary"/></g><g id="front-right-foot"><ellipse cx="110" cy="160" rx="15" ry="8" fill="primary"/><circle cx="118" cy="163" r="4" fill="accent"/></g></g></g><g id="frontLegs-near"><g id="front-left-leg"><g id="front-left-limb"><ellipse cx="70" cy="20" rx="18" ry="15" fill="primary"/><rect x="60" y="20" width="20" height="135" fill="primary"/></g><g id="front-left-foot"><ellipse cx="70" cy="160" rx="15" ry="8" fill="primary"/><circle cx="78" cy="163" r="4" fill="accent"/></g></g></g></g>`;
+  animal.layoutMetadata!.depthGroups.frontLegs = { farGroupId: "frontLegs-far", nearGroupId: "frontLegs-near" };
+  const strict = synchronizeLimbContract(normalizeGeneratedSvgSyntax(animal).animal);
+  const entry = partEntryFromDraft(strict, "frontLegs");
+  const namespaced = namespaceEntry(entry, "pb-strict");
+  assert.equal(namespaced.limbContractVersion, "physical-four-v2");
+  assert.match(namespaced.svg, /id="front-left-leg"/);
+  assert.match(namespaced.svg, /id="front-right-leg"/);
+  assert.match(namespaced.svg, /id="front-left-foot"/);
+  assert.match(namespaced.svg, /id="front-right-limb"/);
+  assert.equal(namespaced.limbInstances?.frontLeft?.groupId, "front-left-leg");
+  assert.equal(entryToPartDraft(namespaced).layoutMetadata?.limbInstances?.frontRight?.depth, "far");
 });
 
 test("palette helpers separate recolouring parts from bolted-on ones", () => {
