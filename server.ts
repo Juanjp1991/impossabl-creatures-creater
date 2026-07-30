@@ -1,4 +1,8 @@
 import express from "express";
+import fs from "fs";
+import http from "http";
+import https from "https";
+import os from "os";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -36,6 +40,30 @@ const AI_PROXY_KEY = (process.env.AI_PROXY_KEY || "").trim();
 // governed by the prompt, not by effort. (Claude via CLIProxyAPI reports reasoning=0 regardless,
 // and errors 500 at high effort, so raising this would not help it either.)
 const AI_PROXY_REASONING = (process.env.AI_PROXY_REASONING || "low").trim();
+// Optional: Cline Pass subscription (https://docs.cline.bot/getting-started/clinepass) via
+// Cline's OpenAI-compatible gateway — no local proxy needed. Auth resolution order:
+//   1. CLINE_API_KEY — long-lived key from app.cline.bot → Settings → API Keys.
+//   2. The Cline CLI's OAuth session (~/.cline/data/settings/providers.json, cline-pass
+//      provider), re-read per request so the CLI's hourly token refresh is picked up live.
+// CLINE_MODELS lists the full cline-pass/<model> slugs the UI may choose from.
+const CLINE_API_URL = (process.env.CLINE_API_URL || "https://api.cline.bot/api/v1").trim().replace(/\/+$/, "");
+const CLINE_API_KEY = (process.env.CLINE_API_KEY || "").trim().replace(/^["']|["']$/g, "");
+const CLINE_REASONING = (process.env.CLINE_REASONING || "low").trim();
+// Kimi K3 generates ~25-50 output tokens/s through the gateway, so a full five-part SVG
+// (6-10k tokens) legitimately takes 5-8 min — over the proxy adapter's 5-min default.
+const CLINE_TIMEOUT_MS = Number(process.env.CLINE_TIMEOUT_MS) > 0 ? Number(process.env.CLINE_TIMEOUT_MS) : 600_000;
+// Accepts "0".."2" (the OpenAI range); anything else is treated as unset.
+function parseTemperature(value: string | undefined): number | undefined {
+  const parsed = Number((value || "").trim());
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2 ? parsed : undefined;
+}
+// Optional sampling temperature per provider. UNSET (today's behaviour) means no key is
+// sent and the upstream uses its own default. A per-request config.temperature always wins.
+// WARNING: reasoning models in the GPT-5.x/o-family reject any temperature ≠ 1 with a 400,
+// so leave AI_PROXY_TEMPERATURE unset when those are in AI_PROXY_MODELS.
+const AI_PROXY_TEMPERATURE = parseTemperature(process.env.AI_PROXY_TEMPERATURE);
+const CLINE_TEMPERATURE = parseTemperature(process.env.CLINE_TEMPERATURE);
+const GEMINI_TEMPERATURE = parseTemperature(process.env.GEMINI_TEMPERATURE);
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high"]);
 const requestedReasoningEffort = (value: unknown) =>
   typeof value === "string" && REASONING_EFFORTS.has(value.trim()) ? value.trim() : undefined;
@@ -55,11 +83,11 @@ interface AiClient {
   models: { generateContent(options: { model: string; contents: any; config?: any }): Promise<GenerateResult> };
 }
 
-// AI providers (§7 in-app model selector). Both the CLIProxyAPI path and the direct Google
-// Gemini path can be live at once; each contributes its models to a small registry, and
-// resolveModel() maps a per-request modelId to the right client + model. The default is
-// today's behaviour: proxy when configured, else Gemini.
-interface ModelEntry { id: string; label: string; provider: "gemini" | "proxy"; model: string; vision: boolean; }
+// AI providers (§7 in-app model selector). The CLIProxyAPI path, the Cline Pass gateway
+// path and the direct Google Gemini path can all be live at once; each contributes its
+// models to a small registry, and resolveModel() maps a per-request modelId to the right
+// client + model. The default is today's behaviour: proxy when configured, else Gemini.
+interface ModelEntry { id: string; label: string; provider: "gemini" | "proxy" | "cline"; model: string; vision: boolean; }
 const parseModelList = (value: string | undefined) => (value || "").split(",").map((entry) => entry.trim()).filter(Boolean);
 
 // Proxied models that reject image content outright rather than ignoring it. GLM 5.x answers
@@ -67,19 +95,79 @@ const parseModelList = (value: string | undefined) => (value || "").split(",").m
 // ['text']`, which surfaced as an opaque failure on auto-fill and on every generation with a
 // reference attached. Listing them lets the app say what is wrong instead of relaying a 400.
 const TEXT_ONLY_MODELS = new Set(parseModelList(process.env.AI_PROXY_TEXT_ONLY_MODELS));
+// Same refusal list for the Cline gateway (CLINE_TEXT_ONLY_MODELS), plus Cline models whose
+// gateway rejects response_format outright (CLINE_PROMPT_SCHEMA_MODELS) — those get the
+// schema in the prompt with no response_format key, like the proxy's non-GPT fallback.
+// cline-pass/kimi-k3 accepts json_schema, so the prompt-schema list starts empty.
+const CLINE_TEXT_ONLY_MODELS = new Set(parseModelList(process.env.CLINE_TEXT_ONLY_MODELS));
+const CLINE_PROMPT_SCHEMA_MODELS = new Set(parseModelList(process.env.CLINE_PROMPT_SCHEMA_MODELS));
+
+// Cline Pass auth fallback: the Cline CLI keeps its OAuth session in providers.json. The
+// file is re-read (mtime-cached) on every key resolution so the CLI's hourly token refresh
+// is picked up without restarting this server. A token counts only while it has >30s to live.
+const CLINE_CLI_SETTINGS = path.join(os.homedir(), ".cline", "data", "settings", "providers.json");
+let clineCliTokenCache: { mtimeMs: number; token: string | null; expiresAt: number } | null = null;
+function readClineCliToken(): string | null {
+  try {
+    const stat = fs.statSync(CLINE_CLI_SETTINGS);
+    if (clineCliTokenCache && clineCliTokenCache.mtimeMs === stat.mtimeMs) {
+      return clineCliTokenCache.token && clineCliTokenCache.expiresAt > Date.now() + 30_000 ? clineCliTokenCache.token : null;
+    }
+    const parsed = JSON.parse(fs.readFileSync(CLINE_CLI_SETTINGS, "utf8"));
+    const auth = parsed?.providers?.["cline-pass"]?.settings?.auth ?? parsed?.providers?.cline?.settings?.auth;
+    const token = typeof auth?.accessToken === "string" ? auth.accessToken : null;
+    const expiresAt = Number(auth?.expiresAt) || 0;
+    clineCliTokenCache = { mtimeMs: stat.mtimeMs, token, expiresAt };
+    return token && expiresAt > Date.now() + 30_000 ? token : null;
+  } catch {
+    return null;
+  }
+}
+const resolveClineKey = (): string | null => CLINE_API_KEY || readClineCliToken();
+
+// True for models whose upstream honours OpenAI response_format:json_schema — i.e. the
+// OpenAI/Codex family (gpt-*, o1/o3-*, codex-*). Everything else served by the proxy
+// (claude-*, kimi-*, …) ignores json_schema and needs the schema-in-prompt fallback in
+// the adapter below. Declared before the registry: createOpenAiProxyClient reads it as
+// its default honoursJsonSchema at construction time.
+const proxyModelHonorsJsonSchema = (model: string) => /^(gpt-|o\d|codex-)/i.test(model) || /codex/i.test(model);
 
 let geminiClient: AiClient | null = null;
 let proxyClient: AiClient | null = null;
+let clineClient: AiClient | null = null;
 let keyValidationError = "";
 const MODEL_REGISTRY: ModelEntry[] = [];
 
 // Proxy path. AI_PROXY_MODELS lists the served model ids; for back-compat it falls back to
 // GEMINI_MODEL, which in proxy mode is just the routed id (e.g. gpt-5.6-sol).
 if (AI_PROXY_URL) {
-  proxyClient = createOpenAiProxyClient(AI_PROXY_URL, AI_PROXY_KEY);
+  proxyClient = createOpenAiProxyClient(AI_PROXY_URL, AI_PROXY_KEY, { temperature: AI_PROXY_TEMPERATURE });
   const configured = parseModelList(process.env.AI_PROXY_MODELS);
   for (const model of configured.length ? configured : [GEMINI_MODEL]) MODEL_REGISTRY.push({ id: `proxy:${model}`, label: `${model} · proxy`, provider: "proxy", model, vision: !TEXT_ONLY_MODELS.has(model) });
   console.log(`AI proxy ${AI_PROXY_URL} serving: ${MODEL_REGISTRY.filter((entry) => entry.provider === "proxy").map((entry) => entry.model).join(", ")}`);
+}
+
+// Cline Pass path. Models register when CLINE_MODELS is set or any credential is available
+// (CLINE_API_KEY, or the CLI's OAuth session); with neither, nothing is registered and the
+// app behaves exactly as before. Verified against the gateway (cline-pass/kimi-k3):
+// response_format:json_schema works, json_object is rejected with HTTP 500 (never sent —
+// allowJsonObject false), vision/reference images work, reasoning_effort is accepted.
+{
+  const configured = parseModelList(process.env.CLINE_MODELS);
+  if (configured.length || resolveClineKey()) {
+    clineClient = createOpenAiProxyClient(CLINE_API_URL, () => resolveClineKey(), {
+      honorsJsonSchema: (model) => !CLINE_PROMPT_SCHEMA_MODELS.has(model),
+      allowJsonObject: false,
+      reasoningEffort: /^(off|none)$/i.test(CLINE_REASONING) ? null : CLINE_REASONING,
+      timeoutMs: CLINE_TIMEOUT_MS,
+      temperature: CLINE_TEMPERATURE,
+      logTag: "cline",
+      errorTag: "Cline",
+      missingKeyError: "No Cline credential available. Set CLINE_API_KEY (from app.cline.bot → Settings → API Keys), or sign in to ClinePass in the Cline CLI so this app can reuse its OAuth token.",
+    });
+    for (const model of configured.length ? configured : ["cline-pass/kimi-k3"]) MODEL_REGISTRY.push({ id: `cline:${model}`, label: `${model.replace(/^cline-pass\//, "")} · Cline Pass`, provider: "cline", model, vision: !CLINE_TEXT_ONLY_MODELS.has(model) });
+    console.log(`Cline gateway ${CLINE_API_URL} serving: ${MODEL_REGISTRY.filter((entry) => entry.provider === "cline").map((entry) => entry.model).join(", ")}`);
+  }
 }
 
 // Direct Gemini path, using GEMINI_API_KEY. GEMINI_MODELS lists the direct models; for
@@ -114,33 +202,62 @@ if (AI_PROXY_URL) {
 }
 
 const DEFAULT_MODEL_ID = (MODEL_REGISTRY.find((entry) => entry.provider === "proxy") ?? MODEL_REGISTRY[0])?.id ?? "";
-if (!MODEL_REGISTRY.length) console.warn("No AI model configured: " + (keyValidationError || "set AI_PROXY_URL (+ AI_PROXY_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS)."));
-const noModelError = () => keyValidationError || "No AI model is configured. Set AI_PROXY_URL (+ AI_PROXY_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS).";
+if (!MODEL_REGISTRY.length) console.warn("No AI model configured: " + (keyValidationError || "set AI_PROXY_URL (+ AI_PROXY_MODELS), CLINE_API_KEY (+ CLINE_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS)."));
+const noModelError = () => keyValidationError || "No AI model is configured. Set AI_PROXY_URL (+ AI_PROXY_MODELS), CLINE_API_KEY (+ CLINE_MODELS) or GEMINI_API_KEY (+ GEMINI_MODELS).";
 
 // Resolve a per-request modelId to its client + model, falling back to the default. Returns
 // null when nothing is configured (endpoints answer 503).
 function resolveModel(modelId: unknown): { client: AiClient; model: string; entry: ModelEntry } | null {
   const entry = MODEL_REGISTRY.find((candidate) => candidate.id === modelId) ?? MODEL_REGISTRY.find((candidate) => candidate.id === DEFAULT_MODEL_ID);
   if (!entry) return null;
-  const client = entry.provider === "proxy" ? proxyClient : geminiClient;
+  const client = entry.provider === "proxy" ? proxyClient : entry.provider === "cline" ? clineClient : geminiClient;
   return client ? { client, model: entry.model, entry } : null;
 }
 
-// True for proxied models whose upstream honours OpenAI response_format:json_schema —
-// i.e. the OpenAI/Codex family (gpt-*, o1/o3-*, codex-*). Everything else served by the
-// proxy (claude-*, kimi-*, …) ignores json_schema and needs the json_object + schema-in-
-// prompt fallback below.
-const proxyModelHonorsJsonSchema = (model: string) => /^(gpt-|o\d|codex-)/i.test(model) || /codex/i.test(model);
-
-// --- OpenAI-compatible proxy adapter -----------------------------------------
+// --- OpenAI-compatible chat adapter ------------------------------------------
 // Translates the app's Gemini-shaped request ({model, contents, config}) into an
-// OpenAI Chat Completions call and back, so a ChatGPT/Codex subscription served via
-// CLIProxyAPI can drive the same generation pipeline. Only used when AI_PROXY_URL set.
-function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
+// OpenAI Chat Completions call and back, so subscription-backed OpenAI-compatible
+// gateways can drive the same generation pipeline: CLIProxyAPI (ChatGPT/Codex, Claude,
+// …) when AI_PROXY_URL is set, and Cline's gateway (Cline Pass → cline-pass/kimi-k3, …)
+// when a Cline credential is available.
+interface OpenAiAdapterOptions {
+  // Which models honour response_format:json_schema. Default: the OpenAI/Codex family
+  // (proxyModelHonorsJsonSchema) — everything else falls back to schema-in-prompt.
+  honorsJsonSchema?: (model: string) => boolean;
+  // Whether response_format:json_object may be sent (default true). Cline's gateway
+  // answers it with HTTP 500, so the Cline client sets this false: the fallback then
+  // carries the schema in the prompt only, with no response_format key at all.
+  allowJsonObject?: boolean;
+  // Server-side default reasoning effort for this client. Undefined → AI_PROXY_REASONING;
+  // null → never send reasoning_effort.
+  reasoningEffort?: string | null;
+  // Server-side default sampling temperature for this client. Undefined → no temperature
+  // key is sent (upstream default); a per-request config.temperature wins over this.
+  temperature?: number;
+  // Default request timeout when the caller doesn't pin one via config.httpOptions.timeout.
+  // Undefined → 300000 (5 min). Cline's gateway is measurably slower on long SVG outputs,
+  // so its client sets CLINE_TIMEOUT_MS (default 10 min).
+  timeoutMs?: number;
+  // Console/error labels so the two clients stay distinguishable in the logs.
+  logTag?: string;
+  errorTag?: string;
+  // When set, a missing key fails the request fast with this message instead of going out
+  // unauthenticated (used by the Cline client when neither CLINE_API_KEY nor a live CLI
+  // OAuth token is available).
+  missingKeyError?: string;
+}
+
+function createOpenAiProxyClient(baseUrl: string, apiKey: string | (() => string | null), adapter: OpenAiAdapterOptions = {}): AiClient {
+  const honorsJsonSchema = adapter.honorsJsonSchema ?? proxyModelHonorsJsonSchema;
+  const allowJsonObject = adapter.allowJsonObject !== false;
+  const logTag = adapter.logTag ?? "proxy";
+  const errorTag = adapter.errorTag ?? "Proxy";
   return {
     models: {
       async generateContent(options) {
         const { model, contents, config } = options;
+        const key = typeof apiKey === "function" ? apiKey() : apiKey;
+        if (!key && adapter.missingKeyError) throw new Error(adapter.missingKeyError);
         const messages: any[] = [];
         if (config?.systemInstruction) {
           messages.push({ role: "system", content: geminiToText(config.systemInstruction) });
@@ -151,17 +268,22 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
         // Per-request effort wins over the server-wide default. Measured to have little effect on
         // drawing quality (see AI_PROXY_REASONING) — exposed so a stubborn species can be retried
         // with more deliberation, not as a routine quality knob.
-        const effort = (config as any)?.reasoningEffort || AI_PROXY_REASONING;
+        const defaultEffort = adapter.reasoningEffort === undefined ? AI_PROXY_REASONING : adapter.reasoningEffort;
+        const effort = (config as any)?.reasoningEffort || defaultEffort || "";
         if (effort) body.reasoning_effort = effort;
+        const temperature = (config as any)?.temperature ?? adapter.temperature;
+        if (temperature !== undefined) body.temperature = temperature;
         if (config?.responseMimeType === "application/json") {
           const schema = config?.responseSchema ? geminiSchemaToJsonSchema(config.responseSchema) : null;
-          if (schema && !proxyModelHonorsJsonSchema(model)) {
+          if (schema && !honorsJsonSchema(model)) {
             // CLIProxyAPI only translates response_format:json_schema for its OpenAI/Codex
             // upstream; Claude (and other non-GPT proxied models) ignore it and answer in
             // prose. Fall back to json_object mode and hand the model the schema as text —
             // the deterministic validator still discards any malformed sample, so the only
-            // cost is an occasional dropped candidate in the N-sample pipeline.
-            body.response_format = { type: "json_object" };
+            // cost is an occasional dropped candidate in the N-sample pipeline. Gateways
+            // that reject json_object too (Cline) skip the response_format key entirely
+            // and rely on the trailing turns below alone.
+            if (allowJsonObject) body.response_format = { type: "json_object" };
             // CLIProxyAPI does not hard-enforce json_object for Claude, so compliance rides
             // on the instruction being the LAST thing the model sees — a trailing user turn
             // overrides any conversational framing in the system/user prompt above it. It must
@@ -173,47 +295,68 @@ function createOpenAiProxyClient(baseUrl: string, apiKey: string): AiClient {
             messages.push({ role: "user", content: `CRITICAL OUTPUT FORMAT — overrides any formatting implied above: respond with ONLY one raw JSON object and nothing else — no prose, no explanation, no markdown code fences, no leading or trailing text. The JSON must simultaneously (1) conform exactly to this JSON Schema, populating every required property, AND (2) obey EVERY content, structure and formatting rule stated in the instructions above, including all requirements on the contents of string fields such as required element IDs / group IDs and the allowed set of colour/token values. The schema fixes the shape; the instructions above fix the contents; satisfy both. Inside any SVG markup you place in a string field, use SINGLE quotes for attribute values — <g id='head-root'><path d='M10 10' fill='primary'/> — so the JSON string needs no escaped quotes. JSON Schema: ${JSON.stringify(schema)}` });
             const reminder = (config as any)?.contentReminder;
             if (reminder) messages.push({ role: "user", content: `BEFORE YOU ANSWER, CHECK THE DRAWING ITSELF. Satisfying the schema is not the task; it is the packaging. ${reminder} A response that is valid JSON but thin, sparse or off-palette is a failed response — count the shapes and re-check the palette before you return it.` });
-          } else {
-            body.response_format = schema
-              ? { type: "json_schema", json_schema: { name: "response", strict: false, schema } }
-              : { type: "json_object" };
+          } else if (schema) {
+            body.response_format = { type: "json_schema", json_schema: { name: "response", strict: false, schema } };
+          } else if (allowJsonObject) {
+            body.response_format = { type: "json_object" };
           }
         }
 
-        // Reasoning models can be slow on large generations; default to 5 min unless
-        // the caller pinned a shorter per-request timeout (e.g. repair).
-        const timeout = config?.httpOptions?.timeout ?? 300000;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeout);
-        let resp: Response;
-        try {
-          resp = await fetch(`${baseUrl}/chat/completions`, {
-            method: "POST",
-            headers: { "content-type": "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
-        } catch (err: any) {
-          if (err?.name === "AbortError") throw new Error(`Proxy request timed out after ${timeout}ms (DEADLINE_EXCEEDED)`);
-          throw err;
-        } finally {
-          clearTimeout(timer);
-        }
+        // Reasoning models can be slow on large generations; default to the client's
+        // timeoutMs (5 min proxy / 10 min Cline) unless the caller pinned a shorter
+        // per-request timeout (e.g. repair).
+        const timeout = config?.httpOptions?.timeout ?? adapter.timeoutMs ?? 300000;
+        // node:http(s) instead of global fetch: undici's built-in headers timeout (300s)
+        // kills slow non-streaming gateway responses (Cline can need 5-8 min for a full
+        // five-part SVG) before the caller's own timeout below gets a say. node:http has
+        // no such ceiling, so the DEADLINE_EXCEEDED message stays the only timeout.
+        const raw = await new Promise<string>((resolve, reject) => {
+          const url = new URL(`${baseUrl}/chat/completions`);
+          const transport = url.protocol === "https:" ? https : http;
+          const req = transport.request(
+            url,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                ...(key ? { authorization: `Bearer ${key}` } : {}),
+              },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on("data", (chunk) => chunks.push(chunk));
+              res.on("error", (err) => { clearTimeout(timer); reject(err); });
+              res.on("end", () => {
+                clearTimeout(timer);
+                const bodyText = Buffer.concat(chunks).toString("utf8");
+                if ((res.statusCode ?? 500) >= 400) {
+                  reject(new Error(`${errorTag} request failed (${res.statusCode}): ${bodyText.slice(0, 500)}`));
+                  return;
+                }
+                resolve(bodyText);
+              });
+            }
+          );
+          const timer = setTimeout(() => req.destroy(new Error(`${errorTag} request timed out after ${timeout}ms (DEADLINE_EXCEEDED)`)), timeout);
+          req.on("error", (err) => { clearTimeout(timer); reject(err); });
+          req.end(JSON.stringify(body));
+        });
 
-        const raw = await resp.text();
-        if (!resp.ok) throw new Error(`Proxy request failed (${resp.status}): ${raw.slice(0, 500)}`);
         let json: any;
         try {
           json = JSON.parse(raw);
         } catch {
-          throw new Error(`Proxy returned non-JSON response: ${raw.slice(0, 300)}`);
+          throw new Error(`${errorTag} returned non-JSON response: ${raw.slice(0, 300)}`);
         }
-        const u = json?.usage;
+        // Cline's gateway wraps the OpenAI payload in an envelope: {data:{choices,usage}}.
+        const payload = json?.data?.choices ? json.data : json;
+        if (!payload?.choices && typeof json?.error === "string") throw new Error(`${errorTag} request failed: ${json.error.slice(0, 300)}`);
+        const u = payload?.usage;
         if (u) {
           const reasoning = u.completion_tokens_details?.reasoning_tokens ?? 0;
-          console.log(`[proxy usage] model=${model} prompt=${u.prompt_tokens ?? "?"} output=${u.completion_tokens ?? "?"} (reasoning=${reasoning}) total=${u.total_tokens ?? "?"}`);
+          console.log(`[${logTag} usage] model=${model} prompt=${u.prompt_tokens ?? "?"} output=${u.completion_tokens ?? "?"} (reasoning=${reasoning}) total=${u.total_tokens ?? "?"}`);
         }
-        const content = json?.choices?.[0]?.message?.content;
+        const content = payload?.choices?.[0]?.message?.content;
         return { text: typeof content === "string" ? content : content == null ? "" : JSON.stringify(content) };
       },
     },
@@ -292,7 +435,12 @@ async function generateContentWithRetry(
     ...options,
     config: {
       ...providerConfig,
-      ...(contentReminder && aiClient === proxyClient ? { contentReminder } : {}),
+      // contentReminder only matters to the chat adapter's schema-in-prompt fallback —
+      // forward it to both OpenAI-compatible clients (proxy + Cline), not to the SDK.
+      ...(contentReminder && (aiClient === proxyClient || aiClient === clineClient) ? { contentReminder } : {}),
+      // GEMINI_TEMPERATURE applies to the SDK path only (the adapter reads its own per-
+      // provider env); a caller-supplied config.temperature always wins.
+      ...(GEMINI_TEMPERATURE !== undefined && aiClient === geminiClient && providerConfig.temperature === undefined ? { temperature: GEMINI_TEMPERATURE } : {}),
       ...(contentReminder
         ? { systemInstruction: `${geminiToText(providerConfig.systemInstruction)}\n\nFINAL DRAWING CHECK — this selected requirement overrides any earlier baseline density numbers: ${contentReminder}` }
         : {}),

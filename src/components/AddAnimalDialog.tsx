@@ -3633,7 +3633,7 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
 
             {blindWithReference && (
               <p className="rounded-lg border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-300">
-                A reference image is attached, but <span className="font-mono">{modelId.replace(/^(proxy|gemini):/, "")}</span> is text only and will reject it.
+                A reference image is attached, but <span className="font-mono">{modelId.replace(/^(proxy|gemini|cline):/, "")}</span> is text only and will reject it.
                 Pick a model without the “text only” note, or remove the reference.
               </p>
             )}

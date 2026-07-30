@@ -55,7 +55,7 @@ interface ContactSheetSelectorProps {
 
 /** `proxy:gpt-5.6-sol` reads as `gpt-5.6-sol`: the provider prefix is noise in a cell this size. */
 function shortModelLabel(modelId: string): string {
-  return modelId.replace(/^(proxy|gemini):/, "");
+  return modelId.replace(/^(proxy|gemini|cline):/, "");
 }
 
 export function ContactSheetSelector({ samples, onUse, onCancel, onRefineSlot, conformanceOf, underlays }: ContactSheetSelectorProps) {

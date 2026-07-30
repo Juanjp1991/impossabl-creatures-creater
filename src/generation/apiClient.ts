@@ -2,16 +2,20 @@
 // dependency-free on purpose: the app talks to a handful of `/api/*` endpoints and
 // the only cross-cutting concerns are a per-path timeout and readable error text.
 
+// Abort caps, not targets: slow subscription gateways (Cline Pass / Kimi K3) can take
+// several minutes on a full five-part generation, so these sit above the server's own
+// per-provider timeouts (5 min proxy/Gemini, 10 min Cline by default).
 export const REQUEST_TIMEOUTS: Record<string, number> = {
-  "/api/populate-brief": 90_000,
-  "/api/generate-animal": 270_000,
+  "/api/populate-brief": 150_000,
+  "/api/generate-animal": 640_000,
   "/api/modify-animal": 135_000,
 };
 
 export interface ModelOption {
   id: string;
   label: string;
-  provider: "gemini" | "proxy";
+  /** "proxy" = CLIProxyAPI, "cline" = Cline Pass gateway, "gemini" = direct Google. */
+  provider: "gemini" | "proxy" | "cline";
   /** False for models that reject image content, e.g. GLM 5.x. Absent on older servers. */
   vision?: boolean;
 }
