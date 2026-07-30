@@ -9,6 +9,8 @@ export const REQUEST_TIMEOUTS: Record<string, number> = {
   "/api/populate-brief": 150_000,
   "/api/generate-animal": 640_000,
   "/api/modify-animal": 135_000,
+  // Image models render in ~10-60s; keep headroom for a slow flash-image run.
+  "/api/generate-image": 180_000,
 };
 
 export interface ModelOption {

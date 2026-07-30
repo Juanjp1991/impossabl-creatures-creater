@@ -16,7 +16,7 @@ import { runPartPipeline } from "../generation/partPipeline";
 import { buildExemplarBlock } from "../generation/exemplars";
 import { DEFAULT_VARIATION_CONCURRENCY, DEFAULT_VARIATION_COUNT, VARIATION_STRENGTHS, runPartVariations, type VariationStrength } from "../generation/partVariations";
 import { SVG_FIELD as PART_SVG_FIELD } from "../partBank/contracts";
-import { fetchModels, type ModelOption } from "../generation/apiClient";
+import { fetchModels, postJson, type ModelOption } from "../generation/apiClient";
 import { downscaleReferenceFile } from "../referenceImage/downscale";
 import { cropReferenceDataUrl, isMeaningfulCrop, type NormalizedCrop, type ReferenceCrops } from "../referenceImage/crop";
 import { scoreKey, scoreRound } from "../referenceImage/scoreRound";
@@ -321,6 +321,10 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
   // §S1 conformance scores for whatever round is on screen, keyed `${slot}:${sampleIndex}`.
   const [conformance, setConformance] = useState<Map<string, ConformanceScore>>(new Map());
   const [referenceMode, setReferenceMode] = useState<ReferenceMode>("match");
+  // AI reference sketch ("make the reference you don't have"): the note is the tweak lever
+  // (stance, head tilt, …) the server applies on top of the brief when drawing the sketch.
+  const [referenceNote, setReferenceNote] = useState("");
+  const [isGeneratingReference, setIsGeneratingReference] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [guidedBrief, setGuidedBrief] = useState<GuidedAnimalBrief>(() => createDefaultBrief());
   const selectedDetailDensity = detailDensityProfile(guidedBrief.detailLevel);
@@ -395,6 +399,33 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
     // Crops are coordinates into a specific image; they mean nothing once it is gone.
     setReferenceCrops({});
     setCropSlot(null);
+  };
+
+  // Draw the reference sketch from the expanded brief, then route it through exactly the
+  // upload pipeline (downscale → state → crops/persistence), so a generated sketch and an
+  // uploaded photo are indistinguishable to everything downstream.
+  const handleGenerateReference = async () => {
+    if (!guidedBrief.animalName?.trim()) {
+      setErrorMsg("Name the animal first — the sketch is drawn from the guided brief.");
+      return;
+    }
+    setIsGeneratingReference(true);
+    try {
+      const data = await postJson("/api/generate-image", { brief: guidedBrief, note: referenceNote });
+      const blob = await (await fetch(data.image)).blob();
+      const file = new File([blob], "generated-reference.jpg", { type: blob.type || "image/jpeg" });
+      const resized = await downscaleReferenceFile(file);
+      setUploadedImage(resized.dataUrl);
+      setReferenceRecord({ blob: resized.blob, width: resized.width, height: resized.height });
+      // A new image invalidates every crop drawn against the old one, same as an upload.
+      setReferenceCrops({});
+      setCropSlot(null);
+      setErrorMsg("");
+    } catch (error: any) {
+      setErrorMsg(error?.message || "Failed to generate the reference sketch.");
+    } finally {
+      setIsGeneratingReference(false);
+    }
   };
 
   /**
@@ -3740,6 +3771,27 @@ export function AddAnimalDialog({ isOpen, onClose, onAddAnimal, editingAnimal }:
                       />
                     </label>
                   )}
+                </div>
+                {/* AI reference sketch: draw the reference from the brief instead of hunting for a photo. */}
+                <div className="mt-2 flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={referenceNote}
+                    onChange={(event) => setReferenceNote(event.target.value)}
+                    placeholder="Tweak: slight head tilt, crouched stance…"
+                    disabled={isGenerating || isGeneratingReference}
+                    className="flex-1 min-w-0 text-[10px] px-2 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200 placeholder:text-zinc-600 focus:border-amber-500/50 focus:outline-none disabled:opacity-50"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleGenerateReference}
+                    disabled={isGenerating || isGeneratingReference || !guidedBrief.animalName?.trim()}
+                    title={guidedBrief.animalName?.trim() ? "Draw an SVG-style reference sketch from the current brief" : "Name the animal first"}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[9px] font-mono font-bold hover:bg-amber-500/20 transition-colors disabled:opacity-40 disabled:hover:bg-amber-500/10 active:scale-95"
+                  >
+                    {isGeneratingReference ? <Loader2 size={11} className="animate-spin" /> : <Wand2 size={11} />}
+                    {isGeneratingReference ? "DRAWING…" : uploadedImage ? "RE-SKETCH" : "SKETCH"}
+                  </button>
                 </div>
                 {uploadedImage && (
                   <div className="mt-2 grid grid-cols-2 gap-1 rounded-lg border border-zinc-800 bg-zinc-950 p-1">

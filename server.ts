@@ -15,6 +15,7 @@ import { buildPartSystemInstruction, PART_PROMPT_VERSION } from "./src/generatio
 import { detailDensityProfile, resolveDetailLevel, wholeAnimalDensityInstruction } from "./src/generation/detailDensity";
 import { parseModelJson } from "./src/generation/parseModelJson";
 import { normalizeAnimalDraftCoordinates, normalizeGeneratedSvgSyntax, snapAttachedPartsToAnchors } from "./src/generation/normalize";
+import { buildReferenceImagePrompt, REFERENCE_IMAGE_PROMPT_VERSION } from "./src/generation/referenceImagePrompt";
 
 // Load environment variables
 dotenv.config();
@@ -23,6 +24,12 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const HMR_PORT = Number(process.env.HMR_PORT) || 24678;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+// Image model for /api/generate-image (the AI reference sketch). Native Gemini image models
+// only — they take generateContent with image output. Probed on this key 2026-07-30:
+// gemini-3.1-flash-image (fast default), gemini-3-pro-image (slow quality option). The
+// subscription providers (proxy, Cline) serve no image generation, so this always uses the
+// direct Google key.
+const GEMINI_IMAGE_MODEL = (process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image").trim();
 // Optional (local dev): route AI through an OpenAI-compatible proxy such as
 // CLIProxyAPI (e.g. AI_PROXY_URL="http://localhost:8317/v1") so a ChatGPT/Codex or
 // Claude subscription can serve GEMINI_MODEL. When AI_PROXY_URL is set the app speaks
@@ -601,6 +608,45 @@ const guidedBriefSchema = {
 // The models the UI may choose from, and today's default. A plain list — no plugin framework.
 app.get("/api/models", (_req, res) => {
   res.json({ models: MODEL_REGISTRY.map(({ id, label, provider, vision }) => ({ id, label, provider, vision })), defaultModelId: DEFAULT_MODEL_ID });
+});
+
+// AI reference sketch: the reference photo you don't have. Draws a flat, SVG-looking
+// side-profile illustration of the expanded brief (plus the user's tweak note for stance,
+// head tilt, …) so generation can run in match mode against an approved structure instead
+// of rolling the dice on text alone. Gemini image model only — the subscription providers
+// serve no image generation — so this needs GEMINI_API_KEY regardless of the text runtime.
+app.post("/api/generate-image", async (req, res) => {
+  try {
+    if (!geminiClient) return res.status(503).json({ error: "Reference sketch generation uses the Google image API and needs a valid GEMINI_API_KEY in .env." });
+    const brief = assertBrief(req.body?.brief);
+    const note = typeof req.body?.note === "string" ? req.body.note : "";
+    const prompt = buildReferenceImagePrompt(brief, note);
+    // geminiClient is typed to the minimal AiClient surface (text in, text out); the image
+    // call needs the full SDK response shape, so take the real client here.
+    const imageClient = geminiClient as unknown as GoogleGenAI;
+    const response = await imageClient.models.generateContent({
+      model: GEMINI_IMAGE_MODEL,
+      contents: prompt,
+      config: { responseModalities: ["TEXT", "IMAGE"] },
+    });
+    const candidate = response.candidates?.[0];
+    const parts = candidate?.content?.parts ?? [];
+    const imagePart = parts.find((part: any) => part?.inlineData?.data);
+    if (!imagePart) {
+      // finishReason IMAGE_RECITATION / SAFETY land here with an empty content: that is the
+      // model declining the prompt, not a transport failure — say so in a fixable way.
+      const reason = candidate?.finishReason;
+      throw new Error(reason && reason !== "STOP"
+        ? `The image model declined this prompt (${reason}). Rephrase the brief or tweak note and try again.`
+        : "The image model returned no picture. Rephrase the brief or tweak note and try again.");
+    }
+    const mimeType = imagePart.inlineData!.mimeType || "image/png";
+    return res.json({ image: `data:${mimeType};base64,${imagePart.inlineData!.data}`, model: GEMINI_IMAGE_MODEL, promptVersion: REFERENCE_IMAGE_PROMPT_VERSION });
+  } catch (error: any) {
+    console.error("Error generating reference sketch:", error);
+    const status = /guided animal brief|required/i.test(error?.message || "") ? 400 : 500;
+    return res.status(status).json({ error: "Failed to generate the reference sketch. Details: " + getFriendlyErrorMessage(error) });
+  }
 });
 
 app.post("/api/populate-brief", async (req, res) => {
